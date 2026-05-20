@@ -24,6 +24,7 @@ Vision 工具采用多级自动选择 + 自动兜底策略，无需手动配置�
 | Gemini | 使用主模型 | inlineData 格式 |
 | 豆包 (Doubao) | 使用主模型 | doubao-seed-2-0 系列原生支持 |
 | Kimi (Moonshot) | 使用主模型 | kimi-k2.6、kimi-k2.5 原生支持 |
+| 百度千帆 (Qianfan) | 使用主模型 | 默认使用多模态主模型 (如 ernie-5.1)，主模型不支持时兜底使用 ernie-4.5-turbo-vl |
 | 智谱 AI | glm-5v-turbo | 固定使用视觉专用模型 |
 | MiniMax | MiniMax-Text-01 | 固定使用视觉专用模型 |
 
@@ -41,11 +42,13 @@ Vision 工具采用多级自动选择 + 自动兜底策略，无需手动配置�
 {
     "tool": {
         "vision": {
-            "model": "gpt-4o"
+            "model": "gpt-4.1"
         }
     }
 }
 ```
+
+指定的模型会被**优先使用**，工具会根据模型名自动路由到对应的 provider；若调用失败，会自动 fallback 到其他已配置的 provider。
 
 大多数情况下无需配置，主模型支持多模态或配置任意一个支持视觉的 API Key 即可自动工作。
 

@@ -26,7 +26,7 @@
 -  ✅  **长期记忆：** 自动将对话记忆持久化至本地文件和数据库中，包括核心记忆、日级记忆和梦境蒸馏，支持关键词及向量检索
 -  ✅  **个人知识库：** 自动整理结构化知识，通过交叉引用构建知识图谱，支持通过对话管理和可视化浏览知识库
 -  ✅  **技能系统：** Skills 安装和运行的引擎，支持从 [Skill Hub](https://skills.cowagent.ai/)、GitHub 等一键安装技能，或通过对话创造 Skills
--  ✅  **工具系统：** 内置文件读写、终端执行、浏览器操作、定时任务等工具，Agent 自主调用以完成复杂任务
+-  ✅  **工具系统：** 内置文件读写、终端执行、浏览器操作、定时任务等工具，支持 MCP 协议，通过 Agent 自主调用完成复杂任务
 -  ✅  **CLI系统：** 提供终端命令和对话命令，支持进程管理、技能安装、配置修改等操作
 -  ✅  **多模态消息：** 支持对文本、图片、语音、文件等多类型消息进行解析、处理、生成、发送等操作
 -  ✅  **多模型支持：** 支持 DeepSeek、MiniMax、Claude、Gemini、OpenAI、GLM、Qwen、Doubao、Kimi 等国内外主流模型厂商
@@ -69,6 +69,8 @@
 <br/>
 
 # 🏷 更新日志
+
+>**2026.05.06：** [2.0.8版本](https://github.com/zhayujie/CowAgent/releases/tag/2.0.8)，飞书渠道全面升级（语音、流式输出和Markdown、一键扫码接入）、新模型支持（DeepSeek V4、百度千帆）、定时任务工具增强等
 
 >**2026.04.22：** [2.0.7版本](https://github.com/zhayujie/CowAgent/releases/tag/2.0.7)，图像生成内置技能（GPT Image 2、Nano Banana 等）、新模型支持（Kimi K2.6、Claude Opus 4.7、GLM 5.1）、知识库和记忆增强、Web 控制台优化
 
@@ -115,7 +117,7 @@ irm https://cdn.link-ai.tech/code/cow/run.ps1 | iex
 
 项目支持国内外主流厂商的模型接口，可选模型及配置说明参考：[模型说明](#模型说明)。
 
-> 注：Agent 模式下推荐使用以下模型，可根据效果及成本综合选择：deepseek-v4-flash、MiniMax-M2.7、glm-5.1、kimi-k2.6、qwen3.5-plus、claude-sonnet-4-6、gemini-3.1-pro-preview、gpt-5.4、gpt-5.4-mini
+> 注：Agent 模式下推荐使用以下模型，可根据效果及成本综合选择：deepseek-v4-flash、MiniMax-M2.7、glm-5.1、kimi-k2.6、qwen3.5-plus、claude-sonnet-4-6、gemini-3.1-pro-preview、gpt-5.4、gpt-5.4-mini、ernie-5.1
 
 同时支持使用 **LinkAI 平台** 接口，支持上述全部模型，并支持知识库、工作流、插件等 Agent 技能，参考 [接口文档](https://docs.link-ai.tech/platform/api)。
 
@@ -202,7 +204,7 @@ cow install-browser
   "group_speech_recognition": false,                          # 是否开启群组语音识别
   "voice_reply_voice": false,                                 # 是否使用语音回复语音
   "use_linkai": false,                                        # 是否使用 LinkAI 接口，默认关闭，设置为 true 后可对接 LinkAI 平台模型
-  "web_password": "",                                         # Web 控制台访问密码，留空则不启用密码保护
+  "web_password": "",                                         # Web 控制台访问密码，留空则不启用密码保护（监听 0.0.0.0 时务必设置）
   "agent": true,                                              # 是否启用 Agent 模式，启用后拥有多轮工具决策、长期记忆、Skills 能力等
   "agent_workspace": "~/cow",                                 # Agent 的工作空间路径，用于存储 memory、skills、系统设定等
   "agent_max_context_tokens": 50000,                          # Agent 模式下最大上下文 tokens，超出将自动智能压缩处理
@@ -597,33 +599,35 @@ API Key 创建：在 [控制台](https://aistudio.google.com/app/apikey?hl=zh-cn
 </details>
 
 <details>
-<summary>百度文心</summary>
-方式一：官方 SDK 接入，配置如下：
+<summary>百度千帆 / ERNIE</summary>
+
+方式一：官方接入（推荐），配置如下：
 
 ```json
 {
-    "model": "wenxin-4", 
-    "baidu_wenxin_api_key": "IajztZ0bDxgnP9bEykU7lBer",
-    "baidu_wenxin_secret_key": "EDPZn6L24uAS9d8RWFfotK47dPvkjD6G"
+  "model": "ernie-5.1",
+  "qianfan_api_key": "",
+  "qianfan_api_base": "https://qianfan.baidubce.com/v2"
 }
 ```
- - `model`: 可填 `wenxin`和`wenxin-4`，对应模型为 文心-3.5 和 文心-4.0
- - `baidu_wenxin_api_key`：参考 [千帆平台-access_token鉴权](https://cloud.baidu.com/doc/WENXINWORKSHOP/s/dlv4pct3s) 文档获取 API Key
- - `baidu_wenxin_secret_key`：参考 [千帆平台-access_token鉴权](https://cloud.baidu.com/doc/WENXINWORKSHOP/s/dlv4pct3s) 文档获取 Secret Key
+
+ - `model`: 默认推荐填写 `ernie-5.1`（多模态，可直接识图），也可填写 `ernie-5.0`、`ernie-x1.1`、`ernie-4.5-turbo-128k`、`ernie-4.5-turbo-32k`；当主模型为纯文本 ERNIE 时，Vision 工具会自动 fallback 到 `ernie-4.5-turbo-vl`
+ - `qianfan_api_key`: 百度千帆 API Key，通常以 `bce-v3/` 开头，可在百度智能云控制台创建
+ - `qianfan_api_base`: 可选，默认为 `https://qianfan.baidubce.com/v2`
 
 方式二：OpenAI 兼容方式接入，配置如下：
 ```json
 {
   "bot_type": "openai",
-  "model": "ERNIE-4.0-Turbo-8K",
+  "model": "ernie-5.1",
   "open_ai_api_base": "https://qianfan.baidubce.com/v2",
-  "open_ai_api_key": "bce-v3/ALTxxxxxxd2b"
+  "open_ai_api_key": ""
 }
 ```
 - `bot_type`: OpenAI 兼容方式
-- `model`: 支持官方所有模型，参考[模型列表](https://cloud.baidu.com/doc/WENXINWORKSHOP/s/Wm9cvy6rl)
-- `open_ai_api_base`: 百度文心 API 的 BASE URL
-- `open_ai_api_key`: 百度文心的 API-KEY，参考 [官方文档](https://cloud.baidu.com/doc/qianfan-api/s/ym9chdsy5) ，在 [控制台](https://console.bce.baidu.com/iam/#/iam/apikey/list) 创建 API Key
+- `model`: 支持千帆平台上的 ERNIE 模型
+- `open_ai_api_base`: 百度千帆 OpenAI 兼容 API 的 BASE URL
+- `open_ai_api_key`: 百度千帆 API Key
 
 </details>
 
@@ -711,49 +715,42 @@ Coding Plan 是各厂商推出的编程包月套餐，所有厂商均可通过 O
 ```json
 {
     "channel_type": "web",
+    "web_host": "0.0.0.0",
+    "web_password": "YOUR PASSWORD",
     "web_port": 9899
 }
 ```
 
+- `web_host`: 监听地址，默认 `127.0.0.1`（仅本机），如需公网访问请改为 `0.0.0.0` 并设置密码
 - `web_port`: 默认为 9899，可按需更改，需要服务器防火墙和安全组放行该端口
-- `web_password`: 访问密码，留空则不启用密码保护。部署在公网环境时建议设置
-- 如本地运行，启动后请访问 `http://localhost:9899/chat` ；如服务器运行，请访问 `http://ip:9899/chat` 
+- `web_password`: 访问密码，留空则不启用密码保护。部署在公网环境时请务必设置
+- 如本地运行，启动后请访问 `http://localhost:9899` ；如服务器运行，请访问 `http://YOUR_IP:9899`
 > 注：请将上述 url 中的 ip 或者 port 替换为实际的值
 </details>
 
 <details>
 <summary>3. Feishu - 飞书</summary>
 
-飞书支持两种事件接收模式：WebSocket 长连接（推荐）和 Webhook。
+飞书使用 WebSocket 长连接模式，无需公网 IP。详细步骤参考 [飞书接入](https://docs.cowagent.ai/channels/feishu)。
 
-**方式一：WebSocket 模式（推荐，无需公网 IP）**
+**方式一：扫码一键创建（推荐）**
 
-```json
-{
-    "channel_type": "feishu",
-    "feishu_app_id": "APP_ID",
-    "feishu_app_secret": "APP_SECRET",
-    "feishu_event_mode": "websocket"
-}
-```
+启动 Cow 后打开 Web 控制台，**通道** → **接入通道** → 选择 **飞书** → 扫码创建。也支持 CLI 启动时在终端打印二维码。
 
-**方式二：Webhook 模式（需要公网 IP）**
+**方式二：手动配置**
+
+在飞书开放平台创建自建应用并配置权限后，将凭据填入 `config.json`：
 
 ```json
 {
     "channel_type": "feishu",
     "feishu_app_id": "APP_ID",
     "feishu_app_secret": "APP_SECRET",
-    "feishu_token": "VERIFICATION_TOKEN",
-    "feishu_event_mode": "webhook",
-    "feishu_port": 9891
+    "feishu_stream_reply": true
 }
 ```
 
-- `feishu_event_mode`: 事件接收模式，`websocket`（推荐）或 `webhook`
-- WebSocket 模式需安装依赖：`pip3 install lark-oapi`
-
-详细步骤和参数说明参考 [飞书接入](https://docs.cowagent.ai/channels/feishu)
+- `feishu_stream_reply`：是否开启流式打字机回复，默认开启（需 `cardkit:card:write` 权限 + 飞书客户端 ≥ 7.20）
 
 </details>
 
@@ -775,7 +772,15 @@ Coding Plan 是各厂商推出的编程包月套餐，所有厂商均可通过 O
 <details>
 <summary>5. WeCom Bot - 企微智能机器人</summary>
 
-企微智能机器人使用 WebSocket 长连接模式，无需公网 IP 和域名，配置简单：
+企微智能机器人使用 WebSocket 长连接模式，无需公网 IP 和域名。详细步骤参考 [企微智能机器人接入](https://docs.cowagent.ai/channels/wecom-bot)。
+
+**方式一：扫码一键创建（推荐）**
+
+启动 Cow 后打开 Web 控制台，**通道** → **接入通道** → 选择 **企微智能机器人** → 使用企业微信扫码创建。
+
+**方式二：手动配置**
+
+在企业微信中创建智能机器人并选择**长连接模式**，记录 Bot ID 和 Secret 后填入 `config.json`：
 
 ```json
 {
@@ -784,7 +789,6 @@ Coding Plan 是各厂商推出的编程包月套餐，所有厂商均可通过 O
     "wecom_bot_secret": "YOUR_SECRET"
 }
 ```
-详细步骤和参数说明参考 [企微智能机器人接入](https://docs.cowagent.ai/channels/wecom-bot)
 
 </details>
 

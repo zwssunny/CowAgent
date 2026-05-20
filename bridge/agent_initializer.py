@@ -5,6 +5,7 @@ Agent Initializer - Handles agent initialization logic
 import os
 import asyncio
 import datetime
+import threading
 import time
 from typing import Optional, List
 
@@ -12,6 +13,13 @@ from agent.protocol import Agent
 from agent.tools import ToolManager
 from common.log import logger
 from common.utils import expand_path
+
+# Module-level lock to serialize scheduler init across concurrent sessions
+_scheduler_init_lock = threading.Lock()
+
+# Track whether the embedding model log has been printed in this process,
+# so we avoid spamming it once per session.
+_embedding_logged: bool = False
 
 
 class AgentInitializer:
@@ -144,7 +152,15 @@ class AgentInitializer:
             from agent.memory import get_conversation_store
             store = get_conversation_store()
             max_turns = conf().get("agent_max_context_turns", 20)
-            restore_turns = max(3, max_turns // 6)
+            # Scheduler tasks run on a stable isolated session per task and
+            # can fire many times a day; a smaller restore window keeps prompt
+            # cost bounded while still letting the agent see "last few" runs
+            # for trend / dedup style logic. Regular chat sessions keep the
+            # original heuristic so user dialogues feel continuous.
+            if session_id.startswith("scheduler_"):
+                restore_turns = max(1, max_turns // 5)
+            else:
+                restore_turns = max(3, max_turns // 6)
             saved = store.load_messages(session_id, max_turns=restore_turns)
             if saved:
                 filtered = self._filter_text_only_messages(saved)
@@ -260,52 +276,19 @@ class AgentInitializer:
         memory_tools = []
         
         try:
-            from agent.memory import MemoryManager, MemoryConfig, create_embedding_provider
+            from agent.memory import MemoryManager, MemoryConfig
             from agent.tools import MemorySearchTool, MemoryGetTool
             from config import conf
-            
-            # Initialize embedding provider (prefer OpenAI, fallback to LinkAI)
-            embedding_provider = None
 
-            openai_api_key = conf().get("open_ai_api_key", "")
-            openai_api_base = conf().get("open_ai_api_base", "")
-            if openai_api_key and openai_api_key not in ["", "YOUR API KEY", "YOUR_API_KEY"]:
-                try:
-                    embedding_provider = create_embedding_provider(
-                        provider="openai",
-                        model="text-embedding-3-small",
-                        api_key=openai_api_key,
-                        api_base=openai_api_base or "https://api.openai.com/v1"
-                    )
-                    if session_id is None:
-                        logger.info("[AgentInitializer] OpenAI embedding initialized")
-                except Exception as e:
-                    logger.warning(f"[AgentInitializer] OpenAI embedding failed: {e}")
-
-            if embedding_provider is None:
-                linkai_api_key = conf().get("linkai_api_key", "") or os.environ.get("LINKAI_API_KEY", "")
-                linkai_api_base = conf().get("linkai_api_base", "https://api.link-ai.tech")
-                if linkai_api_key and linkai_api_key not in ["", "YOUR API KEY", "YOUR_API_KEY"]:
-                    try:
-                        embedding_provider = create_embedding_provider(
-                            provider="linkai",
-                            model="text-embedding-3-small",
-                            api_key=linkai_api_key,
-                            api_base=f"{linkai_api_base}/v1"
-                        )
-                        if session_id is None:
-                            logger.info("[AgentInitializer] LinkAI embedding initialized (fallback)")
-                    except Exception as e:
-                        logger.warning(f"[AgentInitializer] LinkAI embedding failed: {e}")
-            
-            # Create memory manager
             memory_config = MemoryConfig(workspace_root=workspace_root)
+
+            embedding_provider = self._init_embedding_provider(
+                memory_config, session_id=session_id
+            )
+
             memory_manager = MemoryManager(memory_config, embedding_provider=embedding_provider)
-            
-            # Sync memory
             self._sync_memory(memory_manager, session_id)
-            
-            # Create memory tools
+
             memory_tools = [
                 MemorySearchTool(memory_manager),
                 MemoryGetTool(memory_manager)
@@ -318,6 +301,190 @@ class AgentInitializer:
             logger.warning(f"[AgentInitializer] Memory system not available: {e}")
         
         return memory_manager, memory_tools
+
+    def _init_embedding_provider(self, memory_config, session_id: Optional[str] = None):
+        """
+        Initialize the embedding provider for memory.
+
+        Two paths:
+          A. Default (no `embedding_provider` in config.json):
+             Auto-init OpenAI -> LinkAI fallback. Existing 1536-dim indices
+             keep working.
+          B. Explicit (`embedding_provider` is set):
+             Initialize the requested vendor with unified dim (default 1024).
+             If the index was built with a different dim, vector search will
+             quietly return no results (cosine returns 0) and keyword search
+             takes over until the user runs /memory rebuild-index.
+        """
+        from agent.memory import create_embedding_provider
+        from config import conf
+
+        explicit_provider = (conf().get("embedding_provider") or "").strip().lower()
+
+        if not explicit_provider:
+            return self._init_embedding_provider_legacy(session_id=session_id)
+
+        return self._init_embedding_provider_explicit(
+            memory_config, explicit_provider, session_id=session_id,
+        )
+
+    def _init_embedding_provider_legacy(self, session_id: Optional[str] = None):
+        """Legacy auto-init path: OpenAI -> LinkAI. Preserved verbatim for compat."""
+        from agent.memory import create_embedding_provider
+        from config import conf
+
+        embedding_provider = None
+        embedding_model = None
+
+        openai_api_key = conf().get("open_ai_api_key", "")
+        openai_api_base = conf().get("open_ai_api_base", "")
+        if openai_api_key and openai_api_key not in ["", "YOUR API KEY", "YOUR_API_KEY"]:
+            try:
+                model = "text-embedding-3-small"
+                embedding_provider = create_embedding_provider(
+                    provider="openai",
+                    model=model,
+                    api_key=openai_api_key,
+                    api_base=openai_api_base or "https://api.openai.com/v1"
+                )
+                embedding_model = f"openai/{model}"
+            except Exception as e:
+                logger.warning(f"[AgentInitializer] OpenAI embedding failed: {e}")
+
+        if embedding_provider is None:
+            linkai_api_key = conf().get("linkai_api_key", "") or os.environ.get("LINKAI_API_KEY", "")
+            linkai_api_base = conf().get("linkai_api_base", "https://api.link-ai.tech")
+            if linkai_api_key and linkai_api_key not in ["", "YOUR API KEY", "YOUR_API_KEY"]:
+                try:
+                    model = "text-embedding-3-small"
+                    embedding_provider = create_embedding_provider(
+                        provider="linkai",
+                        model=model,
+                        api_key=linkai_api_key,
+                        api_base=f"{linkai_api_base}/v1"
+                    )
+                    embedding_model = f"linkai/{model}"
+                except Exception as e:
+                    logger.warning(f"[AgentInitializer] LinkAI embedding failed: {e}")
+
+        if embedding_provider is not None and embedding_model:
+            global _embedding_logged
+            if not _embedding_logged:
+                logger.info(
+                    f"[AgentInitializer] Embedding model in use: {embedding_model} "
+                    f"(dim={embedding_provider.dimensions})"
+                )
+                _embedding_logged = True
+
+        return embedding_provider
+
+    def _init_embedding_provider_explicit(
+        self,
+        memory_config,
+        provider_key: str,
+        session_id: Optional[str] = None,
+    ):
+        """Explicit-provider path: build the configured vendor.
+
+        If the index was built with a different dim, vector search will
+        silently return no results (cosine returns 0 for mismatched dims)
+        and keyword search takes over. Users switch vendors by running
+        /memory rebuild-index — see docs.
+        """
+        from agent.memory import create_embedding_provider
+        from agent.memory.embedding import EMBEDDING_VENDORS
+        from config import conf
+
+        meta = EMBEDDING_VENDORS.get(provider_key)
+        if meta is None:
+            logger.error(
+                f"[AgentInitializer] Unknown embedding_provider '{provider_key}'. "
+                f"Supported: {sorted(EMBEDDING_VENDORS.keys())}. "
+                f"Memory will run in keyword-only mode."
+            )
+            return None
+
+        api_key = self._resolve_embedding_api_key(provider_key)
+        api_base = self._resolve_embedding_api_base(provider_key, meta["default_base_url"])
+
+        if not api_key:
+            logger.error(
+                f"[AgentInitializer] embedding_provider='{provider_key}' is set but its "
+                f"API key is missing. Memory will run in keyword-only mode."
+            )
+            return None
+
+        model = (conf().get("embedding_model") or "").strip() or meta["default_model"]
+        try:
+            cfg_dim = int(conf().get("embedding_dimensions") or 0)
+        except (TypeError, ValueError):
+            cfg_dim = 0
+        dim = cfg_dim if cfg_dim > 0 else meta["default_dimensions"]
+
+        try:
+            provider = create_embedding_provider(
+                provider=provider_key,
+                model=model,
+                api_key=api_key,
+                api_base=api_base,
+                dimensions=dim,
+            )
+        except Exception as e:
+            logger.error(
+                f"[AgentInitializer] Failed to init embedding provider "
+                f"'{provider_key}/{model}': {e}"
+            )
+            return None
+
+        global _embedding_logged
+        if not _embedding_logged:
+            logger.info(
+                f"[AgentInitializer] Embedding model in use: "
+                f"{provider_key}/{model} (dim={provider.dimensions})"
+            )
+            _embedding_logged = True
+        return provider
+
+    @staticmethod
+    def _resolve_embedding_api_key(provider_key: str) -> str:
+        """Pick the API key for an explicit embedding provider from config."""
+        from config import conf
+
+        key_map = {
+            "openai":    "open_ai_api_key",
+            "linkai":    "linkai_api_key",
+            "dashscope": "dashscope_api_key",
+            "doubao":    "ark_api_key",
+            "zhipu":     "zhipu_ai_api_key",
+        }
+        field = key_map.get(provider_key)
+        if not field:
+            return ""
+        value = conf().get(field, "") or ""
+        if value in ["", "YOUR API KEY", "YOUR_API_KEY"]:
+            return ""
+        return value
+
+    @staticmethod
+    def _resolve_embedding_api_base(provider_key: str, default_base: str) -> str:
+        """Pick the API base for an explicit embedding provider from config."""
+        from config import conf
+
+        base_map = {
+            "openai":    "open_ai_api_base",
+            "linkai":    "linkai_api_base",
+            "doubao":    "ark_base_url",
+            "zhipu":     "zhipu_ai_api_base",
+        }
+        field = base_map.get(provider_key)
+        if not field:
+            return default_base
+        value = (conf().get(field) or "").strip()
+        if not value:
+            return default_base
+        if provider_key == "linkai" and not value.rstrip("/").endswith("/v1"):
+            return f"{value.rstrip('/')}/v1"
+        return value
     
     def _sync_memory(self, memory_manager, session_id: Optional[str] = None):
         """Sync memory database"""
@@ -365,16 +532,33 @@ class AgentInitializer:
                     tool = tool_manager.create_tool(tool_name)
 
                 if tool:
-                    # Apply workspace config to file operation tools
+                    # Apply workspace config to file operation tools.
+                    # Merge into the existing tool.config (set by ToolManager from
+                    # config.json's `tools.<name>` section) instead of replacing
+                    # it, otherwise per-tool user configs (e.g. browser.cdp_endpoint)
+                    # would be silently dropped.
                     if tool_name in ['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'web_fetch', 'send', 'browser']:
-                        tool.config = file_config
-                        tool.cwd = file_config.get("cwd", getattr(tool, 'cwd', None))
-                        if 'memory_manager' in file_config:
-                            tool.memory_manager = file_config['memory_manager']
+                        merged_config = dict(getattr(tool, 'config', None) or {})
+                        merged_config.update(file_config)
+                        tool.config = merged_config
+                        tool.cwd = merged_config.get("cwd", getattr(tool, 'cwd', None))
+                        if 'memory_manager' in merged_config:
+                            tool.memory_manager = merged_config['memory_manager']
                     tools.append(tool)
             except Exception as e:
                 logger.warning(f"[AgentInitializer] Failed to load tool {tool_name}: {e}")
-        
+
+        # Add MCP tools (snapshot to avoid races with the background loader)
+        mcp_tools_snapshot = list(tool_manager._mcp_tool_instances.items())
+        if mcp_tools_snapshot:
+            for _, mcp_tool in mcp_tools_snapshot:
+                tools.append(mcp_tool)
+            if session_id is None:
+                names = [name for name, _ in mcp_tools_snapshot]
+                logger.info(
+                    f"[AgentInitializer] Added {len(names)} MCP tool(s): {names}"
+                )
+
         # Add memory tools
         if memory_tools:
             tools.extend(memory_tools)
@@ -387,16 +571,23 @@ class AgentInitializer:
         return tools
     
     def _initialize_scheduler(self, tools: List, session_id: Optional[str] = None):
-        """Initialize scheduler service if needed"""
+        """Initialize scheduler service if needed.
+
+        Serialize the check-and-set under a module-level lock so concurrent
+        first-time session inits cannot each create a new SchedulerService
+        (which would leak background scanning threads).
+        """
         if not self.agent_bridge.scheduler_initialized:
-            try:
-                from agent.tools.scheduler.integration import init_scheduler
-                if init_scheduler(self.agent_bridge):
-                    self.agent_bridge.scheduler_initialized = True
-                    if session_id is None:
-                        logger.info("[AgentInitializer] Scheduler service initialized")
-            except Exception as e:
-                logger.warning(f"[AgentInitializer] Failed to initialize scheduler: {e}")
+            with _scheduler_init_lock:
+                if not self.agent_bridge.scheduler_initialized:
+                    try:
+                        from agent.tools.scheduler.integration import init_scheduler
+                        if init_scheduler(self.agent_bridge):
+                            self.agent_bridge.scheduler_initialized = True
+                            if session_id is None:
+                                logger.info("[AgentInitializer] Scheduler service initialized")
+                    except Exception as e:
+                        logger.warning(f"[AgentInitializer] Failed to initialize scheduler: {e}")
         
         # Inject scheduler dependencies
         if self.agent_bridge.scheduler_initialized:

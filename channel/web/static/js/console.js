@@ -50,7 +50,7 @@ const I18N = {
         config_password_hint: '留空则不启用密码保护',
         config_password_changed: '密码已更新，请重新登录',
         config_password_cleared: '密码已清除',
-        skills_title: '技能管理', skills_desc: '查看、启用或禁用 Agent 技能', skills_hub_btn: '探索技能广场',
+        skills_title: '技能管理', skills_desc: '查看、启用或禁用 Agent 工具和技能', skills_hub_btn: '探索技能广场',
         skills_loading: '加载技能中...', skills_loading_desc: '技能加载后将显示在此处',
         tools_section_title: '内置工具', tools_loading: '加载工具中...',
         skills_section_title: '技能', skill_enable: '启用', skill_disable: '禁用',
@@ -78,6 +78,19 @@ const I18N = {
         wecom_scan_success: '创建成功，正在启动通道...',
         wecom_scan_fail: '创建失败',
         wecom_mode_scan: '扫码接入', wecom_mode_manual: '手动填写',
+        feishu_scan_btn: '一键创建飞书应用',
+        feishu_scan_desc: '使用飞书 App 扫码，自动创建应用并预置全部权限与事件订阅',
+        feishu_scan_replace_desc: '使用飞书 App 扫码创建新机器人，将覆盖当前的 App ID / Secret',
+        feishu_scan_loading: '正在向飞书申请二维码...',
+        feishu_scan_waiting: '等待扫码...',
+        feishu_scan_tip: '二维码 10 分钟内有效，仅供一次扫描',
+        feishu_scan_open_link: '或点击此处在浏览器中打开',
+        feishu_scan_success: '应用创建成功，正在启动通道...',
+        feishu_scan_expired: '二维码已过期，请重试',
+        feishu_scan_denied: '已取消授权',
+        feishu_scan_fail: '创建失败',
+        feishu_scan_retry: '重试',
+        feishu_mode_scan: '扫码创建', feishu_mode_manual: '手动填写',
         tasks_title: '定时任务', tasks_desc: '查看和管理定时任务',
         tasks_coming: '即将推出', tasks_coming_desc: '定时任务管理功能即将在此提供',
         logs_title: '日志', logs_desc: '实时日志输出 (run.log)',
@@ -91,7 +104,9 @@ const I18N = {
         context_cleared: '— 以上内容已从上下文中移除 —',
         tip_new_chat: '新建对话',
         tip_clear_context: '清除上下文',
-        tip_attach_file: '上传附件',
+        tip_attach: '添加附件',
+        attach_menu_file: '上传文件',
+        attach_menu_folder: '上传文件夹',
         confirm_yes: '确认',
         confirm_cancel: '取消',
         error_send: '发送失败，请稍后再试。', error_timeout: '请求超时，请再试一次。',
@@ -136,7 +151,7 @@ const I18N = {
         config_password_hint: 'Leave empty to disable password protection',
         config_password_changed: 'Password updated, please re-login',
         config_password_cleared: 'Password cleared',
-        skills_title: 'Skills', skills_desc: 'View, enable, or disable agent skills', skills_hub_btn: 'Skill Hub',
+        skills_title: 'Skills', skills_desc: 'View, enable, or disable agent tools and skills', skills_hub_btn: 'Skill Hub',
         skills_loading: 'Loading skills...', skills_loading_desc: 'Skills will be displayed here after loading',
         tools_section_title: 'Built-in Tools', tools_loading: 'Loading tools...',
         skills_section_title: 'Skills', skill_enable: 'Enable', skill_disable: 'Disable',
@@ -164,6 +179,19 @@ const I18N = {
         wecom_scan_success: 'Bot created, starting channel...',
         wecom_scan_fail: 'Bot creation failed',
         wecom_mode_scan: 'Scan QR', wecom_mode_manual: 'Manual',
+        feishu_scan_btn: 'One-click Create Feishu App',
+        feishu_scan_desc: 'Scan with Feishu App to create an app with all required permissions pre-configured',
+        feishu_scan_replace_desc: 'Scan with Feishu App to create a new bot — will overwrite the current App ID / Secret',
+        feishu_scan_loading: 'Requesting QR code from Feishu...',
+        feishu_scan_waiting: 'Waiting for scan...',
+        feishu_scan_tip: 'QR code expires in 10 minutes, single use only',
+        feishu_scan_open_link: 'Or click here to open in browser',
+        feishu_scan_success: 'App created, starting channel...',
+        feishu_scan_expired: 'QR code expired, please retry',
+        feishu_scan_denied: 'Authorization cancelled',
+        feishu_scan_fail: 'App creation failed',
+        feishu_scan_retry: 'Retry',
+        feishu_mode_scan: 'Scan QR', feishu_mode_manual: 'Manual',
         tasks_title: 'Scheduled Tasks', tasks_desc: 'View and manage scheduled tasks',
         tasks_coming: 'Coming Soon', tasks_coming_desc: 'Scheduled task management will be available here',
         logs_title: 'Logs', logs_desc: 'Real-time log output (run.log)',
@@ -177,7 +205,9 @@ const I18N = {
         context_cleared: '— Context above has been cleared —',
         tip_new_chat: 'New Chat',
         tip_clear_context: 'Clear Context',
-        tip_attach_file: 'Attach File',
+        tip_attach: 'Add Attachment',
+        attach_menu_file: 'Upload File',
+        attach_menu_folder: 'Upload Folder',
         confirm_yes: 'Confirm',
         confirm_cancel: 'Cancel',
         error_send: 'Failed to send. Please try again.', error_timeout: 'Request timeout. Please try again.',
@@ -364,14 +394,34 @@ window.addEventListener('resize', () => {
 // =====================================================================
 // Markdown Renderer
 // =====================================================================
+const FALLBACK_HLJS = {
+    getLanguage() { return false; },
+    highlight(str) { return { value: escapeHtml(str) }; },
+    highlightAuto(str) { return { value: escapeHtml(str) }; },
+    highlightElement() {},
+};
+
+function getHljs() {
+    return window.hljs || FALLBACK_HLJS;
+}
+
 function createMd() {
-    const md = window.markdownit({
+    const hljsLib = getHljs();
+    const mdFactory = window.markdownit;
+    if (typeof mdFactory !== 'function') {
+        return {
+            render(text) {
+                return `<p>${escapeHtml(text || '')}</p>`;
+            }
+        };
+    }
+    const md = mdFactory({
         html: false, breaks: true, linkify: true, typographer: true,
         highlight: function(str, lang) {
-            if (lang && hljs.getLanguage(lang)) {
-                try { return hljs.highlight(str, { language: lang }).value; } catch (_) {}
+            if (lang && hljsLib.getLanguage(lang)) {
+                try { return hljsLib.highlight(str, { language: lang }).value; } catch (_) {}
             }
-            return hljs.highlightAuto(str).value;
+            return hljsLib.highlightAuto(str).value;
         }
     });
     const defaultLinkOpen = md.renderer.rules.link_open || function(tokens, idx, options, env, self) {
@@ -552,6 +602,15 @@ const chatInput = document.getElementById('chat-input');
 const sendBtn = document.getElementById('send-btn');
 const messagesDiv = document.getElementById('chat-messages');
 const fileInput = document.getElementById('file-input');
+const folderInput = document.getElementById('folder-input');
+const attachBtn = document.getElementById('attach-btn');
+const attachMenu = document.getElementById('attach-menu');
+const attachFolderOption = document.getElementById('attach-folder-option');
+const supportsDirectoryUpload = !!folderInput && 'webkitdirectory' in folderInput;
+
+if (!supportsDirectoryUpload && attachFolderOption) {
+    attachFolderOption.classList.add('hidden');
+}
 
 // Smart auto-scroll: pause when user scrolls up, resume when near bottom
 let _autoScrollEnabled = true;
@@ -618,9 +677,12 @@ function renderAttachmentPreview() {
     attachmentPreview.classList.remove('hidden');
     attachmentPreview.innerHTML = pendingAttachments.map((att, idx) => {
         if (att._uploading) {
+            const suffix = att.file_type === 'directory' && att.file_count
+                ? ` (${att.file_count})`
+                : '';
             return `<div class="att-chip att-uploading" data-idx="${idx}">
                 <i class="fas fa-spinner fa-spin"></i>
-                <span class="att-name">${escapeHtml(att.file_name)}</span>
+                <span class="att-name">${escapeHtml(att.file_name)}${suffix}</span>
             </div>`;
         }
         if (att.file_type === 'image') {
@@ -629,10 +691,15 @@ function renderAttachmentPreview() {
                 <button class="att-remove" onclick="removeAttachment(${idx})">&times;</button>
             </div>`;
         }
-        const icon = att.file_type === 'video' ? 'fa-film' : 'fa-file-alt';
+        const icon = att.file_type === 'video'
+            ? 'fa-film'
+            : (att.file_type === 'directory' ? 'fa-folder-tree' : 'fa-file-alt');
+        const suffix = att.file_type === 'directory' && att.file_count
+            ? ` (${att.file_count})`
+            : '';
         return `<div class="att-chip" data-idx="${idx}">
             <i class="fas ${icon}"></i>
-            <span class="att-name">${escapeHtml(att.file_name)}</span>
+            <span class="att-name">${escapeHtml(att.file_name)}${suffix}</span>
             <button class="att-remove" onclick="removeAttachment(${idx})">&times;</button>
         </div>`;
     }).join('');
@@ -643,6 +710,34 @@ function removeAttachment(idx) {
     if (pendingAttachments[idx]?._uploading) return;
     pendingAttachments.splice(idx, 1);
     renderAttachmentPreview();
+}
+
+function isAttachMenuVisible() {
+    return attachMenu && !attachMenu.classList.contains('hidden');
+}
+
+function hideAttachMenu() {
+    if (attachMenu) attachMenu.classList.add('hidden');
+}
+
+function toggleAttachMenu(event) {
+    if (!attachMenu) return;
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    attachMenu.classList.toggle('hidden');
+}
+
+function triggerFileUpload() {
+    hideAttachMenu();
+    fileInput?.click();
+}
+
+function triggerFolderUpload() {
+    if (!supportsDirectoryUpload) return;
+    hideAttachMenu();
+    folderInput?.click();
 }
 
 async function handleFileSelect(files) {
@@ -683,9 +778,88 @@ async function handleFileSelect(files) {
     await Promise.all(tasks);
 }
 
+function _makeUploadId() {
+    return `dir_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function _groupDirectoryFiles(files) {
+    const groups = new Map();
+    for (const file of Array.from(files || [])) {
+        const relPath = file.webkitRelativePath || file.name;
+        const parts = relPath.split('/').filter(Boolean);
+        const rootName = parts[0] || file.name;
+        if (!groups.has(rootName)) groups.set(rootName, []);
+        groups.get(rootName).push({ file, relPath });
+    }
+    return groups;
+}
+
+async function handleFolderSelect(files) {
+    if (!files || files.length === 0) return;
+    const groups = _groupDirectoryFiles(files);
+    const groupTasks = [];
+
+    for (const [rootName, entries] of groups.entries()) {
+        const placeholder = {
+            file_name: rootName,
+            file_type: 'directory',
+            file_count: entries.length,
+            _uploading: true,
+        };
+        pendingAttachments.push(placeholder);
+        uploadingCount++;
+        renderAttachmentPreview();
+
+        const uploadId = _makeUploadId();
+        groupTasks.push((async () => {
+            try {
+                const formData = new FormData();
+                formData.append('session_id', sessionId);
+                formData.append('upload_id', uploadId);
+                for (const { file, relPath } of entries) {
+                    formData.append('files', file);
+                    formData.append('relative_paths', relPath);
+                }
+
+                const resp = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await resp.json();
+                if (data.status !== 'success') {
+                    throw new Error(data.message || 'Upload failed');
+                }
+                if (!data.root_path) {
+                    throw new Error('Directory root path missing');
+                }
+                placeholder.file_path = data.root_path;
+                placeholder.file_name = data.root_name || rootName;
+                delete placeholder._uploading;
+            } catch (e) {
+                console.error('Directory upload failed:', e);
+                const i = pendingAttachments.indexOf(placeholder);
+                if (i !== -1) pendingAttachments.splice(i, 1);
+            } finally {
+                uploadingCount--;
+            }
+            renderAttachmentPreview();
+        })());
+    }
+
+    await Promise.all(groupTasks);
+}
+
 fileInput.addEventListener('change', function() {
     handleFileSelect(this.files);
     this.value = '';
+});
+
+folderInput.addEventListener('change', function() {
+    handleFolderSelect(this.files);
+    this.value = '';
+});
+
+document.addEventListener('click', (e) => {
+    if (!isAttachMenuVisible()) return;
+    if (attachMenu.contains(e.target) || attachBtn.contains(e.target)) return;
+    hideAttachMenu();
 });
 
 // Drag-and-drop support on chat input area
@@ -868,6 +1042,11 @@ chatInput.addEventListener('input', function() {
 chatInput.addEventListener('keydown', function(e) {
     if (e.keyCode === 229 || e.isComposing || isComposing) return;
 
+    if (e.key === 'Escape' && isAttachMenuVisible()) {
+        hideAttachMenu();
+        return;
+    }
+
     if (isSlashMenuVisible()) {
         if (e.key === 'ArrowDown') {
             e.preventDefault();
@@ -1011,6 +1190,7 @@ function sendMessage() {
             file_path: a.file_path,
             file_name: a.file_name,
             file_type: a.file_type,
+            file_count: a.file_count,
         }));
     }
 
@@ -1422,8 +1602,13 @@ function createUserMessageEl(content, timestamp, attachments) {
             if (a.file_type === 'image') {
                 return `<img src="${a.preview_url}" alt="${escapeHtml(a.file_name)}" class="user-msg-image">`;
             }
-            const icon = a.file_type === 'video' ? 'fa-film' : 'fa-file-alt';
-            return `<div class="user-msg-file"><i class="fas ${icon}"></i> ${escapeHtml(a.file_name)}</div>`;
+            const icon = a.file_type === 'video'
+                ? 'fa-film'
+                : (a.file_type === 'directory' ? 'fa-folder-tree' : 'fa-file-alt');
+            const suffix = a.file_type === 'directory' && a.file_count
+                ? ` (${a.file_count})`
+                : '';
+            return `<div class="user-msg-file"><i class="fas ${icon}"></i> ${escapeHtml(a.file_name)}${suffix}</div>`;
         }).join('');
         attachHtml = `<div class="user-msg-attachments">${items}</div>`;
     }
@@ -1543,10 +1728,14 @@ function renderStepsHtml(steps) {
         } else if (step.type === 'tool') {
             const argsStr = formatToolArgs(step.arguments || {});
             const resultStr = step.result ? escapeHtml(String(step.result)) : '';
+            const isErr = step.is_error === true;
+            const iconClass = isErr
+                ? 'fas fa-times text-red-400 flex-shrink-0 tool-icon'
+                : 'fas fa-check text-primary-400 flex-shrink-0 tool-icon';
             html += `
-<div class="agent-step agent-tool-step">
+<div class="agent-step agent-tool-step${isErr ? ' tool-failed' : ''}">
     <div class="tool-header" onclick="this.parentElement.classList.toggle('expanded')">
-        <i class="fas fa-check text-primary-400 flex-shrink-0 tool-icon"></i>
+        <i class="${iconClass}"></i>
         <span class="tool-name">${escapeHtml(step.name || '')}</span>
         <i class="fas fa-chevron-right tool-chevron"></i>
     </div>
@@ -1557,8 +1746,8 @@ function renderStepsHtml(steps) {
         </div>
         ${resultStr ? `
         <div class="tool-detail-section tool-output-section">
-            <div class="tool-detail-label">Output</div>
-            <pre class="tool-detail-content">${resultStr}</pre>
+            <div class="tool-detail-label">${isErr ? 'Error' : 'Output'}</div>
+            <pre class="tool-detail-content${isErr ? ' tool-error-text' : ''}">${resultStr}</pre>
         </div>` : ''}
     </div>
 </div>`;
@@ -1953,7 +2142,7 @@ function _applyInputTooltips() {
     };
     set('new-chat-btn', 'tip_new_chat');
     set('clear-context-btn', 'tip_clear_context');
-    set('attach-btn', 'tip_attach_file');
+    set('attach-btn', 'tip_attach');
     set('session-toggle-btn', 'session_history', 'bottom');
 }
 
@@ -2269,9 +2458,10 @@ function _updateScrollToBottomBtn() {
 function applyHighlighting(container) {
     const root = container || document;
     setTimeout(() => {
+        const hljsLib = getHljs();
         root.querySelectorAll('pre code').forEach(block => {
             if (!block.classList.contains('hljs')) {
-                hljs.highlightElement(block);
+                hljsLib.highlightElement(block);
             }
         });
     }, 0);
@@ -2999,6 +3189,8 @@ function renderActiveChannels() {
 
         const weixinWaiting = ch.name === 'weixin' && ch.login_status && ch.login_status !== 'logged_in';
         const wecomNeedsCreds = ch.name === 'wecom_bot' && !_wecomBotHasCreds(ch);
+        // 飞书 active 卡片渲染带 Tab 的 panel：手动填写 + 扫码重建（覆盖现有配置）
+        const isFeishu = ch.name === 'feishu';
         let statusDot, statusText;
         if (weixinWaiting) {
             statusDot = 'bg-amber-400 animate-pulse';
@@ -3014,7 +3206,7 @@ function renderActiveChannels() {
         }
 
         card.innerHTML = `
-            <div class="flex items-center gap-4${hasFields || weixinWaiting || wecomNeedsCreds ? ' mb-5' : ''}">
+            <div class="flex items-center gap-4${hasFields || weixinWaiting || wecomNeedsCreds || isFeishu ? ' mb-5' : ''}">
                 <div class="w-10 h-10 rounded-xl bg-${ch.color}-50 dark:bg-${ch.color}-900/20 flex items-center justify-center flex-shrink-0">
                     <i class="fas ${ch.icon} text-${ch.color}-500 text-base"></i>
                 </div>
@@ -3050,7 +3242,7 @@ function renderActiveChannels() {
                 </button>
                 <div id="wecom-card-scan-status" class="mt-3"></div>
             </div>` : ''}
-            ${hasFields ? `<div class="space-y-4">
+            ${isFeishu ? buildFeishuPanel(ch, true) : (hasFields ? `<div class="space-y-4">
                 ${fieldsHtml}
                 <div class="flex items-center justify-end gap-3 pt-1">
                     <span id="ch-status-${ch.name}" class="text-xs text-primary-500 opacity-0 transition-opacity duration-300"></span>
@@ -3059,7 +3251,7 @@ function renderActiveChannels() {
                                cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
                         id="ch-save-${ch.name}">${t('channels_save')}</button>
                 </div>
-            </div>` : ''}`;
+            </div>` : '')}`;
 
         container.appendChild(card);
         bindSecretFieldEvents(card);
@@ -3256,6 +3448,7 @@ function openAddChannelPanel() {
 
 function closeAddChannelPanel() {
     stopWeixinQrPoll();
+    stopFeishuRegisterPoll();
     const panel = document.getElementById('channels-add-panel');
     if (panel) {
         panel.classList.add('hidden');
@@ -3267,6 +3460,7 @@ function closeAddChannelPanel() {
 
 function onAddChannelSelect(chName) {
     stopWeixinQrPoll();
+    stopFeishuRegisterPoll();
     const fieldsContainer = document.getElementById('add-channel-fields');
     const actions = document.getElementById('add-channel-actions');
 
@@ -3290,6 +3484,13 @@ function onAddChannelSelect(chName) {
         actions.classList.add('hidden');
         const ch = channelsData.find(c => c.name === chName);
         fieldsContainer.innerHTML = buildWecomBotPanel(ch);
+        return;
+    }
+
+    if (chName === 'feishu') {
+        actions.classList.add('hidden');
+        const ch = channelsData.find(c => c.name === chName);
+        fieldsContainer.innerHTML = buildFeishuPanel(ch);
         return;
     }
 
@@ -3517,6 +3718,12 @@ function connectWeixinAfterQr() {
 // =====================================================================
 // WeCom Bot QR Auth
 // =====================================================================
+// NOTE: This is the only remaining external script in the Web Console.
+// Tencent's WeCom Bot SDK must be loaded from their official CDN — it
+// performs runtime origin/signature checks and will not work if
+// self-hosted. The SDK is fetched lazily, only when the user opens the
+// "WeCom Bot" channel QR-login flow, so the rest of the console works
+// fully offline.
 const WECOM_BOT_SDK_URL = 'https://wwcdn.weixin.qq.com/node/wework/js/wecom-aibot-sdk@0.1.0.min.js';
 const WECOM_BOT_SOURCE = 'cowagent';
 let _wecomSdkLoaded = false;
@@ -3690,14 +3897,245 @@ function startWecomBotAuthInCard() {
 // Initialize wecom bot panel with correct default mode when inserted into DOM
 document.addEventListener('DOMContentLoaded', function() {
     const observer = new MutationObserver(function() {
-        const panel = document.getElementById('wecom-bot-panel');
-        if (panel && !panel.dataset.initialized) {
-            panel.dataset.initialized = '1';
-            switchWecomBotMode(panel.dataset.defaultMode || 'scan');
+        const wecomPanel = document.getElementById('wecom-bot-panel');
+        if (wecomPanel && !wecomPanel.dataset.initialized) {
+            wecomPanel.dataset.initialized = '1';
+            switchWecomBotMode(wecomPanel.dataset.defaultMode || 'scan');
+        }
+        const feishuPanel = document.getElementById('feishu-panel');
+        if (feishuPanel && !feishuPanel.dataset.initialized) {
+            feishuPanel.dataset.initialized = '1';
+            switchFeishuMode(feishuPanel.dataset.defaultMode || 'scan');
         }
     });
     observer.observe(document.body, { childList: true, subtree: true });
 });
+
+// =====================================================================
+// Feishu One-click App Registration (lark-oapi register_app)
+// =====================================================================
+let _feishuRegisterPollTimer = null;
+
+function _feishuHasCreds(ch) {
+    if (!ch || !ch.fields) return false;
+    const idField = ch.fields.find(f => f.key === 'feishu_app_id');
+    const secretField = ch.fields.find(f => f.key === 'feishu_app_secret');
+    return !!(idField && idField.value && secretField && secretField.value);
+}
+
+function buildFeishuPanel(ch, isActive) {
+    const scanLabel = t('feishu_mode_scan');
+    const manualLabel = t('feishu_mode_manual');
+    // 已有凭据时默认进入手动 Tab，方便修改；否则推荐扫码
+    const defaultMode = _feishuHasCreds(ch) ? 'manual' : 'scan';
+    const activeAttr = isActive ? 'data-active="1"' : '';
+    return `
+        <div id="feishu-panel" data-default-mode="${defaultMode}" ${activeAttr}>
+            <div class="flex items-center justify-center gap-1 mb-5 bg-slate-100 dark:bg-white/5 rounded-lg p-1">
+                <button id="feishu-tab-scan" onclick="switchFeishuMode('scan')"
+                    class="flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-colors
+                           bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-100 shadow-sm">
+                    ${scanLabel}
+                </button>
+                <button id="feishu-tab-manual" onclick="switchFeishuMode('manual')"
+                    class="flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-colors
+                           text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">
+                    ${manualLabel}
+                </button>
+            </div>
+            <div id="feishu-mode-content"></div>
+        </div>`;
+}
+
+function switchFeishuMode(mode) {
+    const panel = document.getElementById('feishu-panel');
+    const scanTab = document.getElementById('feishu-tab-scan');
+    const manualTab = document.getElementById('feishu-tab-manual');
+    const content = document.getElementById('feishu-mode-content');
+    if (!scanTab || !manualTab || !content) return;
+
+    // 已激活通道卡片中嵌入此 panel 时，没有 add-channel-actions（保存按钮就近渲染）
+    const isActive = panel && panel.dataset.active === '1';
+    const actions = isActive ? null : document.getElementById('add-channel-actions');
+
+    const activeClasses = 'bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-100 shadow-sm';
+    const inactiveClasses = 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200';
+
+    stopFeishuRegisterPoll();
+
+    if (mode === 'scan') {
+        scanTab.className = `flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${activeClasses}`;
+        manualTab.className = `flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${inactiveClasses}`;
+        if (actions) actions.classList.add('hidden');
+        // active 卡片下扫码替换的提示文案，强调"创建新机器人会覆盖现有配置"
+        const desc = isActive
+            ? t('feishu_scan_replace_desc')
+            : t('feishu_scan_desc');
+        content.innerHTML = `
+            <div id="feishu-scan-panel" class="flex flex-col items-center py-4">
+                <p class="text-sm text-slate-600 dark:text-slate-300 mb-3 text-center">${desc}</p>
+                <button onclick="startFeishuRegister()"
+                    class="mt-2 px-6 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium
+                           cursor-pointer transition-colors duration-150">
+                    <i class="fas fa-qrcode mr-2"></i>${t('feishu_scan_btn')}
+                </button>
+                <div id="feishu-scan-status" class="mt-4 w-full"></div>
+            </div>`;
+    } else {
+        manualTab.className = `flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${activeClasses}`;
+        scanTab.className = `flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${inactiveClasses}`;
+        const ch = channelsData.find(c => c.name === 'feishu');
+        const fieldsHtml = buildChannelFieldsHtml('feishu', ch ? ch.fields || [] : []);
+        if (isActive) {
+            // 已接入卡片：内置保存按钮，复用 saveChannelConfig 走 update 流程
+            content.innerHTML = `
+                <div class="space-y-4">
+                    ${fieldsHtml}
+                    <div class="flex items-center justify-end gap-3 pt-1">
+                        <span id="ch-status-feishu" class="text-xs text-primary-500 opacity-0 transition-opacity duration-300"></span>
+                        <button onclick="saveChannelConfig('feishu')"
+                            class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
+                                   cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                            id="ch-save-feishu">${t('channels_save')}</button>
+                    </div>
+                </div>`;
+        } else {
+            content.innerHTML = `<div class="space-y-4">${fieldsHtml}</div>`;
+            if (actions) actions.classList.remove('hidden');
+        }
+        bindSecretFieldEvents(content);
+    }
+}
+
+function stopFeishuRegisterPoll() {
+    if (_feishuRegisterPollTimer) {
+        clearTimeout(_feishuRegisterPollTimer);
+        _feishuRegisterPollTimer = null;
+    }
+}
+
+function startFeishuRegister(targetStatusId) {
+    const statusId = targetStatusId || 'feishu-scan-status';
+    const statusEl = document.getElementById(statusId);
+    if (statusEl) {
+        statusEl.innerHTML = `<p class="text-sm text-slate-500 dark:text-slate-400 text-center">${t('feishu_scan_loading')}</p>`;
+    }
+    stopFeishuRegisterPoll();
+    fetch('/api/feishu/register')
+        .then(r => r.json())
+        .then(data => {
+            if (data.status !== 'success') {
+                renderFeishuRegisterError(statusId, data.message || t('feishu_scan_fail'));
+                return;
+            }
+            renderFeishuQr(statusId, data.qr_image, data.qrcode_url);
+            pollFeishuRegisterStatus(statusId);
+        })
+        .catch(err => {
+            renderFeishuRegisterError(statusId, err.message || t('feishu_scan_fail'));
+        });
+}
+
+function renderFeishuQr(statusId, qrImage, qrUrl) {
+    const statusEl = document.getElementById(statusId);
+    if (!statusEl) return;
+    const imgHtml = qrImage
+        ? `<img src="${qrImage}" alt="QR" class="w-44 h-44 rounded-lg border border-slate-200 dark:border-white/10 bg-white p-2"/>`
+        : `<div class="w-44 h-44 rounded-lg border border-dashed border-slate-300 flex items-center justify-center text-xs text-slate-400">QR</div>`;
+    statusEl.innerHTML = `
+        <div class="flex flex-col items-center gap-3">
+            ${imgHtml}
+            <p class="text-xs text-amber-500">${t('feishu_scan_waiting')}</p>
+            <p class="text-xs text-slate-400 dark:text-slate-500">${t('feishu_scan_tip')}</p>
+            ${qrUrl ? `<a href="${qrUrl}" target="_blank" rel="noopener"
+                class="text-xs text-blue-500 hover:text-blue-600 underline">${t('feishu_scan_open_link')}</a>` : ''}
+        </div>`;
+}
+
+function renderFeishuRegisterError(statusId, message) {
+    const statusEl = document.getElementById(statusId);
+    if (!statusEl) return;
+    statusEl.innerHTML = `
+        <div class="flex flex-col items-center gap-2 py-2">
+            <p class="text-sm text-red-500 text-center">${message}</p>
+            <button onclick="startFeishuRegister('${statusId}')"
+                class="mt-1 px-4 py-1.5 rounded-md text-xs font-medium
+                       bg-slate-100 dark:bg-white/10 text-slate-700 dark:text-slate-200
+                       hover:bg-slate-200 dark:hover:bg-white/20 cursor-pointer">
+                <i class="fas fa-rotate-right mr-1"></i>${t('feishu_scan_retry')}
+            </button>
+        </div>`;
+}
+
+function pollFeishuRegisterStatus(statusId) {
+    stopFeishuRegisterPoll();
+    _feishuRegisterPollTimer = setTimeout(() => {
+        fetch('/api/feishu/register', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'poll' })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.status !== 'success') {
+                renderFeishuRegisterError(statusId, data.message || t('feishu_scan_fail'));
+                return;
+            }
+            const rs = data.register_status;
+            if (rs === 'done') {
+                const statusEl = document.getElementById(statusId);
+                if (statusEl) {
+                    statusEl.innerHTML = `
+                        <div class="flex flex-col items-center py-2">
+                            <div class="w-10 h-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 flex items-center justify-center mb-2">
+                                <i class="fas fa-check text-emerald-500 text-lg"></i>
+                            </div>
+                            <p class="text-sm font-medium text-emerald-600 dark:text-emerald-400">${t('feishu_scan_success')}</p>
+                        </div>`;
+                }
+                connectFeishuAfterRegister(data.app_id, data.app_secret);
+            } else if (rs === 'expired') {
+                renderFeishuRegisterError(statusId, t('feishu_scan_expired'));
+            } else if (rs === 'denied') {
+                renderFeishuRegisterError(statusId, t('feishu_scan_denied'));
+            } else if (rs === 'error') {
+                renderFeishuRegisterError(statusId, data.message || t('feishu_scan_fail'));
+            } else {
+                pollFeishuRegisterStatus(statusId);
+            }
+        })
+        .catch(() => {
+            pollFeishuRegisterStatus(statusId);
+        });
+    }, 2000);
+}
+
+function connectFeishuAfterRegister(appId, appSecret) {
+    fetch('/api/channels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            action: 'connect',
+            channel: 'feishu',
+            config: { feishu_app_id: appId, feishu_app_secret: appSecret }
+        })
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.status === 'success') {
+            const ch = channelsData.find(c => c.name === 'feishu');
+            if (ch) {
+                ch.active = true;
+                (ch.fields || []).forEach(f => {
+                    if (f.key === 'feishu_app_id') f.value = appId;
+                    if (f.key === 'feishu_app_secret') f.value = ChannelsHandler_maskSecret(appSecret);
+                });
+            }
+            setTimeout(() => renderActiveChannels(), 1500);
+        }
+    })
+    .catch(() => {});
+}
 
 // =====================================================================
 // Scheduler View
@@ -3754,6 +4192,51 @@ function loadTasksView() {
 // =====================================================================
 let logEventSource = null;
 
+function logLevelClass(line) {
+    if (/\[CRITICAL\]/.test(line)) return 'log-line-critical';
+    if (/\[ERROR\]/.test(line))    return 'log-line-error';
+    if (/\[WARNING\]/.test(line))  return 'log-line-warning';
+    if (/\[INFO\]/.test(line))     return 'log-line-info';
+    if (/\[DEBUG\]/.test(line))    return 'log-line-debug';
+    return '';
+}
+
+function getHiddenLevels() {
+    const hidden = new Set();
+    document.querySelectorAll('.log-filter-cb').forEach(function(cb) {
+        if (!cb.checked) hidden.add('log-line-' + cb.dataset.level);
+    });
+    return hidden;
+}
+
+function applyLogFilter() {
+    const hidden = getHiddenLevels();
+    document.querySelectorAll('#log-output .log-line').forEach(function(span) {
+        const level = span.classList[1] || '';
+        span.style.display = hidden.has(level) ? 'none' : '';
+    });
+}
+
+function appendLogLines(output, text) {
+    const hidden = getHiddenLevels();
+    let lastLevelClass = '';
+    const lines = text.split('\n');
+    lines.forEach(function(line, i) {
+        if (i === lines.length - 1 && line === '') return;
+        const span = document.createElement('span');
+        const levelClass = logLevelClass(line) || lastLevelClass;
+        if (logLevelClass(line)) lastLevelClass = levelClass;
+        span.className = 'log-line ' + levelClass;
+        span.textContent = line + '\n';
+        if (hidden.has(levelClass)) span.style.display = 'none';
+        output.appendChild(span);
+    });
+}
+
+document.addEventListener('change', function(e) {
+    if (e.target.classList.contains('log-filter-cb')) applyLogFilter();
+});
+
 function startLogStream() {
     if (logEventSource) return;
     const output = document.getElementById('log-output');
@@ -3765,10 +4248,11 @@ function startLogStream() {
         try { item = JSON.parse(e.data); } catch (_) { return; }
 
         if (item.type === 'init') {
-            output.textContent = item.content || '';
+            output.innerHTML = '';
+            appendLogLines(output, item.content || '');
             output.scrollTop = output.scrollHeight;
         } else if (item.type === 'line') {
-            output.textContent += item.content;
+            appendLogLines(output, item.content);
             output.scrollTop = output.scrollHeight;
         } else if (item.type === 'error') {
             output.textContent = item.message || 'Error loading logs';
@@ -4107,18 +4591,38 @@ function switchKnowledgeTab(tab) {
     }
 }
 
+let _d3LoadPromise = null;
+
+function ensureD3Loaded() {
+    if (window.d3) return Promise.resolve(window.d3);
+    if (_d3LoadPromise) return _d3LoadPromise;
+    _d3LoadPromise = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = 'assets/vendor/d3/d3.min.js';
+        script.async = true;
+        script.onload = () => resolve(window.d3);
+        script.onerror = () => reject(new Error('Failed to load d3'));
+        document.head.appendChild(script);
+    });
+    return _d3LoadPromise;
+}
+
 function loadKnowledgeGraph() {
     _knowledgeGraphLoaded = true;
     const container = document.getElementById('knowledge-graph-container');
-    container.innerHTML = '';
+    container.innerHTML = '<div class="flex items-center justify-center h-full text-slate-400 text-sm"><i class="fas fa-spinner fa-spin mr-2"></i>Loading graph...</div>';
 
-    fetch('/api/knowledge/graph').then(r => r.json()).then(data => {
+    Promise.all([
+        ensureD3Loaded(),
+        fetch('/api/knowledge/graph').then(r => r.json()),
+    ]).then(([, data]) => {
         const nodes = data.nodes || [];
         const links = data.links || [];
         if (nodes.length === 0) {
             container.innerHTML = `<div class="flex flex-col items-center justify-center h-full text-slate-400"><i class="fas fa-diagram-project text-3xl mb-3 opacity-40"></i><p class="text-sm">${t('knowledge_empty_hint')}</p></div>`;
             return;
         }
+        container.innerHTML = '';
         renderKnowledgeGraph(container, nodes, links);
     }).catch(() => {
         container.innerHTML = '<div class="flex items-center justify-center h-full text-slate-400 text-sm">Failed to load graph</div>';

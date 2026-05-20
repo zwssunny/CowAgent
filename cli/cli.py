@@ -26,7 +26,8 @@ Commands:
   knowledge  Manage knowledge base.
   install-browser  Install browser tool (Playwright + Chromium).
 
-Tip: You can also send /help, /skill list, etc. in agent chat."""
+Tip: Memory index management lives in chat — send /memory status or
+/memory rebuild-index to the running agent."""
 
 
 class CowCLI(click.Group):

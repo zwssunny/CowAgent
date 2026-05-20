@@ -3,6 +3,7 @@ Integration module for scheduler with AgentBridge
 """
 
 import os
+import threading
 from typing import Optional
 from config import conf
 from common.log import logger
@@ -13,65 +14,82 @@ from bridge.reply import Reply, ReplyType
 # Global scheduler service instance
 _scheduler_service = None
 _task_store = None
+# Module-level lock to guard idempotent initialization across threads
+_init_lock = threading.Lock()
 
 
 def init_scheduler(agent_bridge) -> bool:
     """
-    Initialize scheduler service
-    
+    Initialize scheduler service (idempotent).
+
+    Safe to call multiple times and from multiple threads: only the first
+    successful call creates the singleton ``SchedulerService`` + background
+    scanning thread. Subsequent calls return immediately.
+
     Args:
         agent_bridge: AgentBridge instance
-        
+
     Returns:
-        True if initialized successfully
+        True if scheduler is initialized (newly created or already running)
     """
     global _scheduler_service, _task_store
-    
-    try:
-        from agent.tools.scheduler.task_store import TaskStore
-        from agent.tools.scheduler.scheduler_service import SchedulerService
-        
-        # Get workspace from config
-        workspace_root = expand_path(conf().get("agent_workspace", "~/cow"))
-        store_path = os.path.join(workspace_root, "scheduler", "tasks.json")
-        
-        # Create task store
-        _task_store = TaskStore(store_path)
-        logger.debug(f"[Scheduler] Task store initialized: {store_path}")
-        
-        # Create execute callback
-        def execute_task_callback(task: dict):
-            """Callback to execute a scheduled task"""
-            try:
-                action = task.get("action", {})
-                action_type = action.get("type")
-                
-                if action_type == "agent_task":
-                    _execute_agent_task(task, agent_bridge)
-                elif action_type == "send_message":
-                    # Legacy support for old tasks
-                    _execute_send_message(task, agent_bridge)
-                elif action_type == "tool_call":
-                    # Legacy support for old tasks
-                    _execute_tool_call(task, agent_bridge)
-                elif action_type == "skill_call":
-                    # Legacy support for old tasks
-                    _execute_skill_call(task, agent_bridge)
-                else:
-                    logger.warning(f"[Scheduler] Unknown action type: {action_type}")
-            except Exception as e:
-                logger.error(f"[Scheduler] Error executing task {task.get('id')}: {e}")
-        
-        # Create scheduler service
-        _scheduler_service = SchedulerService(_task_store, execute_task_callback)
-        _scheduler_service.start()
-        
-        logger.debug("[Scheduler] Scheduler service initialized and started")
+
+    # Fast path: already initialized and running
+    if _scheduler_service is not None and getattr(_scheduler_service, "running", False):
         return True
-        
-    except Exception as e:
-        logger.error(f"[Scheduler] Failed to initialize scheduler: {e}")
-        return False
+
+    with _init_lock:
+        # Re-check under the lock to avoid races where multiple threads
+        # passed the fast-path check before any of them acquired the lock.
+        if _scheduler_service is not None and getattr(_scheduler_service, "running", False):
+            return True
+
+        try:
+            from agent.tools.scheduler.task_store import TaskStore
+            from agent.tools.scheduler.scheduler_service import SchedulerService
+
+            # Get workspace from config
+            workspace_root = expand_path(conf().get("agent_workspace", "~/cow"))
+            store_path = os.path.join(workspace_root, "scheduler", "tasks.json")
+
+            # Create task store (reuse if already created)
+            if _task_store is None:
+                _task_store = TaskStore(store_path)
+                logger.debug(f"[Scheduler] Task store initialized: {store_path}")
+
+            # Create execute callback
+            def execute_task_callback(task: dict):
+                """Callback to execute a scheduled task"""
+                try:
+                    action = task.get("action", {})
+                    action_type = action.get("type")
+
+                    if action_type == "agent_task":
+                        _execute_agent_task(task, agent_bridge)
+                    elif action_type == "send_message":
+                        # Legacy support for old tasks
+                        _execute_send_message(task, agent_bridge)
+                    elif action_type == "tool_call":
+                        # Legacy support for old tasks
+                        _execute_tool_call(task, agent_bridge)
+                    elif action_type == "skill_call":
+                        # Legacy support for old tasks
+                        _execute_skill_call(task, agent_bridge)
+                    else:
+                        logger.warning(f"[Scheduler] Unknown action type: {action_type}")
+                except Exception as e:
+                    logger.error(f"[Scheduler] Error executing task {task.get('id')}: {e}")
+
+            # Create scheduler service
+            _scheduler_service = SchedulerService(_task_store, execute_task_callback)
+            _scheduler_service.start()
+
+            logger.debug("[Scheduler] Scheduler service initialized and started")
+            return True
+
+        except Exception as e:
+            logger.error(f"[Scheduler] Failed to initialize scheduler: {e}")
+            return False
 
 
 def get_task_store():
@@ -82,6 +100,49 @@ def get_task_store():
 def get_scheduler_service():
     """Get the global scheduler service instance"""
     return _scheduler_service
+
+
+def _remember_delivered_output(
+    agent_bridge,
+    task: dict,
+    channel_type: str,
+    content: str,
+) -> None:
+    """Best-effort persistence of the message the scheduler sent to a user.
+
+    Uses notify_session_id (the real chat session_id stored at task creation time)
+    so that group chats correctly associate the output with the user's conversation.
+    Falls back to receiver for backward compatibility with old tasks.
+
+    Per-action-type behaviour:
+        - agent_task / tool_call / skill_call: gated by ``scheduler_inject_to_session``
+          (default True). These produce AI-generated content worth remembering.
+        - send_message: additionally gated by ``scheduler_inject_send_message``
+          (default False). Fixed reminder text rarely benefits follow-up Q&A and
+          would just consume context tokens.
+    """
+    if not content:
+        return
+    action = task.get("action", {})
+    action_type = action.get("type", "")
+
+    # send_message defaults to NOT being injected; explicit opt-in via config.
+    if action_type == "send_message":
+        if not conf().get("scheduler_inject_send_message", False):
+            return
+
+    session_id = action.get("notify_session_id") or action.get("receiver")
+    if not session_id:
+        return
+    try:
+        remember = getattr(agent_bridge, "remember_scheduled_output", None)
+        if remember:
+            task_desc = action.get("task_description") or action.get("content", "")
+            remember(session_id, str(content), channel_type=channel_type, task_description=task_desc)
+    except Exception as e:
+        logger.warning(
+            f"[Scheduler] Failed to remember delivered output for {session_id}: {e}"
+        )
 
 
 def _execute_agent_task(task: dict, agent_bridge):
@@ -165,6 +226,7 @@ def _execute_agent_task(task: dict, agent_bridge):
                         
                         # Send the reply
                         channel.send(reply, context)
+                        _remember_delivered_output(agent_bridge, task, channel_type, reply.content)
                         logger.info(f"[Scheduler] Task {task['id']} executed successfully, result sent to {receiver}")
                     else:
                         logger.error(f"[Scheduler] Failed to create channel: {channel_type}")
@@ -255,6 +317,7 @@ def _execute_send_message(task: dict, agent_bridge):
                     logger.debug(f"[Scheduler] Registered request_id {request_id} -> session {receiver}")
                 
                 channel.send(reply, context)
+                _remember_delivered_output(agent_bridge, task, channel_type, content)
                 logger.info(f"[Scheduler] Task {task['id']} executed: sent message to {receiver}")
             else:
                 logger.error(f"[Scheduler] Failed to create channel: {channel_type}")
@@ -351,6 +414,7 @@ def _execute_tool_call(task: dict, agent_bridge):
                     logger.debug(f"[Scheduler] Registered request_id {request_id} -> session {receiver}")
 
                 channel.send(reply, context)
+                _remember_delivered_output(agent_bridge, task, channel_type, content)
                 logger.info(f"[Scheduler] Task {task['id']} executed: sent tool result to {receiver}")
             else:
                 logger.error(f"[Scheduler] Failed to create channel: {channel_type}")
@@ -428,6 +492,24 @@ def _execute_skill_call(task: dict, agent_bridge):
                 # Add prefix if specified
                 if result_prefix:
                     content = f"{result_prefix}\n\n{content}"
+                
+                # Send the result via channel
+                from channel.channel_factory import create_channel
+                
+                try:
+                    channel = create_channel(channel_type)
+                    if channel:
+                        # For web channel, register request_id
+                        if channel_type == "web" and hasattr(channel, 'request_to_session'):
+                            req_id = context.get("request_id")
+                            if req_id:
+                                channel.request_to_session[req_id] = receiver
+                                logger.debug(f"[Scheduler] Registered request_id {req_id} -> session {receiver}")
+                        
+                        channel.send(Reply(ReplyType.TEXT, content), context)
+                        _remember_delivered_output(agent_bridge, task, channel_type, content)
+                except Exception as e:
+                    logger.error(f"[Scheduler] Failed to send skill result: {e}")
                 
                 logger.info(f"[Scheduler] Task {task['id']} executed: skill result sent to {receiver}")
             else:

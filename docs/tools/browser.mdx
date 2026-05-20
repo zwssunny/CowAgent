@@ -45,7 +45,8 @@ description: 控制浏览器访问和操作网页
 </Tabs>
 
 <Note>
-  支持 Ubuntu 20.04+、Debian 10+、macOS、Windows。Ubuntu 18.04 等旧系统会自动降级安装兼容版本。
+  1. 支持 Ubuntu 20.04+、Debian 10+、macOS、Windows。Ubuntu 18.04 等旧系统会自动降级安装兼容版本。
+  2. 浏览器工具依赖较重（约300MB），为可选安装。轻量的网页内容获取可使用 `web_fetch` 工具。
 </Note>
 
 ## 工作流程
@@ -104,6 +105,68 @@ Agent 使用浏览器的典型流程：
 }
 ```
 
+## 登录态持久化
+
+**只需登录一次目标网站，Agent 后续可直接使用**。提供两种方式：
+
+### 方式一：Persistent 模式（默认）
+
+开箱即用，登录信息保存在 `~/.cow/browser_profile`。无需任何配置。
+
+如需关闭持久化模式，每次都用纯净环境：
+
+```json
+{
+  "tools": {
+    "browser": {
+      "persistent": false
+    }
+  }
+}
+```
+
+### 方式二：CDP 模式（接管真实 Chrome）
+
+让 Agent 连接独立启动的真实 Chrome（而非 Playwright 自带的 Chromium），获得完整浏览器指纹，适合反爬严格的网站。
+
+启动 Chrome 时加上调试端口和独立用户目录：
+
+<Tabs>
+  <Tab title="macOS">
+    ```bash
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+      --remote-debugging-port=9222 \
+      --user-data-dir="$HOME/.cow/chrome-cdp"
+    ```
+  </Tab>
+  <Tab title="Linux">
+    ```bash
+    google-chrome \
+      --remote-debugging-port=9222 \
+      --user-data-dir="$HOME/.cow/chrome-cdp"
+    ```
+  </Tab>
+  <Tab title="Windows">
+    ```powershell
+    & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+      --remote-debugging-port=9222 `
+      --user-data-dir="$env:USERPROFILE\.cow\chrome-cdp"
+    ```
+  </Tab>
+</Tabs>
+
+在 `config.json` 中配置端点：
+
+```json
+{
+  "tools": {
+    "browser": {
+      "cdp_endpoint": "http://localhost:9222"
+    }
+  }
+}
+```
+
 <Note>
-  浏览器工具依赖较重（~300MB），如不需要可不安装。轻量的网页内容获取可使用 `web_fetch` 工具。
+  Chrome 137+ 限制 `--remote-debugging-port` 必须搭配独立 `--user-data-dir`，因此 CDP 启动的 Chrome **无法直接复用你日常 Chrome 的登录态**，需要在独立目录中重新登录一次。
 </Note>

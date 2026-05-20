@@ -6,7 +6,7 @@ description: CowAgent 支持的模型及推荐选择
 CowAgent 支持国内外主流厂商的大语言模型，模型接口实现在项目的 `models/` 目录下。
 
 <Note>
-  Agent 模式下推荐使用以下模型，可根据效果及成本综合选择：deepseek-v4-flash、MiniMax-M2.7、claude-sonnet-4-6、gemini-3.1-pro-preview、glm-5.1、qwen3.6-plus、kimi-k2.6
+  Agent 模式下推荐使用以下模型，可根据效果及成本综合选择：deepseek-v4-flash、MiniMax-M2.7、claude-sonnet-4-6、gemini-3.1-pro-preview、glm-5.1、qwen3.6-plus、kimi-k2.6、ernie-5.1
 
   同时支持使用 [LinkAI](https://link-ai.tech) 平台接口，可灵活切换多种模型，并支持知识库、工作流、插件等 Agent 能力。
 </Note>
@@ -25,6 +25,9 @@ CowAgent 支持国内外主流厂商的大语言模型，模型接口实现在�
 <CardGroup cols={2}>
   <Card title="DeepSeek" href="/models/deepseek">
     deepseek-v4-flash、deepseek-v4-pro 等
+  </Card>
+  <Card title="百度千帆 / ERNIE" href="/models/qianfan">
+    ernie-5.1、ernie-5.0、ernie-4.5-turbo-128k 等
   </Card>
   <Card title="MiniMax" href="/models/minimax">
     MiniMax-M2.7 等系列模型

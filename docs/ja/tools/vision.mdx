@@ -23,6 +23,7 @@ Vision ツールは多段階の自動選択＋自動フォールバック戦略�
 | ベンダー | ビジョンモデル | 説明 |
 | --- | --- | --- |
 | OpenAI / 互換プロトコル | メインモデル | すべての OpenAI 互換マルチモーダルモデルに対応 |
+| Baidu Qianfan | メインモデル | 多モーダルの主モデル（`ernie-5.1` など）は直接画像を処理。テキスト専用主モデルの場合は `ernie-4.5-turbo-vl` に自動フォールバック |
 | 通義千問 (DashScope) | メインモデル | MultiModalConversation API 経由 |
 | Claude | メインモデル | Anthropic ネイティブ画像形式 |
 | Gemini | メインモデル | inlineData 形式 |
@@ -52,7 +53,7 @@ Vision ツールで使用するモデルを指定するには、`config.json` �
 {
     "tool": {
         "vision": {
-            "model": "gpt-4o"
+            "model": "ernie-4.5-turbo-vl"
         }
     }
 }

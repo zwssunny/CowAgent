@@ -144,45 +144,37 @@ class MemoryStorage:
             ON chunks(path, hash)
         """)
         
-        # Create FTS5 virtual table for keyword search (only if supported)
+        # Create FTS5 virtual table + triggers (only if supported).
+        # Self-heal: if the previous process crashed mid-rebuild and left
+        # triggers pointing at a missing chunks_fts (or vice versa), wipe
+        # both sides and recreate cleanly. Otherwise next chunks INSERT
+        # will fail with "no such table: chunks_fts".
         if self.fts5_available:
-            # Use default unicode61 tokenizer (stable and compatible)
-            # For CJK support, we'll use LIKE queries as fallback
-            self.conn.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                    text,
-                    id UNINDEXED,
-                    user_id UNINDEXED,
-                    path UNINDEXED,
-                    source UNINDEXED,
-                    scope UNINDEXED,
-                    content='chunks',
-                    content_rowid='rowid'
+            if self._fts5_state_inconsistent():
+                from common.log import logger
+                logger.warning(
+                    "[MemoryStorage] FTS5 state inconsistent (triggers/table mismatch). "
+                    "Resetting chunks_fts to recover."
                 )
-            """)
-            
-            # Create triggers to keep FTS in sync
-            self.conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-                    INSERT INTO chunks_fts(rowid, text, id, user_id, path, source, scope)
-                    VALUES (new.rowid, new.text, new.id, new.user_id, new.path, new.source, new.scope);
-                END
-            """)
-            
-            self.conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-                    DELETE FROM chunks_fts WHERE rowid = old.rowid;
-                END
-            """)
-            
-            self.conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-                    UPDATE chunks_fts SET text = new.text, id = new.id,
-                                         user_id = new.user_id, path = new.path, source = new.source, scope = new.scope
-                    WHERE rowid = new.rowid;
-                END
-            """)
-        
+                self.conn.execute("DROP TRIGGER IF EXISTS chunks_ai")
+                self.conn.execute("DROP TRIGGER IF EXISTS chunks_ad")
+                self.conn.execute("DROP TRIGGER IF EXISTS chunks_au")
+                self.conn.execute("DROP TABLE IF EXISTS chunks_fts")
+                self.conn.commit()
+            self._create_fts5_objects()
+
+            # Probe FTS5 shadow tables. The schema may be intact but the
+            # internal _data/_idx/_docsize blob can still be corrupt — that
+            # surfaces as "database disk image is malformed" on bm25 / MATCH.
+            # We rebuild from the chunks table when that happens; data isn't
+            # lost because chunks (the content table) is the source of truth.
+            if self._fts5_shadow_corrupt():
+                from common.log import logger
+                logger.warning(
+                    "[MemoryStorage] FTS5 shadow tables corrupt; rebuilding from chunks."
+                )
+                self._rebuild_fts5_from_chunks()
+
         # Create files metadata table
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS files (
@@ -196,7 +188,116 @@ class MemoryStorage:
         """)
         
         self.conn.commit()
-    
+
+    def _fts5_state_inconsistent(self) -> bool:
+        """Detect a half-broken FTS5 setup (e.g. trigger exists but table doesn't)."""
+        try:
+            row = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+            ).fetchone()
+            table_exists = row is not None
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name IN ('chunks_ai','chunks_ad','chunks_au')"
+            ).fetchone()
+            trigger_count = int(row[0]) if row else 0
+        except Exception:
+            return False
+        # Healthy = both present (3 triggers + table) or both absent.
+        return table_exists != (trigger_count > 0)
+
+    def _create_fts5_objects(self):
+        """Create chunks_fts virtual table and the 3 sync triggers.
+
+        Idempotent: uses IF NOT EXISTS. Caller must hold self.conn.
+        """
+        self.conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                text,
+                id UNINDEXED,
+                user_id UNINDEXED,
+                path UNINDEXED,
+                source UNINDEXED,
+                scope UNINDEXED,
+                content='chunks',
+                content_rowid='rowid'
+            )
+        """)
+        self.conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+                INSERT INTO chunks_fts(rowid, text, id, user_id, path, source, scope)
+                VALUES (new.rowid, new.text, new.id, new.user_id, new.path, new.source, new.scope);
+            END
+        """)
+        self.conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+                DELETE FROM chunks_fts WHERE rowid = old.rowid;
+            END
+        """)
+        self.conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+                UPDATE chunks_fts SET text = new.text, id = new.id,
+                                     user_id = new.user_id, path = new.path,
+                                     source = new.source, scope = new.scope
+                WHERE rowid = new.rowid;
+            END
+        """)
+
+    def reset_fts5(self):
+        """Drop and recreate chunks_fts + triggers in one transaction.
+
+        Used by rebuild_index to recover from FTS5 shadow-table corruption
+        (bm25/ORDER BY rank may raise "database disk image is malformed"
+        even when raw MATCH still works).
+
+        Triggers must be dropped first; otherwise the next chunks INSERT/DELETE
+        on the existing connection will hit "no such table: chunks_fts".
+        """
+        if not self.fts5_available:
+            return
+        self.conn.execute("DROP TRIGGER IF EXISTS chunks_ai")
+        self.conn.execute("DROP TRIGGER IF EXISTS chunks_ad")
+        self.conn.execute("DROP TRIGGER IF EXISTS chunks_au")
+        self.conn.execute("DROP TABLE IF EXISTS chunks_fts")
+        self._create_fts5_objects()
+        self.conn.commit()
+
+    def _fts5_shadow_corrupt(self) -> bool:
+        """Probe whether bm25 over chunks_fts errors out at startup.
+
+        Schema (table + triggers) can be intact while the underlying
+        FTS5 shadow blobs are malformed — typically because the previous
+        process crashed mid-write or wrote with a different SQLite build.
+        A cheap MATCH probe surfaces it immediately."""
+        try:
+            self.conn.execute(
+                "SELECT bm25(chunks_fts) FROM chunks_fts WHERE chunks_fts MATCH 'a' LIMIT 1"
+            ).fetchone()
+            return False
+        except sqlite3.DatabaseError as e:
+            msg = str(e).lower()
+            return "malformed" in msg or "corrupt" in msg
+        except Exception:
+            # Any other error (e.g. table missing) is handled by the
+            # state-inconsistent path; treat as healthy here.
+            return False
+
+    def _rebuild_fts5_from_chunks(self):
+        """Drop FTS5, recreate it, then INSERT every row from chunks.
+
+        Safe data-wise: chunks (the content table) is the source of truth.
+        Done in one transaction so a crash leaves either fully old or fully
+        new state, not a partial rebuild.
+        """
+        # Reset schema first; this clears any malformed shadow blobs.
+        self.reset_fts5()
+        # Re-feed content. Triggers handle future writes automatically.
+        self.conn.execute("""
+            INSERT INTO chunks_fts(rowid, text, id, user_id, path, source, scope)
+            SELECT rowid, text, id, user_id, path, source, scope FROM chunks
+        """)
+        self.conn.commit()
+
     def save_chunk(self, chunk: MemoryChunk):
         """Save a memory chunk"""
         self.conn.execute("""
@@ -283,13 +384,26 @@ class MemoryStorage:
             """
         
         rows = self.conn.execute(query, params).fetchall()
-        
-        # Calculate cosine similarity
+
+        # Calculate cosine similarity. We probe the first row's dim to fail
+        # loudly on a query/index dim mismatch — otherwise every doc would
+        # score 0 silently, leaving the user wondering why search broke.
         results = []
+        query_dim = len(query_embedding)
+        if rows:
+            first = json.loads(rows[0]['embedding'])
+            if isinstance(first, list) and len(first) != query_dim:
+                raise ValueError(
+                    f"Embedding dim mismatch: query is {query_dim}-dim but "
+                    f"index stores {len(first)}-dim vectors. The configured "
+                    f"embedding model differs from the one that built the "
+                    f"index — run /memory rebuild-index to re-embed."
+                )
+
         for row in rows:
             embedding = json.loads(row['embedding'])
             similarity = self._cosine_similarity(query_embedding, embedding)
-            
+
             if similarity > 0:
                 results.append((similarity, row))
         
@@ -319,27 +433,24 @@ class MemoryStorage:
     ) -> List[SearchResult]:
         """
         Keyword search using FTS5 + LIKE fallback
-        
+
         Strategy:
-        1. If FTS5 available: Try FTS5 search first (good for English and word-based languages)
-        2. If no FTS5 or no results and query contains CJK: Use LIKE search
+        1. If FTS5 available and healthy: try FTS5 first
+        2. Always fall back to LIKE for CJK queries
+        3. If FTS5 fails OR returns empty for non-CJK, also try LIKE so a
+           broken FTS5 shadow table doesn't silently kill keyword search.
         """
         if scopes is None:
             scopes = ["shared"]
             if user_id:
                 scopes.append("user")
-        
-        # Try FTS5 search first (if available)
+
         if self.fts5_available:
             fts_results = self._search_fts5(query, user_id, scopes, limit)
             if fts_results:
                 return fts_results
-        
-        # Fallback to LIKE search (always for CJK, or if FTS5 not available)
-        if not self.fts5_available or MemoryStorage._contains_cjk(query):
-            return self._search_like(query, user_id, scopes, limit)
-        
-        return []
+
+        return self._search_like(query, user_id, scopes, limit)
     
     def _search_fts5(
         self,
@@ -394,7 +505,11 @@ class MemoryStorage:
                 )
                 for row in rows
             ]
-        except Exception:
+        except Exception as e:
+            from common.log import logger
+            logger.error(
+                f"[MemoryStorage] FTS5 search failed (caller will fall back to LIKE): {e}"
+            )
             return []
     
     def _search_like(
@@ -404,21 +519,28 @@ class MemoryStorage:
         scopes: List[str],
         limit: int
     ) -> List[SearchResult]:
-        """LIKE-based search for CJK characters"""
+        """LIKE-based search.
+
+        Used as the keyword-search fallback when FTS5 is unavailable, fails,
+        or returns empty. Supports both CJK runs and ASCII word tokens so it
+        can serve as a true safety net for any query.
+        """
         import re
-        # Extract CJK words (2+ characters)
+        # CJK runs (2+ chars) + ASCII word tokens (3+ chars to avoid noise)
         cjk_words = re.findall(r'[\u4e00-\u9fff]{2,}', query)
-        if not cjk_words:
+        ascii_words = [t for t in re.findall(r'[A-Za-z0-9_]+', query) if len(t) >= 3]
+        words = cjk_words + ascii_words
+        if not words:
             return []
-        
+
         scope_placeholders = ','.join('?' * len(scopes))
-        
-        # Build LIKE conditions for each word
+
+        # Build LIKE conditions for each word (case-insensitive for ASCII)
         like_conditions = []
         params = []
-        for word in cjk_words:
-            like_conditions.append("text LIKE ?")
-            params.append(f'%{word}%')
+        for word in words:
+            like_conditions.append("LOWER(text) LIKE ?")
+            params.append(f'%{word.lower()}%')
         
         where_clause = ' OR '.join(like_conditions)
         params.extend(scopes)
@@ -455,7 +577,9 @@ class MemoryStorage:
                 )
                 for row in rows
             ]
-        except Exception:
+        except Exception as e:
+            from common.log import logger
+            logger.error(f"[MemoryStorage] LIKE search failed: {e}")
             return []
     
     def delete_by_path(self, path: str):
@@ -485,14 +609,19 @@ class MemoryStorage:
         chunks_count = self.conn.execute("""
             SELECT COUNT(*) as cnt FROM chunks
         """).fetchone()['cnt']
-        
+
         files_count = self.conn.execute("""
             SELECT COUNT(*) as cnt FROM files
         """).fetchone()['cnt']
-        
+
+        embedded_count = self.conn.execute("""
+            SELECT COUNT(*) as cnt FROM chunks WHERE embedding IS NOT NULL
+        """).fetchone()['cnt']
+
         return {
             'chunks': chunks_count,
-            'files': files_count
+            'files': files_count,
+            'embedded': embedded_count,
         }
     
     def close(self):

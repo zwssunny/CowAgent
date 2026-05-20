@@ -4,6 +4,15 @@ Browser tool - Control a Chromium browser for web navigation and interaction.
 Uses Playwright under the hood. Browser instance is lazily started on first
 use, reused across tool calls within the same session, and cleaned up via
 close().
+
+Launch modes (configured under `tools.browser` in config.json):
+  - persistent (default): Chromium runs with a persistent user_data_dir
+    (default `~/.cow/browser_profile`), so cookies and login state survive
+    across runs. The user only needs to log in once.
+  - cdp: When `cdp_endpoint` is set, attach to an externally launched Chrome
+    via the Chrome DevTools Protocol. Lets the agent reuse the user's real
+    browser (with all logins / extensions / true fingerprints).
+  - fresh: Set `persistent` to false to fall back to a clean context every run.
 """
 
 import json
@@ -25,7 +34,10 @@ class BrowserTool(BaseTool):
         "get_text, press, evaluate.\n\n"
         "Workflow: navigate (auto-includes snapshot with element refs) → click/fill/select by ref → snapshot to verify.\n\n"
         "Use snapshot as the primary way to read pages. Use screenshot + send to show key results to the user. "
-        "For login/CAPTCHA/authorization etc., screenshot and ask the user for help."
+        "For login/CAPTCHA/authorization etc., screenshot and ask the user for help. "
+        "Login state is persisted across sessions (cookies / localStorage are kept in a "
+        "user profile directory), so once the user logs in to a site, the agent can keep "
+        "using it without logging in again."
     )
 
     params: dict = {

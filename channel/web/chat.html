@@ -5,20 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CowAgent Console</title>
     <link rel="icon" href="assets/favicon.ico" type="image/x-icon">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/markdown-it@13.0.1/dist/markdown-it.min.js"></script>
-    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
-    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" disabled>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/javascript.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/go.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+    <!-- Vendored third-party assets (no external CDN dependency).
+         See channel/web/static/vendor/README.md for sources & versions. -->
+    <link rel="stylesheet" href="assets/vendor/fontawesome/css/all.min.css">
+    <link rel="stylesheet" href="assets/vendor/fonts/inter/inter.css">
+    <script src="assets/vendor/tailwind/tailwind.min.js"></script>
+    <script src="assets/vendor/markdown-it/markdown-it.min.js"></script>
+    <link id="hljs-light" rel="stylesheet" href="assets/vendor/highlightjs/styles/github.min.css">
+    <link id="hljs-dark" rel="stylesheet" href="assets/vendor/highlightjs/styles/github-dark.min.css" disabled>
+    <script src="assets/vendor/highlightjs/highlight.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/python.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/javascript.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/java.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/go.min.js"></script>
+    <script src="assets/vendor/highlightjs/languages/bash.min.js"></script>
     <script>
     tailwind.config = {
         darkMode: 'class',
@@ -398,12 +398,24 @@
                                     <button id="attach-btn" class="w-9 h-10 flex items-center justify-center rounded-lg
                                                                    text-slate-400 hover:text-primary-500 hover:bg-primary-50 dark:hover:bg-primary-900/20
                                                                    cursor-pointer transition-colors duration-150"
-                                            onclick="document.getElementById('file-input').click()">
+                                            type="button"
+                                            onclick="toggleAttachMenu(event)">
                                         <i class="fas fa-paperclip text-base"></i>
                                     </button>
                                 </div>
                                 <input type="file" id="file-input" class="hidden" multiple
                                        accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.json,.xml,.zip,.rar,.7z,.py,.js,.ts,.java,.c,.cpp,.go,.rs,.md">
+                                <input type="file" id="folder-input" class="hidden" multiple webkitdirectory directory>
+                                <div id="attach-menu" class="attach-menu hidden">
+                                    <button id="attach-file-option" type="button" class="attach-menu-item" onclick="triggerFileUpload()">
+                                        <i class="fas fa-file-arrow-up"></i>
+                                        <span data-i18n="attach_menu_file">上传文件</span>
+                                    </button>
+                                    <button id="attach-folder-option" type="button" class="attach-menu-item" onclick="triggerFolderUpload()">
+                                        <i class="fas fa-folder-plus"></i>
+                                        <span data-i18n="attach_menu_folder">上传文件夹</span>
+                                    </button>
+                                </div>
                                 <div id="slash-menu" class="slash-menu hidden"></div>
                                 <textarea id="chat-input"
                                           class="flex-1 min-w-0 px-4 py-[10px] rounded-xl border border-slate-200 dark:border-slate-600
@@ -907,6 +919,28 @@
                                     </div>
                                     <span class="text-xs text-slate-400 ml-2 font-mono">run.log</span>
                                     <div class="flex-1"></div>
+                                    <div class="flex items-center gap-3 mr-2">
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="debug" checked>
+                                            <span class="text-xs text-slate-400">DEBUG</span>
+                                        </label>
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="info" checked>
+                                            <span class="text-xs text-blue-400">INFO</span>
+                                        </label>
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="warning" checked>
+                                            <span class="text-xs text-yellow-400">WARNING</span>
+                                        </label>
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="error" checked>
+                                            <span class="text-xs text-red-400">ERROR</span>
+                                        </label>
+                                        <label class="flex items-center gap-1 cursor-pointer select-none">
+                                            <input type="checkbox" class="log-filter-cb" data-level="critical" checked>
+                                            <span class="text-xs text-white font-bold">CRITICAL</span>
+                                        </label>
+                                    </div>
                                     <div class="flex items-center gap-1.5">
                                         <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
                                         <span class="text-xs text-slate-500" data-i18n="logs_live">实时</span>
@@ -950,7 +984,6 @@
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
-    <script src="assets/js/console.js"></script>
+    <script defer src="assets/js/console.js"></script>
 </body>
 </html>

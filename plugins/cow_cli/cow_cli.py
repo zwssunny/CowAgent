@@ -62,10 +62,25 @@ class CowCliPlugin(Plugin):
 
         content = e_context["context"].content.strip()
         parsed = self._parse_command(content)
-        if not parsed:
+        if parsed is None:
             return
 
         cmd, args = parsed
+
+        if cmd not in KNOWN_COMMANDS:
+            # Slash-prefixed near-miss: looks like a typo of a real command.
+            # Intercept with a hint so we don't burn an LLM round on "/momory".
+            suggestion = self._suggest_command(cmd)
+            if suggestion is None:
+                return
+            hint = f"未知命令: /{cmd}"
+            if suggestion:
+                hint += f"\n你是不是想输入 /{suggestion} ?"
+            hint += "\n发送 /help 查看全部命令。"
+            e_context["reply"] = Reply(ReplyType.TEXT, hint)
+            e_context.action = EventAction.BREAK_PASS
+            return
+
         logger.info(f"[CowCli] intercepted command: {cmd} {args}")
 
         result = self._dispatch(cmd, args, e_context)
@@ -82,28 +97,80 @@ class CowCliPlugin(Plugin):
           cow <command> [args...]   e.g. "cow skill list"
           /<command> [args...]      e.g. "/skill list"
 
-        Returns (command, args_string) or None if not a cow command.
-        """
-        parts = None
+        Returns:
+          - (command, args_string): when the message looks like a command.
+            'command' may NOT be in KNOWN_COMMANDS; caller should validate.
+          - None: when the message is not command-like at all.
 
+        We deliberately return parsed-but-unknown for the slash form so the
+        caller can offer a typo hint instead of silently passing the message
+        through to the agent.
+        """
         if content.startswith("/"):
             rest = content[1:].strip()
-            if rest:
-                parts = rest.split(None, 1)
-        elif content.startswith("cow "):
+            if not rest:
+                return None
+            parts = rest.split(None, 1)
+            cmd = parts[0].lower()
+            args = parts[1] if len(parts) > 1 else ""
+            return cmd, args
+
+        if content.startswith("cow "):
             rest = content[4:].strip()
-            if rest:
-                parts = rest.split(None, 1)
+            if not rest:
+                return None
+            parts = rest.split(None, 1)
+            cmd = parts[0].lower()
+            if cmd not in KNOWN_COMMANDS:
+                # 'cow xxx' that isn't a command — don't intercept (could be
+                # natural language like "cow xxx 怎么样").
+                return None
+            args = parts[1] if len(parts) > 1 else ""
+            return cmd, args
 
-        if not parts:
+        return None
+
+    @staticmethod
+    def _suggest_command(cmd: str) -> str:
+        """
+        Return the closest known command if cmd is a likely typo, else "".
+        Returns None to indicate "do not intercept" (when input is too far off).
+
+        Heuristic: edit distance <= 1 (single insert/delete/substitute) when
+        |cmd| >= 3, and the candidate shares the same first letter.
+        """
+        if not cmd:
+            return ""
+        if len(cmd) < 3:
             return None
 
-        cmd = parts[0].lower()
-        if cmd not in KNOWN_COMMANDS:
-            return None
+        def edit_distance_le1(a: str, b: str) -> bool:
+            if a == b:
+                return True
+            la, lb = len(a), len(b)
+            if abs(la - lb) > 1:
+                return False
+            if la == lb:
+                diffs = sum(1 for x, y in zip(a, b) if x != y)
+                return diffs <= 1
+            short, long_ = (a, b) if la < lb else (b, a)
+            i = j = 0
+            skipped = False
+            while i < len(short) and j < len(long_):
+                if short[i] != long_[j]:
+                    if skipped:
+                        return False
+                    skipped = True
+                    j += 1
+                else:
+                    i += 1
+                    j += 1
+            return True
 
-        args = parts[1] if len(parts) > 1 else ""
-        return cmd, args
+        for known in KNOWN_COMMANDS:
+            if known[0] == cmd[0] and edit_distance_le1(cmd, known):
+                return known
+        return None
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -113,12 +180,23 @@ class CowCliPlugin(Plugin):
         """Execute a cow/slash command string without a channel context.
 
         Used by cloud on_chat to intercept commands before the agent runs.
-        Returns None when *query* is not a recognised command.
+        Returns None when *query* is not command-like at all (e.g. natural
+        language). For slash-prefixed typos returns a hint string so the
+        caller still short-circuits the agent round.
         """
         parsed = self._parse_command(query.strip())
-        if not parsed:
+        if parsed is None:
             return None
         cmd, args = parsed
+        if cmd not in KNOWN_COMMANDS:
+            suggestion = self._suggest_command(cmd)
+            if suggestion is None:
+                return None
+            hint = f"未知命令: /{cmd}"
+            if suggestion:
+                hint += f"\n你是不是想输入 /{suggestion} ?"
+            hint += "\n发送 /help 查看全部命令。"
+            return hint
         return self._dispatch(cmd, args, e_context=None, session_id=session_id)
 
     def _dispatch(self, cmd: str, args: str, e_context: EventContext, session_id: str = "") -> str:
@@ -158,7 +236,9 @@ class CowCliPlugin(Plugin):
             "  /config              查看当前配置",
             "  /config <key>        查看某项配置",
             "  /config <key> <val>  修改配置",
-            "  /memory dream [N]    手动触发记忆蒸馏 (整理近N天, 默认3, 最多30)",
+            "  /memory status        查看记忆索引状态",
+            "  /memory rebuild-index 清空并重建向量索引 (切换 embedding 模型后必须执行)",
+            "  /memory dream [N]     手动触发记忆蒸馏 (整理近N天, 默认3, 最多30)",
             "  /knowledge           查看知识库统计",
             "  /knowledge list      查看知识库文件树",
             "  /knowledge on|off    开启/关闭知识库",
@@ -428,11 +508,12 @@ class CowCliPlugin(Plugin):
 
     @staticmethod
     def _resolve_bot_type_for_model(model_name: str) -> str:
-        """Resolve bot_type from model name, reusing AgentBridge mapping."""
+        """Resolve bot_type from model name, matching AgentBridge mapping."""
         from common import const
         _EXACT = {
             "wenxin": const.BAIDU, "wenxin-4": const.BAIDU,
             "xunfei": const.XUNFEI, const.QWEN: const.QWEN_DASHSCOPE,
+            const.QIANFAN: const.QIANFAN,
             const.MODELSCOPE: const.MODELSCOPE,
             const.MOONSHOT: const.MOONSHOT,
             "moonshot-v1-8k": const.MOONSHOT, "moonshot-v1-32k": const.MOONSHOT,
@@ -445,6 +526,7 @@ class CowCliPlugin(Plugin):
             ("claude", const.CLAUDEAPI),
             ("moonshot", const.MOONSHOT), ("kimi", const.MOONSHOT),
             ("doubao", const.DOUBAO), ("deepseek", const.DEEPSEEK),
+            ("ernie", const.QIANFAN),
         ]
         if not model_name:
             return const.OPENAI
@@ -454,8 +536,9 @@ class CowCliPlugin(Plugin):
             return const.MiniMax
         if model_name in [const.QWEN_TURBO, const.QWEN_PLUS, const.QWEN_MAX]:
             return const.QWEN_DASHSCOPE
+        lowered_model = model_name.lower()
         for prefix, btype in _PREFIX:
-            if model_name.startswith(prefix):
+            if lowered_model.startswith(prefix):
                 return btype
         return const.OPENAI
 
@@ -904,12 +987,25 @@ class CowCliPlugin(Plugin):
             if len(parts) > 1 and parts[1].isdigit():
                 days = max(1, min(int(parts[1]), 30))
             return self._memory_dream(days, e_context, session_id)
+        elif sub in ("rebuild-index", "rebuild_index", "rebuild"):
+            return self._memory_rebuild_index(e_context, session_id)
+        elif sub in ("status", "info", ""):
+            if sub == "":
+                return self._memory_help()
+            return self._memory_status()
         else:
-            return (
-                "用法: /memory <子命令>\n\n"
-                "子命令:\n"
-                "  dream [N]  手动触发记忆蒸馏 (整理近N天, 默认3, 最多30)"
-            )
+            return self._memory_help()
+
+    @staticmethod
+    def _memory_help() -> str:
+        return (
+            "🧠 记忆管理\n\n"
+            "用法: /memory <子命令>\n\n"
+            "子命令:\n"
+            "  status              查看索引状态 (provider / model / dim / chunks)\n"
+            "  rebuild-index       清空并重建向量索引 (切换 embedding 模型后必须执行)\n"
+            "  dream [N]           手动触发记忆蒸馏 (整理近N天, 默认3, 最多30)"
+        )
 
     def _memory_dream(self, days: int, e_context, session_id: str) -> str:
         session_id = self._get_session_id(e_context, fallback=session_id)
@@ -959,6 +1055,140 @@ class CowCliPlugin(Plugin):
         except Exception as e:
             logger.warning(f"[CowCli] /memory dream sync failed: {e}")
             return f"❌ 记忆蒸馏失败: {e}"
+
+    def _memory_status(self) -> str:
+        """Show current memory index status."""
+        from agent.memory.embedding import detect_index_dim
+        from config import conf
+
+        agent = self._get_agent("")
+        memory_manager = agent.memory_manager if agent else None
+
+        lines = ["🧠 记忆索引状态", ""]
+        if not memory_manager:
+            lines.append("  ⚠️ Agent 尚未初始化，先发一条普通消息再试")
+            return "\n".join(lines)
+
+        stats = memory_manager.storage.get_stats()
+        db_path = memory_manager.config.get_db_path()
+        embedded = stats.get('embedded', 0)
+        chunks = stats.get('chunks', 0)
+        lines.append(f"  索引DB  : {db_path}")
+        lines.append(f"  Files   : {stats.get('files', 0)}")
+        lines.append(f"  Chunks  : {chunks} (embedded: {embedded})")
+        lines.append("")
+
+        # Active provider (from running config + provider instance).
+        provider_obj = memory_manager.embedding_provider
+        cfg_provider = (conf().get("embedding_provider") or "").strip().lower() or "(legacy)"
+        if provider_obj is not None:
+            cfg_model = getattr(provider_obj, "model", "?")
+            cfg_dim = getattr(provider_obj, "_dimensions", None) or "?"
+            lines.append(f"  Provider : {cfg_provider}")
+            lines.append(f"  Model    : {cfg_model}")
+            lines.append(f"  Dim      : {cfg_dim}")
+        else:
+            lines.append("  Provider : (未初始化, keyword-only)")
+
+        # Health hints — only shown when the user has explicitly opted into
+        # vector search via `embedding_provider`. Legacy users (no explicit
+        # provider) are running in a "best-effort vectors" mode by design;
+        # nagging them about missing/mismatched vectors would be noise.
+        warnings = []
+        explicitly_opted_in = (conf().get("embedding_provider") or "").strip() != ""
+        if explicitly_opted_in and provider_obj is not None:
+            if chunks > 0 and embedded < chunks:
+                missing = chunks - embedded
+                warnings.append(
+                    f"  ⚠️ {missing}/{chunks} 个 chunk 没有向量；"
+                    f"运行 /memory rebuild-index 后所有记忆才会被向量化检索"
+                )
+
+            index_dim = detect_index_dim(memory_manager.storage)
+            cfg_dim = getattr(provider_obj, "_dimensions", None)
+            if index_dim is not None and cfg_dim and index_dim != cfg_dim:
+                warnings.append(
+                    f"  ⚠️ 索引中存量向量为 {index_dim} 维，与当前配置 {cfg_dim} 维不一致；"
+                    f"运行 /memory rebuild-index 重建后向量检索才会生效"
+                )
+
+        if warnings:
+            lines.append("")
+            lines.extend(warnings)
+
+        return "\n".join(lines)
+
+    def _memory_rebuild_index(self, e_context, session_id: str) -> str:
+        """Rebuild the vector index using the current agent's memory_manager."""
+        session_id = self._get_session_id(e_context, fallback=session_id)
+        agent = self._get_agent(session_id)
+        if not agent or not agent.memory_manager:
+            return (
+                "⚠️ Agent 尚未初始化，无法重建索引。\n"
+                "请先发送一条普通消息触发 Agent 启动后再试。"
+            )
+
+        memory_manager = agent.memory_manager
+        if memory_manager.embedding_provider is None:
+            return (
+                "⚠️ 当前没有可用的 embedding provider。\n"
+                "请检查 config.json 中的 embedding 相关配置 (provider / api key)。"
+            )
+
+        provider_obj = memory_manager.embedding_provider
+        model_label = getattr(provider_obj, "model", "?")
+        dim_label = getattr(provider_obj, "dimensions", "?")
+
+        # SaaS (e_context is None): run synchronously, return final result
+        if e_context is None:
+            return self._memory_rebuild_sync(memory_manager, model_label, dim_label)
+
+        # Local channels: run in background, push progress + final result
+        from agent.memory.embedding import rebuild_in_process
+
+        def _run():
+            try:
+                result = rebuild_in_process(memory_manager)
+                if result.ok:
+                    self._notify(
+                        e_context,
+                        (
+                            f"✅ 索引重建完成\n"
+                            f"  cleared : {result.removed}\n"
+                            f"  chunks  : {result.chunks}\n"
+                            f"  files   : {result.files}"
+                        ),
+                    )
+                else:
+                    self._notify(e_context, f"❌ 索引重建失败: {result.error}")
+            except Exception as e:
+                logger.exception("[CowCli] /memory rebuild-index failed")
+                self._notify(e_context, f"❌ 索引重建失败: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+        return (
+            f"🔧 索引重建已启动 (model={model_label}, dim={dim_label})\n\n"
+            f"将清空现有 chunks 并重新 embed 所有记忆文件，完成后会通知你。"
+        )
+
+    @staticmethod
+    def _memory_rebuild_sync(memory_manager, model_label, dim_label) -> str:
+        from agent.memory.embedding import rebuild_in_process
+
+        try:
+            result = rebuild_in_process(memory_manager)
+        except Exception as e:
+            logger.exception("[CowCli] /memory rebuild-index sync failed")
+            return f"❌ 索引重建失败: {e}"
+
+        if not result.ok:
+            return f"❌ 索引重建失败: {result.error}"
+        return (
+            f"✅ 索引重建完成 (model={model_label}, dim={dim_label})\n"
+            f"  cleared : {result.removed}\n"
+            f"  chunks  : {result.chunks}\n"
+            f"  files   : {result.files}"
+        )
 
     @staticmethod
     def _notify(e_context, text: str):

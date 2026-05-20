@@ -10,6 +10,7 @@ Web 控制台是 CowAgent 的默认通道，启动后会自动运行，通过浏
 ```json
 {
   "channel_type": "web",
+  "web_host": "0.0.0.0",
   "web_port": 9899,
   "web_password": "",
   "enable_thinking": false
@@ -19,8 +20,9 @@ Web 控制台是 CowAgent 的默认通道，启动后会自动运行，通过浏
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
 | `channel_type` | 设为 `web` | `web` |
+| `web_host` | Web 服务监听地址，默认监听 `127.0.0.1`（仅本机），如需公网访问请改为 `0.0.0.0` 并设置密码 | `""` |
 | `web_port` | Web 服务监听端口 | `9899` |
-| `web_password` | 访问密码，留空表示不启用密码保护 | `""` |
+| `web_password` | 访问密码，留空表示不启用密码保护；监听 `0.0.0.0` 时建议设置 | `""` |
 | `web_session_expire_days` | 登录会话有效天数 | `30` |
 | `enable_thinking` | 是否启用深度思考模式 | `false` |
 

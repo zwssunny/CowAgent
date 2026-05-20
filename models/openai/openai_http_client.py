@@ -24,6 +24,7 @@ Design goals:
 
 import json
 from typing import Any, Dict, Generator, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -32,6 +33,37 @@ from common.log import logger
 
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_TIMEOUT = 600  # seconds; matches old openai SDK default
+
+
+_APP_TITLE = "CowAgent"
+_APP_REFERER = "https://github.com/zhayujie/CowAgent"
+
+# Per-gateway app attribution headers, only sent when the request host
+# matches a documented gateway. Sending these to user-configured custom
+# proxies would leak app identity, so we dispatch by host suffix.
+_ATTRIBUTION_HEADERS_BY_HOST: Dict[str, Dict[str, str]] = {
+    "openrouter.ai": {
+        "HTTP-Referer": _APP_REFERER,
+        "X-Title": _APP_TITLE,
+    },
+    "ai-gateway.vercel.sh": {
+        "HTTP-Referer": _APP_REFERER,
+        "X-Title": _APP_TITLE,
+    },
+}
+
+
+def _resolve_attribution_headers(url: str) -> Dict[str, str]:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return {}
+    if not host:
+        return {}
+    for suffix, headers in _ATTRIBUTION_HEADERS_BY_HOST.items():
+        if host == suffix or host.endswith("." + suffix):
+            return dict(headers)
+    return {}
 
 
 class OpenAIHTTPError(Exception):
@@ -159,11 +191,16 @@ class OpenAIHTTPClient:
         self,
         api_key: Optional[str],
         extra_headers: Optional[Dict[str, str]],
+        url: Optional[str] = None,
     ) -> Dict[str, str]:
         key = api_key if api_key is not None else self.api_key
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
+        if url:
+            attribution = _resolve_attribution_headers(url)
+            if attribution:
+                headers.update(attribution)
         if self.extra_headers:
             headers.update(self.extra_headers)
         if extra_headers:
@@ -185,7 +222,7 @@ class OpenAIHTTPClient:
     ):
         base = (api_base or self.api_base).rstrip("/") if api_base else self.api_base
         url = f"{base}{path}" if path.startswith("/") else f"{base}/{path}"
-        headers = self._build_headers(api_key, extra_headers)
+        headers = self._build_headers(api_key, extra_headers, url=url)
         req_timeout = timeout if timeout is not None else self.timeout
         proxies = (
             {"http": proxy, "https": proxy} if proxy else self.proxies

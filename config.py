@@ -76,6 +76,9 @@ available_setting = {
     "baidu_wenxin_api_key": "",  # Baidu api key
     "baidu_wenxin_secret_key": "",  # Baidu secret key
     "baidu_wenxin_prompt_enabled": False,  # Enable prompt if you are using ernie character model
+    # Baidu Qianfan / ERNIE OpenAI-compatible API
+    "qianfan_api_key": "",  # Baidu Qianfan API key in bce-v3 format
+    "qianfan_api_base": "https://qianfan.baidubce.com/v2",  # Qianfan OpenAI-compatible API base
     # 讯飞星火API
     "xunfei_app_id": "",  # 讯飞应用ID
     "xunfei_api_key": "",  # 讯飞 API key
@@ -97,6 +100,10 @@ available_setting = {
     "dashscope_api_key": "",
     # Google Gemini Api Key
     "gemini_api_key": "",
+    # Embedding 模型设置
+    "embedding_provider": "",  # 显式指定厂商：openai / linkai / dashscope / doubao / zhipu (与 bot_type 命名一致)
+    "embedding_model": "",     # 留空使用厂商默认 model
+    "embedding_dimensions": 0, # 留空/0 使用厂商默认维度（推荐统一 1024）
     # 语音设置
     "speech_recognition": True,  # 是否开启语音识别
     "group_speech_recognition": False,  # 是否开启群组语音识别
@@ -123,10 +130,13 @@ available_setting = {
     "chat_start_time": "00:00",  # 服务开始时间
     "chat_stop_time": "24:00",  # 服务结束时间
     # 翻译api
-    "translate": "baidu",  # 翻译api，支持baidu
+    "translate": "baidu",  # 翻译api，支持baidu, youdao
     # baidu翻译api的配置
     "baidu_translate_app_id": "",  # 百度翻译api的appid
     "baidu_translate_app_key": "",  # 百度翻译api的秘钥
+    # youdao翻译api的配置
+    "youdao_translate_app_key": "",  # 有道翻译api的应用ID
+    "youdao_translate_app_secret": "",  # 有道翻译api的应用密钥
     # wechatmp的配置
     "wechatmp_token": "",  # 微信公众平台的Token
     "wechatmp_port": 8080,  # 微信公众平台的端口,需要端口转发到80或443
@@ -142,12 +152,13 @@ available_setting = {
     "wechatcomapp_agent_id": "",  # 企业微信app的agent_id
     "wechatcomapp_aes_key": "",  # 企业微信app的aes_key
     # 飞书配置
-    "feishu_port": 80,  # 飞书bot监听端口
+    "feishu_port": 80,  # 飞书bot监听端口，仅webhook模式需要
     "feishu_app_id": "",  # 飞书机器人应用APP Id
     "feishu_app_secret": "",  # 飞书机器人APP secret
-    "feishu_token": "",  # 飞书 verification token
-    "feishu_bot_name": "",  # 飞书机器人的名字
+    "feishu_token": "",  # 飞书 verification token，仅webhook模式需要
     "feishu_event_mode": "websocket",  # 飞书事件接收模式: webhook(HTTP服务器) 或 websocket(长连接)
+    # 飞书流式回复（基于官方 cardkit 流式卡片 API，需要机器人开通 cardkit:card:write 权限，且飞书客户端 7.20+）
+    "feishu_stream_reply": True,  # 是否开启流式回复（打字机效果）。失败/老客户端自动降级为非流式或升级提示
     # 钉钉配置
     "dingtalk_client_id": "",  # 钉钉机器人Client ID 
     "dingtalk_client_secret": "",  # 钉钉机器人Client Secret
@@ -198,6 +209,7 @@ available_setting = {
     "Minimax_base_url": "",
     "deepseek_api_key": "",
     "deepseek_api_base": "https://api.deepseek.com/v1",
+    "web_host": "",  # Web console bind address; empty means auto
     "web_port": 9899,
     "web_password": "",  # Web console password; empty means no authentication required
     "web_session_expire_days": 30,  # Auth session expiry in days
@@ -207,11 +219,10 @@ available_setting = {
     "agent_max_context_turns": 20,  # Agent模式下最大上下文记忆轮次
     "agent_max_steps": 20,  # Agent模式下单次运行最大决策步数
     "enable_thinking": False,  # Enable deep-thinking mode for thinking-capable models
+    "reasoning_effort": "high",  # Reasoning depth under thinking mode: "high" or "max"
     "knowledge": True,  # 是否开启知识库功能
-    # Per-skill runtime config. Nested keys are flattened to env vars at startup
-    # using the rule: skill[<name>][<key>] -> SKILL_<NAME>_<KEY>
-    # (e.g. skill["image-generation"].model -> SKILL_IMAGE_GENERATION_MODEL).
-    "skill": {},
+    "skill": {},  # Per-skill runtime config; nested keys flatten to SKILL_<NAME>_<KEY> env vars at startup
+    "mcp_servers": [],  # MCP server list; each entry supports type "stdio" (local process) or "sse" (remote URL)
 }
 
 
@@ -226,15 +237,9 @@ class Config(dict):
         self.user_datas = {}
 
     def __getitem__(self, key):
-        # 跳过以下划线开头的注释字段
-        if not key.startswith("_") and key not in available_setting:
-            logger.warning("[Config] key '{}' not in available_setting, may not take effect".format(key))
         return super().__getitem__(key)
 
     def __setitem__(self, key, value):
-        # 跳过以下划线开头的注释字段
-        if not key.startswith("_") and key not in available_setting:
-            logger.warning("[Config] key '{}' not in available_setting, may not take effect".format(key))
         return super().__setitem__(key, value)
 
     def get(self, key, default=None):
@@ -242,7 +247,7 @@ class Config(dict):
         if key.startswith("_"):
             return super().get(key, default)
         
-        # 如果key不在available_setting中，直接返回default
+        # 如果key不在available_setting中，直接走dict的get，返回config.json中实际加载的值（如不存在则返回default）
         if key not in available_setting:
             return super().get(key, default)
         
@@ -386,6 +391,8 @@ def load_config():
         "minimax_api_base": "MINIMAX_API_BASE",
         "deepseek_api_key": "DEEPSEEK_API_KEY",
         "deepseek_api_base": "DEEPSEEK_API_BASE",
+        "qianfan_api_key": "QIANFAN_API_KEY",
+        "qianfan_api_base": "QIANFAN_API_BASE",
         "zhipu_ai_api_key": "ZHIPU_AI_API_KEY",
         "zhipu_ai_api_base": "ZHIPU_AI_API_BASE",
         "moonshot_api_key": "MOONSHOT_API_KEY",

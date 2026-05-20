@@ -422,8 +422,9 @@ class _AzureChatHTTPClient(OpenAIHTTPClient):
         )
         self._api_version = api_version
 
-    def _build_headers(self, api_key, extra_headers):
-        # Azure uses api-key header, not Bearer token.
+    def _build_headers(self, api_key, extra_headers, url=None):
+        # Azure uses api-key header, not Bearer token. No attribution
+        # headers — Azure deployments are the customer's own tenant.
         key = api_key if api_key is not None else self.api_key
         headers = {"Content-Type": "application/json"}
         if key:

@@ -15,6 +15,10 @@ import threading
 from typing import Optional, Dict, Any, List, Callable
 
 from common.log import logger
+from common.utils import expand_path
+
+
+_DEFAULT_USER_DATA_DIR = "~/.cow/browser_profile"
 
 try:
     from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, Playwright
@@ -212,6 +216,21 @@ _SNAPSHOT_JS = """
 )
 
 
+_BROWSER_DEAD_HINTS = (
+    "has been closed",
+    "browser has disconnected",
+    "target closed",
+    "browser closed",
+    "context or browser has been closed",
+)
+
+
+def _is_browser_dead_error(err: Exception) -> bool:
+    """Return True if *err* indicates the browser / page died out from under us."""
+    msg = str(err).lower()
+    return any(h in msg for h in _BROWSER_DEAD_HINTS)
+
+
 def _should_use_headless() -> bool:
     """Decide headless mode: headless on Linux servers without display, headed elsewhere."""
     if sys.platform in ("win32", "darwin"):
@@ -302,10 +321,37 @@ class BrowserService:
         self._context = None
         self._page = None
 
+        # Launch mode: one of "fresh" | "persistent" | "cdp".
+        # - cdp: connect to an externally launched Chrome via CDP endpoint.
+        # - persistent: launch with launch_persistent_context using a user_data_dir
+        #   so cookies / login state survive across runs (default).
+        # - fresh: classic launch + new_context, clean state every run.
+        cdp_endpoint = self._config.get("cdp_endpoint") or ""
+        persistent_flag = self._config.get("persistent", True)
+        user_data_dir_cfg = self._config.get("user_data_dir")
+        if user_data_dir_cfg is None:
+            user_data_dir_cfg = _DEFAULT_USER_DATA_DIR
+
+        self._cdp_endpoint: str = cdp_endpoint.strip() if isinstance(cdp_endpoint, str) else ""
+        if self._cdp_endpoint:
+            self._launch_mode = "cdp"
+            self._user_data_dir: str = ""
+        elif persistent_flag and user_data_dir_cfg:
+            self._launch_mode = "persistent"
+            self._user_data_dir = expand_path(str(user_data_dir_cfg))
+        else:
+            self._launch_mode = "fresh"
+            self._user_data_dir = ""
+
         # Idle auto-release
         idle_cfg = self._config.get("idle_timeout")
         self._idle_timeout: float = float(idle_cfg) if idle_cfg is not None else self._IDLE_TIMEOUT_DEFAULT
         self._idle_timer: Optional[threading.Timer] = None
+
+        # Set when the browser / page is detected to have died externally
+        # (e.g. user manually closed the window). The next _submit() will then
+        # tear down the stale thread and relaunch.
+        self._needs_restart = False
 
     # ------------------------------------------------------------------
     # Background-thread lifecycle
@@ -354,6 +400,12 @@ class BrowserService:
                 result_slot["value"] = fn(*args, **kwargs)
             except Exception as e:
                 result_slot["error"] = e
+                if _is_browser_dead_error(e):
+                    self._needs_restart = True
+                    logger.warning(
+                        f"[Browser] Detected closed page/context ({e}); "
+                        "will relaunch on next request."
+                    )
             finally:
                 result_slot["event"].set()
 
@@ -375,7 +427,7 @@ class BrowserService:
             result_slot["event"].set()
 
     def _launch_browser(self):
-        """Launch Chromium on the background thread."""
+        """Launch / connect Chromium on the background thread."""
         if self._headless is None:
             headless_cfg = self._config.get("headless")
             self._headless = headless_cfg if headless_cfg is not None else _should_use_headless()
@@ -390,36 +442,142 @@ class BrowserService:
 
         viewport_w = self._config.get("viewport_width", 1280)
         viewport_h = self._config.get("viewport_height", 720)
+        viewport = {"width": viewport_w, "height": viewport_h}
+        user_agent = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
 
         self._playwright = sync_playwright().start()
-        logger.info(f"[Browser] Launching Chromium (headless={self._headless})")
+
+        if self._launch_mode == "cdp":
+            self._connect_cdp(viewport)
+        elif self._launch_mode == "persistent":
+            self._launch_persistent(launch_args, viewport, user_agent)
+        else:
+            self._launch_fresh(launch_args, viewport, user_agent)
+
+        logger.info("[Browser] Browser ready")
+
+    def _launch_fresh(self, launch_args: List[str], viewport: Dict[str, int], user_agent: str):
+        """Classic launch: brand new Chromium with an empty context."""
+        logger.info(f"[Browser] Launching Chromium (fresh, headless={self._headless})")
         self._browser = self._playwright.chromium.launch(
             headless=self._headless,
             args=launch_args,
         )
         self._context = self._browser.new_context(
-            viewport={"width": viewport_w, "height": viewport_h},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            viewport=viewport,
+            user_agent=user_agent,
         )
         self._page = self._context.new_page()
-        logger.info("[Browser] Browser ready")
+        self._wire_close_listeners()
+
+    def _launch_persistent(self, launch_args: List[str], viewport: Dict[str, int], user_agent: str):
+        """Launch Chromium with a persistent user_data_dir so login state survives."""
+        os.makedirs(self._user_data_dir, exist_ok=True)
+        logger.info(
+            f"[Browser] Launching Chromium (persistent, headless={self._headless}, "
+            f"profile={self._user_data_dir})"
+        )
+        try:
+            self._context = self._playwright.chromium.launch_persistent_context(
+                user_data_dir=self._user_data_dir,
+                headless=self._headless,
+                args=launch_args,
+                viewport=viewport,
+                user_agent=user_agent,
+            )
+        except Exception as e:
+            # Profile is locked when another Chromium instance already holds it.
+            msg = str(e).lower()
+            if "singletonlock" in msg or "profile" in msg or "lock" in msg:
+                raise RuntimeError(
+                    f"Browser profile '{self._user_data_dir}' is in use by another process. "
+                    "Close the other Chromium / cow instance, or set a different "
+                    "tools.browser.user_data_dir."
+                ) from e
+            raise
+
+        # Persistent context has no parent Browser handle; reuse the auto-created page.
+        self._browser = None
+        pages = self._context.pages
+        self._page = pages[0] if pages else self._context.new_page()
+        self._wire_close_listeners()
+
+    def _connect_cdp(self, viewport: Dict[str, int]):
+        """Attach to an existing Chrome started with --remote-debugging-port."""
+        endpoint = self._cdp_endpoint
+        logger.info(f"[Browser] Connecting to existing Chrome via CDP: {endpoint}")
+        try:
+            self._browser = self._playwright.chromium.connect_over_cdp(endpoint)
+        except Exception as e:
+            msg = str(e).lower()
+            if "econnrefused" in msg or "connect" in msg or "refused" in msg:
+                raise RuntimeError(
+                    f"Cannot reach Chrome at {endpoint}. The CDP browser is not "
+                    "running. Ask the user to launch Chrome with "
+                    "--remote-debugging-port and --user-data-dir, then retry. "
+                    "Do not retry this tool until the user confirms."
+                ) from e
+            raise
+
+        contexts = self._browser.contexts
+        if contexts:
+            self._context = contexts[0]
+        else:
+            self._context = self._browser.new_context(viewport=viewport)
+
+        pages = self._context.pages
+        self._page = pages[0] if pages else self._context.new_page()
+        self._wire_close_listeners()
+
+    def _wire_close_listeners(self):
+        """Mark needs_restart whenever the browser / context / page dies externally."""
+        def _on_dead(_obj=None):
+            self._needs_restart = True
+
+        try:
+            if self._browser:
+                self._browser.on("disconnected", _on_dead)
+            if self._context:
+                self._context.on("close", _on_dead)
+            if self._page:
+                self._page.on("close", _on_dead)
+        except Exception as e:
+            logger.debug(f"[Browser] Failed to wire close listeners: {e}")
 
     def _shutdown_browser(self):
-        """Shut down all Playwright resources on the background thread."""
+        """Shut down Playwright resources on the background thread.
+
+        Mode-specific behavior:
+        - cdp: only disconnect the Playwright client; leave the user's Chrome
+          and its tabs untouched (do NOT close the context).
+        - persistent: close the persistent context (no separate browser handle).
+        - fresh: close context, then browser.
+        """
         self._cancel_idle_timer()
-        for obj, label in [
-            (self._context, "context"),
-            (self._browser, "browser"),
-        ]:
+
+        if self._launch_mode == "cdp":
+            # For CDP, browser.close() only detaches the Playwright client;
+            # the user's Chrome process and its tabs stay alive.
             try:
-                if obj:
-                    obj.close()
+                if self._browser:
+                    self._browser.close()
             except Exception as e:
-                logger.debug(f"[Browser] {label} close error: {e}")
+                logger.debug(f"[Browser] cdp disconnect error: {e}")
+        else:
+            for obj, label in [
+                (self._context, "context"),
+                (self._browser, "browser"),
+            ]:
+                try:
+                    if obj:
+                        obj.close()
+                except Exception as e:
+                    logger.debug(f"[Browser] {label} close error: {e}")
+
         try:
             if self._playwright:
                 self._playwright.stop()
@@ -433,6 +591,13 @@ class BrowserService:
 
     def _submit(self, fn: Callable, *args, **kwargs):
         """Submit *fn* to the background thread and block until it completes."""
+        # If the browser died externally (e.g. user closed the window), tear
+        # down the stale thread first so _start_thread() will relaunch fresh.
+        if self._needs_restart:
+            logger.info("[Browser] Restarting after detecting closed browser")
+            self.close()
+            self._needs_restart = False
+
         self._start_thread()
 
         if not self._alive:
@@ -481,6 +646,7 @@ class BrowserService:
         self._cancel_idle_timer()
         with self._lock:
             if not self._alive:
+                self._needs_restart = False
                 return
             self._alive = False
             t = self._thread
@@ -490,6 +656,7 @@ class BrowserService:
             t.join(timeout=10)
         with self._lock:
             self._thread = None
+            self._needs_restart = False
 
     # ------------------------------------------------------------------
     # Actions  (each method is dispatched to the background thread)
