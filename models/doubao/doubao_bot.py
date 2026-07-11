@@ -9,6 +9,7 @@ from models.bot import Bot
 from models.session_manager import SessionManager
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
+from common import const
 from common.log import logger
 from config import conf, load_config
 from .doubao_session import DoubaoSession
@@ -18,8 +19,8 @@ from .doubao_session import DoubaoSession
 class DoubaoBot(Bot):
     def __init__(self):
         super().__init__()
-        self.sessions = SessionManager(DoubaoSession, model=conf().get("model") or "doubao-seed-2-0-pro-260215")
-        model = conf().get("model") or "doubao-seed-2-0-pro-260215"
+        self.sessions = SessionManager(DoubaoSession, model=conf().get("model") or const.DOUBAO_SEED_2_1_PRO)
+        model = conf().get("model") or const.DOUBAO_SEED_2_1_PRO
         self.args = {
             "model": model,
             "temperature": conf().get("temperature", 0.8),
@@ -153,7 +154,7 @@ class DoubaoBot(Bot):
                     max_tokens: int = 1000) -> dict:
         """Analyze an image using Doubao (Volcengine Ark) OpenAI-compatible API."""
         try:
-            vision_model = model or self.args.get("model", "doubao-seed-2-0-pro-260215")
+            vision_model = model or self.args.get("model", const.DOUBAO_SEED_2_1_PRO)
             payload = {
                 "model": vision_model,
                 "max_tokens": max_tokens,
@@ -170,7 +171,7 @@ class DoubaoBot(Bot):
                 "Content-Type": "application/json",
             }
             resp = requests.post(f"{self.base_url}/chat/completions",
-                                 headers=headers, json=payload, timeout=60)
+                                 headers=headers, json=payload, timeout=180)
             if resp.status_code != 200:
                 return {"error": True, "message": f"HTTP {resp.status_code}: {resp.text[:300]}"}
             data = resp.json()

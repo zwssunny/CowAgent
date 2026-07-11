@@ -1,62 +1,62 @@
 ---
 title: カスタム
-description: サードパーティAPIやローカルモデル向けのカスタムプロバイダー設定
+description: サードパーティ API プロキシやローカルモデル向けのカスタムプロバイダー設定
 ---
 
-OpenAI互換プロトコルでアクセスするモデルサービスに適用します：
+OpenAI 互換プロトコルで接続するモデルサービス向けの設定です。例えば：
 
-- **サードパーティAPIプロキシ**：統一APIベースで複数モデルを呼び出し
-- **ローカルモデル**：Ollama、vLLM、LocalAIなどでローカルにデプロイされたモデル
-- **プライベートデプロイ**：組織内でホストされたモデルサービス
+- **サードパーティ API プロキシ**：統一された API アドレスで複数のモデルを呼び出す
+- **ローカルモデル**：Ollama、vLLM などのツールでローカルにデプロイしたモデル
+- **プライベートデプロイ**：企業内部にデプロイされたモデルサービス
 
-<Note>
-  `openai` プロバイダーとの違い：カスタムプロバイダーでは `/config model` でモデルを切り替えてもプロバイダータイプは自動切り替えされず、カスタムAPIアドレスが常に保持されます。
-</Note>
+## Web コンソールでの設定
 
-## 設定方法
+推奨方法です。Web コンソールの「モデル」ページで「プロバイダーを追加」をクリックし、「カスタム」を選択して、名称・API Base・API Key を入力します。複数のカスタムプロバイダーを追加でき、追加後は「メインモデル」でプロバイダーとモデルを選択すると有効になります。
 
-### サードパーティAPIプロキシ
+<img width="900" src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/web-console-custom-model-config.png" />
 
-```json
-{
-  "bot_type": "custom",
-  "model": "deepseek-v4-flash",
-  "custom_api_key": "YOUR_API_KEY",
-  "custom_api_base": "https://{your-proxy.com}/v1"
-}
-```
+主なローカルデプロイツールのデフォルトアドレス：
 
-| パラメータ | 説明 |
-| --- | --- |
-| `bot_type` | `custom` に設定必須 |
-| `model` | モデル名、プロキシサービスがサポートする任意のモデル名 |
-| `custom_api_key` | プロキシサービスが提供するAPIキー |
-| `custom_api_base` | APIアドレス、OpenAI互換プロトコルが必要 |
-
-### ローカルモデル
-
-ローカルモデルは通常APIキー不要で、APIベースのみ設定します：
-
-```json
-{
-  "bot_type": "custom",
-  "model": "qwen3.5:27b",
-  "custom_api_base": "http://localhost:11434/v1"
-}
-```
-
-一般的なローカルデプロイツールとデフォルトアドレス：
-
-| ツール | デフォルトAPIベース |
+| ツール | デフォルト API Base |
 | --- | --- |
 | [Ollama](https://ollama.com) | `http://localhost:11434/v1` |
 | [vLLM](https://docs.vllm.ai) | `http://localhost:8000/v1` |
 | [LocalAI](https://localai.io) | `http://localhost:8080/v1` |
 
-## モデル切り替え
+## 設定ファイルでの設定
 
-カスタムプロバイダーではモデル切り替え時に `model` のみ変更され、`bot_type` やAPIアドレスは変わりません：
+`config.json` を直接編集することもできます。`custom_providers` リストに複数のプロバイダーを定義し、`bot_type` を `"custom:<id>"` に設定していずれかを有効化します：
 
+```json
+{
+  "bot_type": "custom:3f2a9c1b",
+  "custom_providers": [
+    {
+      "id": "3f2a9c1b",
+      "name": "プロバイダーA",
+      "api_key": "YOUR_API_KEY_A",
+      "api_base": "https://api.a.com/v1",
+      "model": "deepseek-v3"
+    },
+    {
+      "id": "a1b2c3d4",
+      "name": "プロバイダーB",
+      "api_key": "YOUR_API_KEY_B",
+      "api_base": "https://api.b.com/v1",
+      "model": "qwen3-max"
+    }
+  ]
+}
 ```
-/config model qwen3.5:27b
-```
+
+| パラメータ | 説明 |
+| --- | --- |
+| `custom_providers` | カスタムプロバイダーのリスト。各項目は `id`、`name`、`api_base`、`api_key`（任意）、`model`（任意）を含む |
+| `bot_type` | `"custom:<id>"` に設定して対応するプロバイダーを有効化 |
+| `id` | 一意の識別子（8 桁の 16 進数）。Web コンソールから追加すると自動生成され、手動設定の場合は重複しない任意の文字列でよい |
+| `name` | 表示名。自由に変更可能 |
+| `model` | このプロバイダーで使用するモデル。有効化時に適用される |
+
+<Note>
+  従来の単一プロバイダー設定（`bot_type` を `"custom"` にし、`custom_api_key` / `custom_api_base` を使用）は引き続き互換性があり、変更なしでそのまま利用できます。
+</Note>

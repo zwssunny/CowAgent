@@ -10,6 +10,19 @@ from croniter import croniter
 from common.log import logger
 
 
+def _parse_naive_local(iso_str: str) -> datetime:
+    """Parse an ISO datetime and coerce it to tz-naive local time.
+
+    The scheduler uses ``datetime.now()`` (tz-naive) for all comparisons,
+    so any persisted timestamp must be normalized to the same flavor —
+    otherwise comparing naive vs aware raises TypeError.
+    """
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
 class SchedulerService:
     """
     Background service that executes scheduled tasks
@@ -39,7 +52,6 @@ class SchedulerService:
             self.running = True
             self.thread = threading.Thread(target=self._run_loop, daemon=True)
             self.thread.start()
-            logger.debug("[Scheduler] Service started")
     
     def stop(self):
         """Stop the scheduler service"""
@@ -54,7 +66,7 @@ class SchedulerService:
     
     def _run_loop(self):
         """Main scheduler loop"""
-        logger.debug("[Scheduler] Scheduler loop started")
+        logger.info("[Scheduler] Scheduler loop started")
         
         while self.running:
             try:
@@ -71,12 +83,18 @@ class SchedulerService:
         
         for task in tasks:
             try:
-                # Check if task is due
                 if self._is_task_due(task, now):
                     logger.info(f"[Scheduler] Executing task: {task['id']} - {task['name']}")
-                    self._execute_task(task)
-                    
-                    # Update next run time
+                    ok = self._execute_task(task)
+                    if not ok:
+                        # Leave next_run_at as-is so the next loop retries.
+                        # Cron tasks within the catch-up window will keep
+                        # firing; beyond it _is_task_due will reschedule.
+                        logger.warning(
+                            f"[Scheduler] Task {task['id']} delivery failed, will retry next tick"
+                        )
+                        continue
+
                     next_run = self._calculate_next_run(task, now)
                     if next_run:
                         self.task_store.update_task(task['id'], {
@@ -84,7 +102,6 @@ class SchedulerService:
                             "last_run_at": now.isoformat()
                         })
                     else:
-                        # One-time task completed, remove it
                         self.task_store.delete_task(task['id'])
                         logger.info(f"[Scheduler] One-time task completed and removed: {task['id']}")
             except Exception as e:
@@ -113,34 +130,43 @@ class SchedulerService:
             return False
         
         try:
-            next_run = datetime.fromisoformat(next_run_str)
-            
-            # Check if task is overdue (e.g., service restart)
+            next_run = _parse_naive_local(next_run_str)
+
             if next_run < now:
                 time_diff = (now - next_run).total_seconds()
-                
-                # If overdue by more than 5 minutes, skip this run and schedule next
-                if time_diff > 300:  # 5 minutes
-                    logger.warning(f"[Scheduler] Task {task['id']} is overdue by {int(time_diff)}s, skipping and scheduling next run")
-                    
-                    # For one-time tasks, remove them directly
-                    schedule = task.get("schedule", {})
-                    if schedule.get("type") == "once":
-                        self.task_store.delete_task(task['id'])
-                        logger.info(f"[Scheduler] One-time task {task['id']} expired, removed")
-                        return False
-                    
-                    # For recurring tasks, calculate next run from now
-                    next_next_run = self._calculate_next_run(task, now)
-                    if next_next_run:
-                        self.task_store.update_task(task['id'], {
-                            "next_run_at": next_next_run.isoformat()
-                        })
-                        logger.info(f"[Scheduler] Rescheduled task {task['id']} to {next_next_run}")
+                schedule = task.get("schedule", {})
+                schedule_type = schedule.get("type")
+
+                # Catch-up window: fire if we're within 10 minutes of the
+                # scheduled tick. Beyond that we'd rather skip than push a
+                # stale daily report to the user.
+                if time_diff <= 600:
+                    return True
+
+                logger.warning(
+                    f"[Scheduler] Task {task['id']} is overdue by {int(time_diff)}s, "
+                    f"skipping and scheduling next run"
+                )
+
+                if schedule_type == "once":
+                    self.task_store.delete_task(task['id'])
+                    logger.info(f"[Scheduler] One-time task {task['id']} expired, removed")
                     return False
-            
+
+                next_next_run = self._calculate_next_run(task, now)
+                if next_next_run:
+                    self.task_store.update_task(task['id'], {
+                        "next_run_at": next_next_run.isoformat()
+                    })
+                    logger.info(f"[Scheduler] Rescheduled task {task['id']} to {next_next_run}")
+                return False
+
             return now >= next_run
-        except Exception:
+        except Exception as e:
+            logger.error(
+                f"[Scheduler] Failed to evaluate due-state for task "
+                f"{task.get('id')} (next_run_at={next_run_str!r}): {e}"
+            )
             return False
     
     def _calculate_next_run(self, task: dict, from_time: datetime) -> Optional[datetime]:
@@ -184,30 +210,34 @@ class SchedulerService:
                 return None
             
             try:
-                run_at = datetime.fromisoformat(run_at_str)
-                # Only return if in the future
+                run_at = _parse_naive_local(run_at_str)
                 if run_at > from_time:
                     return run_at
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(
+                    f"[Scheduler] Failed to parse once-task run_at "
+                    f"{run_at_str!r}: {e}"
+                )
             return None
         
         return None
     
-    def _execute_task(self, task: dict):
+    def _execute_task(self, task: dict) -> bool:
         """
-        Execute a task
-        
-        Args:
-            task: Task dictionary
+        Execute a task.
+
+        Returns True if delivery succeeded (caller should advance state),
+        False if it failed (caller should keep next_run_at so the next
+        loop iteration retries). Callback may return None for legacy
+        behaviour, treated as success.
         """
         try:
-            # Call the execute callback
-            self.execute_callback(task)
+            result = self.execute_callback(task)
+            return False if result is False else True
         except Exception as e:
             logger.error(f"[Scheduler] Error executing task {task['id']}: {e}")
-            # Update task with error
             self.task_store.update_task(task['id'], {
                 "last_error": str(e),
                 "last_error_at": datetime.now().isoformat()
             })
+            return False

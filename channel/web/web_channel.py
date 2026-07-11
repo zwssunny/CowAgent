@@ -1,15 +1,17 @@
+import datetime
 import hashlib
 import hmac
-import time
 import json
 import logging
 import mimetypes
 import os
+import random
+import shutil
 import threading
 import time
 import uuid
 from queue import Queue, Empty
-from typing import Tuple
+from typing import List, Tuple
 
 import web
 
@@ -19,15 +21,24 @@ from channel.chat_channel import ChatChannel, check_prefix
 from channel.chat_message import ChatMessage
 from collections import OrderedDict
 from common import const
+from common import i18n
 from common.log import logger
 from common.singleton import singleton
-from config import conf
+from config import conf, get_data_root, get_weixin_credentials_path
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".avi", ".mov", ".mkv"}
 
+def _get_web_password() -> str:
+    # Coerce to str so non-string values in config.json (e.g. numeric password) won't break comparisons
+    pwd = conf().get("web_password", "")
+    if pwd is None:
+        return ""
+    return str(pwd)
+
+
 def _is_password_enabled():
-    return bool(conf().get("web_password", ""))
+    return bool(_get_web_password())
 
 
 def _session_expire_seconds():
@@ -38,7 +49,7 @@ def _create_auth_token():
     """Create a stateless signed token: ``<timestamp_hex>.<hmac_hex>``."""
     ts = format(int(time.time()), "x")
     sig = hmac.new(
-        conf().get("web_password", "").encode(),
+        _get_web_password().encode(),
         ts.encode(),
         hashlib.sha256,
     ).hexdigest()
@@ -61,18 +72,49 @@ def _verify_auth_token(token):
     if time.time() - ts > _session_expire_seconds():
         return False
     expected = hmac.new(
-        conf().get("web_password", "").encode(),
+        _get_web_password().encode(),
         ts_hex.encode(),
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(sig, expected)
 
 
+def _get_bearer_token():
+    """Extract the token from an `Authorization: Bearer <token>` header.
+
+    The desktop client renders from a file:// origin, so cross-origin cookies
+    to http://127.0.0.1 are unreliable (SameSite=Lax cookies aren't sent). It
+    therefore authenticates via this header instead; browsers keep using the
+    cookie set by /auth/login.
+    """
+    auth = web.ctx.env.get("HTTP_AUTHORIZATION", "") or ""
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def _get_query_token():
+    """Extract a token from the `token` query param.
+
+    Needed for SSE endpoints: EventSource can't set an Authorization header,
+    and file:// cookies are unreliable, so the desktop client passes the token
+    in the query string for /stream and /api/logs.
+    """
+    try:
+        return web.input(token="").token or ""
+    except Exception:
+        return ""
+
+
 def _check_auth():
     """Return True if request is authenticated or password not enabled."""
     if not _is_password_enabled():
         return True
-    return _verify_auth_token(web.cookies().get("cow_auth_token", ""))
+    if _verify_auth_token(web.cookies().get("cow_auth_token", "")):
+        return True
+    if _verify_auth_token(_get_bearer_token()):
+        return True
+    return _verify_auth_token(_get_query_token())
 
 
 def _require_auth():
@@ -81,6 +123,15 @@ def _require_auth():
         raise web.HTTPError("401 Unauthorized",
                             {"Content-Type": "application/json; charset=utf-8"},
                             json.dumps({"status": "error", "message": "Unauthorized"}))
+
+
+# Localized text for /cancel system replies. Web is the only channel that
+# honors a per-request `lang`; other channels reply in Chinese by default.
+def _cancel_reply_text(cancelled: int, lang: str) -> str:
+    en = lang.startswith("en")
+    if cancelled > 0:
+        return "🛑 Cancelled" if en else "🛑 已中止"
+    return "Nothing to cancel." if en else "当前没有可中止的任务。"
 
 
 def _get_upload_dir() -> str:
@@ -161,6 +212,29 @@ def _read_uploaded_file_bytes(file_obj) -> bytes:
     raise TypeError(f"Unsupported uploaded content type: {type(content).__name__}")
 
 
+def _read_uploaded_file_bytes_limited(file_obj, max_bytes: int) -> bytes:
+    """Read uploaded content and fail once it exceeds max_bytes."""
+    if isinstance(file_obj, bytes):
+        content = file_obj
+    elif isinstance(file_obj, str):
+        content = file_obj.encode("utf-8")
+    elif hasattr(file_obj, "file") and hasattr(file_obj.file, "read"):
+        content = file_obj.file.read(max_bytes + 1)
+    elif hasattr(file_obj, "read"):
+        content = file_obj.read(max_bytes + 1)
+    elif hasattr(file_obj, "value"):
+        content = file_obj.value
+    else:
+        raise ValueError("Unable to read uploaded file content")
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    if not isinstance(content, bytes):
+        raise TypeError(f"Unsupported uploaded content type: {type(content).__name__}")
+    if len(content) > max_bytes:
+        raise ValueError("file too large")
+    return content
+
+
 def _raw_web_input():
     """Return unprocessed multipart form data when web.py exposes rawinput."""
     rawinput = getattr(getattr(web, "webapi", None), "rawinput", None)
@@ -220,7 +294,13 @@ class WebChannel(ChatChannel):
         self.session_queues = {}  # session_id -> Queue (fallback polling)
         self.request_to_session = {}  # request_id -> session_id
         self.sse_queues = {}  # request_id -> Queue (SSE streaming)
+        # request_id -> last-active timestamp. Refreshed while the SSE
+        # generator is being consumed (client still connected). The janitor
+        # only reclaims queues whose generator stopped refreshing this, so a
+        # long-running but still-streaming reply is never wrongly killed.
+        self.sse_last_active = {}
         self._http_server = None
+        self._sse_janitor_started = False
 
     def _generate_msg_id(self):
         """生成唯一的消息ID"""
@@ -230,6 +310,21 @@ class WebChannel(ChatChannel):
     def _generate_request_id(self):
         """生成唯一的请求ID"""
         return str(uuid.uuid4())
+
+    def _fetch_latest_pair_seqs(self, session_id: str):
+        """Query the conversation store for the latest user/bot message seqs.
+
+        Returned as ``{"user_seq": int|None, "bot_seq": int|None}``; used to
+        attach seq metadata onto the SSE ``done`` event so the frontend can
+        wire edit / regenerate buttons for live-streamed bubbles without a
+        page refresh.
+        """
+        try:
+            from agent.memory import get_conversation_store
+            return get_conversation_store().get_latest_pair_seqs(session_id)
+        except Exception as e:
+            logger.debug(f"[WebChannel] _fetch_latest_pair_seqs failed: {e}")
+            return {"user_seq": None, "bot_seq": None}
 
     def send(self, reply: Reply, context: Context):
         try:
@@ -271,11 +366,14 @@ class WebChannel(ChatChannel):
                 if reply.type in (ReplyType.IMAGE_URL, ReplyType.FILE) and content.startswith("file://"):
                     text_content = getattr(reply, 'text_content', '')
                     if text_content:
+                        seqs = self._fetch_latest_pair_seqs(session_id)
                         self.sse_queues[request_id].put({
                             "type": "done",
                             "content": text_content,
                             "request_id": request_id,
-                            "timestamp": time.time()
+                            "timestamp": time.time(),
+                            "user_seq": seqs.get("user_seq"),
+                            "bot_seq": seqs.get("bot_seq"),
                         })
                     logger.debug(f"SSE skipped duplicate file for request {request_id}")
                     return
@@ -287,13 +385,22 @@ class WebChannel(ChatChannel):
                     logger.debug(f"SSE skipped http media reply for request {request_id}")
                     return
 
+                seqs = self._fetch_latest_pair_seqs(session_id)
                 self.sse_queues[request_id].put({
                     "type": "done",
                     "content": content,
                     "request_id": request_id,
-                    "timestamp": time.time()
+                    "timestamp": time.time(),
+                    "user_seq": seqs.get("user_seq"),
+                    "bot_seq": seqs.get("bot_seq"),
                 })
                 logger.debug(f"SSE done sent for request {request_id}")
+                # Auto-trigger TTS once the bot finishes its text reply. The
+                # synthesis runs in the background so the chat stream is never
+                # blocked; the resulting audio URL is pushed via a follow-up
+                # `voice_attach` SSE event and persisted to messages.extras.
+                if reply.type == ReplyType.TEXT and content.strip():
+                    self._maybe_dispatch_auto_tts(request_id, session_id, content, context)
                 return
 
             # Fallback: polling mode
@@ -312,6 +419,13 @@ class WebChannel(ChatChannel):
                     and context.get("on_event") is not None
                 ):
                     logger.debug(f"Polling skipped duplicate file reply for session {session_id}")
+                    return
+                # SSE-enabled requests already stream the text reply to the
+                # client. Do NOT also enqueue it for polling: if the user
+                # switched away mid-run, the queued copy would resurface as a
+                # duplicate bubble when they return and poll the session.
+                if reply.type == ReplyType.TEXT and context.get("on_event") is not None:
+                    logger.debug(f"Polling skipped SSE text reply for session {session_id}")
                     return
                 response_data = {
                     "type": str(reply.type),
@@ -340,6 +454,10 @@ class WebChannel(ChatChannel):
         # Use a single-element list as a mutable counter accessible from closure.
         reasoning_chars_sent = [0]
         reasoning_capped_notified = [False]
+        # Captures the first error message emitted by agent_stream so the
+        # subsequent agent_end handler can skip its "empty final_response"
+        # fallback (which would otherwise overwrite the real error).
+        streamed_error: List[str] = []
 
         def on_event(event: dict):
             if request_id not in self.sse_queues:
@@ -374,7 +492,15 @@ class WebChannel(ChatChannel):
             elif event_type == "tool_execution_start":
                 tool_name = data.get("tool_name", "tool")
                 arguments = data.get("arguments", {})
-                q.put({"type": "tool_start", "tool": tool_name, "arguments": arguments})
+                q.put({"type": "tool_start", "tool_call_id": data.get("tool_call_id"), "tool": tool_name, "arguments": arguments})
+
+            elif event_type == "tool_execution_progress":
+                q.put({
+                    "type": "tool_progress",
+                    "tool_call_id": data.get("tool_call_id"),
+                    "tool": data.get("tool_name", "tool"),
+                    "content": str(data.get("message", ""))[-4 * 1024:],
+                })
 
             elif event_type == "tool_execution_end":
                 tool_name = data.get("tool_name", "tool")
@@ -387,6 +513,7 @@ class WebChannel(ChatChannel):
                     result_str = result_str[:2000] + "…"
                 q.put({
                     "type": "tool_end",
+                    "tool_call_id": data.get("tool_call_id"),
                     "tool": tool_name,
                     "status": status,
                     "result": result_str,
@@ -398,6 +525,37 @@ class WebChannel(ChatChannel):
                 if tool_calls:
                     q.put({"type": "message_end", "has_tool_calls": True})
 
+            elif event_type == "error":
+                # Agent raised an exception (LLM 401/timeout/etc). Surface the
+                # real message instead of letting the empty-response fallback
+                # below hide it as "(模型未返回任何内容)".
+                err_msg = data.get("error") or "unknown error"
+                logger.warning(
+                    f"[WebChannel] agent_stream emitted error for "
+                    f"request {request_id}: {err_msg}"
+                )
+                # Remember it so the agent_end handler below knows not to
+                # rewrite the message into a generic empty-response notice.
+                streamed_error.append(err_msg)
+                q.put({
+                    "type": "done",
+                    "content": f"❌ {err_msg}",
+                    "request_id": request_id,
+                    "timestamp": time.time(),
+                })
+
+            elif event_type == "agent_cancelled":
+                # Push an explicit cancelled SSE event so the frontend
+                # marks the bubble as stopped. A trailing "done" still
+                # arrives with the partial answer.
+                final_response = data.get("final_response", "")
+                q.put({
+                    "type": "cancelled",
+                    "content": final_response,
+                    "request_id": request_id,
+                    "timestamp": time.time(),
+                })
+
             elif event_type == "agent_end":
                 # Safety net: if the agent finishes with an empty final_response,
                 # chat_channel skips _send_reply (because reply.content is empty),
@@ -406,31 +564,204 @@ class WebChannel(ChatChannel):
                 # here so the frontend always gets closure.
                 final_response = data.get("final_response", "")
                 if not final_response or not str(final_response).strip():
-                    logger.warning(
-                        f"[WebChannel] agent_end with empty final_response for "
-                        f"request {request_id}, sending fallback done"
-                    )
-                    q.put({
-                        "type": "done",
-                        "content": "(模型未返回任何内容，请重试或换一种方式描述你的需求)",
-                        "request_id": request_id,
-                        "timestamp": time.time(),
-                    })
+                    if streamed_error:
+                        # Error was already surfaced via the `error` event
+                        # handler above; nothing more to do here.
+                        pass
+                    else:
+                        logger.warning(
+                            f"[WebChannel] agent_end with empty final_response for "
+                            f"request {request_id}, sending fallback done"
+                        )
+                        q.put({
+                            "type": "done",
+                            "content": i18n.t(
+                                "(模型未返回任何内容，请重试或换一种方式描述你的需求)",
+                                "(The model returned no content. Please retry or rephrase your request.)",
+                            ),
+                            "request_id": request_id,
+                            "timestamp": time.time(),
+                        })
 
             elif event_type == "file_to_send":
                 file_path = data.get("path", "")
                 file_name = data.get("file_name", os.path.basename(file_path))
                 file_type = data.get("file_type", "file")
-                from urllib.parse import quote
-                web_url = f"/api/file?path={quote(file_path)}"
+                # Remote URLs are passed through as-is; local files are served
+                # via the backend /api/file endpoint.
+                remote_url = data.get("url", "")
+                is_remote = bool(remote_url) and remote_url.lower().startswith(("http://", "https://"))
+                if is_remote:
+                    web_url = remote_url
+                else:
+                    from urllib.parse import quote
+                    web_url = f"/api/file?path={quote(file_path)}"
                 is_image = file_type == "image"
-                q.put({
+                payload = {
                     "type": "image" if is_image else "file",
                     "content": web_url,
                     "file_name": file_name,
-                })
+                    # Preserve the concrete media kind (image/video/audio/...)
+                    # so richer clients can render an inline player.
+                    "file_type": file_type,
+                }
+                # Expose the local absolute path so the desktop client can open
+                # the file directly (Finder / default app) instead of the browser.
+                if not is_remote and file_path:
+                    payload["abs_path"] = file_path
+                q.put(payload)
 
         return on_event
+
+    # ------------------------------------------------------------------
+    # TTS auto-dispatch
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_voice_reply_mode() -> str:
+        """
+        Decide the TTS auto-reply policy.
+
+        Source of truth is the cross-channel pair
+        (`always_reply_voice`, `voice_reply_voice`) which chat_channel
+        also consults. The web UI presents these as a single three-state
+        picker (off / voice_if_voice / always) via a lossless mapping.
+        """
+        if conf().get("always_reply_voice", False):
+            return "always"
+        if conf().get("voice_reply_voice", False):
+            return "voice_if_voice"
+        return "off"
+
+    # Mirror of ModelsHandler._TTS_PROVIDERS. zhipu is intentionally omitted
+    # from the UI (GLM-TTS prelude beep); pinning it in config.json still works.
+    _TTS_PROVIDERS_SUGGEST_ORDER = ["openai", "minimax", "dashscope", "linkai"]
+
+    @classmethod
+    def _tts_provider_ready(cls) -> bool:
+        """True if user picked a provider OR any suggested vendor has an API key."""
+        if (conf().get("text_to_voice") or "").strip():
+            return True
+        for pid in cls._TTS_PROVIDERS_SUGGEST_ORDER:
+            meta = ConfigHandler.PROVIDER_MODELS.get(pid) or {}
+            key_field = meta.get("api_key_field")
+            if not key_field:
+                continue
+            val = (conf().get(key_field) or "").strip()
+            if val and val not in ("YOUR API KEY", "YOUR_API_KEY"):
+                return True
+        return False
+
+    def _maybe_dispatch_auto_tts(
+        self,
+        request_id: str,
+        session_id: str,
+        text: str,
+        context: dict,
+    ) -> None:
+        try:
+            mode = self._resolve_voice_reply_mode()
+            if mode == "off":
+                return
+            if mode == "voice_if_voice" and not context.get("is_voice_input"):
+                return
+            if not self._tts_provider_ready():
+                return
+            threading.Thread(
+                target=self._synthesize_tts_async,
+                args=(request_id, session_id, text),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            logger.debug(f"[WebChannel] auto-tts dispatch skipped: {e}")
+
+    def _synthesize_tts_async(
+        self,
+        request_id: str,
+        session_id: str,
+        text: str,
+    ) -> None:
+        try:
+            from bridge.bridge import Bridge
+            reply = Bridge().fetch_text_to_voice(text)
+            if reply is None or reply.type != ReplyType.VOICE or not reply.content:
+                logger.warning(
+                    f"[WebChannel] TTS produced no audio for request {request_id}: "
+                    f"reply={reply}"
+                )
+                return
+            url = self._publish_tts_audio(reply.content)
+            if not url:
+                logger.warning(f"[WebChannel] TTS publish failed for request {request_id}")
+                return
+            payload = {"audio": {"url": url, "kind": "tts"}}
+            try:
+                from agent.memory import get_conversation_store
+                get_conversation_store().attach_extras_to_last_assistant(session_id, payload)
+            except Exception as e:
+                logger.debug(f"[WebChannel] tts persist skipped: {e}")
+            q = self.sse_queues.get(request_id)
+            if q is None:
+                logger.warning(
+                    f"[WebChannel] TTS ready but SSE queue already closed "
+                    f"for request {request_id} (url={url})"
+                )
+                return
+            q.put({
+                "type": "voice_attach",
+                "url": url,
+                "request_id": request_id,
+                "timestamp": time.time(),
+            })
+            logger.info(f"[WebChannel] TTS voice_attach pushed for request {request_id}: {url}")
+        except Exception as e:
+            # TTS failures are intentionally silent (no user-facing error).
+            logger.warning(f"[WebChannel] TTS synthesis failed: {e}")
+
+    @staticmethod
+    def _publish_tts_audio(src_path: str) -> str:
+        """Move a TTS file into uploads/ and return its public URL."""
+        try:
+            if not src_path or not os.path.isfile(src_path):
+                logger.warning(f"[WebChannel] publish_tts_audio missing source: {src_path!r}")
+                return ""
+            ext = os.path.splitext(src_path)[1].lower() or ".mp3"
+            upload_dir = _get_upload_dir()
+            os.makedirs(upload_dir, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            dst_name = f"voice_reply_{ts}_{random.randint(0, 9999)}{ext}"
+            dst_path = os.path.join(upload_dir, dst_name)
+            shutil.move(src_path, dst_path)
+            logger.debug(f"[WebChannel] publish_tts_audio moved {src_path} -> {dst_path}")
+            return f"/uploads/{dst_name}"
+        except Exception as e:
+            logger.warning(f"[WebChannel] publish_tts_audio failed: {e}")
+            return ""
+
+    @staticmethod
+    def _cleanup_stale_voice_recordings(max_age_seconds: int = 3600) -> None:
+        """Drop voice_input_* uploads older than max_age_seconds (run at startup)."""
+        try:
+            upload_dir = _get_upload_dir()
+            if not os.path.isdir(upload_dir):
+                return
+            now = time.time()
+            removed = 0
+            for name in os.listdir(upload_dir):
+                if not name.startswith("voice_input_"):
+                    continue
+                full = os.path.join(upload_dir, name)
+                try:
+                    if not os.path.isfile(full):
+                        continue
+                    if now - os.path.getmtime(full) > max_age_seconds:
+                        os.remove(full)
+                        removed += 1
+                except OSError:
+                    continue
+            if removed:
+                logger.info(f"[WebChannel] cleaned up {removed} stale voice recording(s) from {upload_dir}")
+        except Exception as e:
+            logger.warning(f"[WebChannel] voice cleanup failed: {e}")
 
     def upload_file(self):
         """Handle file or directory upload via multipart/form-data."""
@@ -557,6 +888,29 @@ class WebChannel(ChatChannel):
             prompt = json_data.get('message', '')
             use_sse = json_data.get('stream', True)
             attachments = json_data.get('attachments', [])
+            # Tag the message as originating from voice input so the post-reply
+            # TTS hook can honour the `voice_if_voice` policy (mirrors the
+            # desire_rtype concept used by other channels).
+            is_voice_input = bool(json_data.get('is_voice', False))
+
+            # Fast path for /cancel: bypass the session queue and SSE setup.
+            # Web frontend (stream=true) only listens to SSE, so we return an
+            # inline_reply payload to be rendered synchronously.
+            stripped_prompt = (prompt or "").strip().lower()
+            if stripped_prompt == "/cancel":
+                from agent.protocol import get_cancel_registry
+                cancelled = get_cancel_registry().cancel_session(session_id)
+                lang = (json_data.get('lang') or 'zh').lower()
+                msg_text = _cancel_reply_text(cancelled, lang)
+                logger.info(
+                    f"[WebChannel] /cancel fast-path: session={session_id}, cancelled={cancelled}, lang={lang}"
+                )
+                return json.dumps({
+                    "status": "success",
+                    "request_id": "",
+                    "stream": False,
+                    "inline_reply": msg_text,
+                })
 
             # Append file references to the prompt (same format as QQ channel)
             if attachments:
@@ -567,13 +921,13 @@ class WebChannel(ChatChannel):
                     if not fpath:
                         continue
                     if ftype == "image":
-                        file_refs.append(f"[图片: {fpath}]")
+                        file_refs.append(f"[{i18n.t('图片', 'Image')}: {fpath}]")
                     elif ftype == "video":
-                        file_refs.append(f"[视频: {fpath}]")
+                        file_refs.append(f"[{i18n.t('视频', 'Video')}: {fpath}]")
                     elif ftype == "directory":
-                        file_refs.append(f"[目录: {fpath}]")
+                        file_refs.append(f"[{i18n.t('目录', 'Directory')}: {fpath}]")
                     else:
-                        file_refs.append(f"[文件: {fpath}]")
+                        file_refs.append(f"[{i18n.t('文件', 'File')}: {fpath}]")
                 if file_refs:
                     prompt = prompt + "\n" + "\n".join(file_refs)
                     logger.info(f"[WebChannel] Attached {len(file_refs)} file(s) to message")
@@ -586,6 +940,7 @@ class WebChannel(ChatChannel):
 
             if use_sse:
                 self.sse_queues[request_id] = Queue()
+                self.sse_last_active[request_id] = time.time()
 
             trigger_prefixs = conf().get("single_chat_prefix", [""])
             if check_prefix(prompt, trigger_prefixs) is None:
@@ -600,13 +955,17 @@ class WebChannel(ChatChannel):
 
             if context is None:
                 logger.warning(f"[WebChannel] Context is None for session {session_id}, message may be filtered")
-                if request_id in self.sse_queues:
-                    del self.sse_queues[request_id]
+                self._drop_sse_request(request_id)
                 return json.dumps({"status": "error", "message": "Message was filtered"})
 
             context["session_id"] = session_id
             context["receiver"] = session_id
             context["request_id"] = request_id
+            if is_voice_input:
+                # Web channel runs its own TTS post-pipeline via
+                # _maybe_dispatch_auto_tts; don't set desire_rtype here or
+                # chat_channel would synthesize a duplicate VOICE reply.
+                context["is_voice_input"] = True
 
             if use_sse:
                 context["on_event"] = self._make_sse_callback(request_id)
@@ -618,6 +977,60 @@ class WebChannel(ChatChannel):
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             return json.dumps({"status": "error", "message": str(e)})
+
+    def _drop_sse_request(self, request_id: str):
+        """Reclaim all state tied to an SSE request to prevent fd/memory leaks.
+
+        Removing the queue lets the WSGI generator and its socket be released,
+        and dropping request_to_session avoids unbounded map growth.
+        """
+        self.sse_queues.pop(request_id, None)
+        self.sse_last_active.pop(request_id, None)
+        self.request_to_session.pop(request_id, None)
+
+    def _start_sse_janitor(self):
+        """Start a background thread that reclaims orphaned SSE queues.
+
+        When a client disconnects before the "done" event arrives (browser
+        closed, session switched, network drop), the generator may keep the
+        queue around to allow reconnection. Without a sweep these orphans
+        accumulate, leaking file descriptors until cheroot raises
+        "[Errno 24] Too many open files".
+
+        Reclamation is based on idle time, not total age: an active stream
+        refreshes ``sse_last_active`` every second while its generator is being
+        consumed, so a long-running reply (even hours long) is never killed
+        while the client stays connected. Only queues that stopped refreshing
+        (client gone) past SSE_IDLE_TIMEOUT are reclaimed.
+        """
+        if self._sse_janitor_started:
+            return
+        self._sse_janitor_started = True
+
+        SSE_IDLE_TIMEOUT = 1800  # 30 minutes with no client consumption
+        SWEEP_INTERVAL = 60
+
+        def _sweep():
+            while True:
+                time.sleep(SWEEP_INTERVAL)
+                try:
+                    now = time.time()
+                    stale = [
+                        rid for rid, ts in list(self.sse_last_active.items())
+                        if now - ts > SSE_IDLE_TIMEOUT
+                    ]
+                    for rid in stale:
+                        self._drop_sse_request(rid)
+                    if stale:
+                        logger.info(
+                            f"[WebChannel] SSE janitor reclaimed {len(stale)} "
+                            f"idle stream(s)"
+                        )
+                except Exception as e:
+                    logger.warning(f"[WebChannel] SSE janitor error: {e}")
+
+        t = threading.Thread(target=_sweep, name="sse-janitor", daemon=True)
+        t.start()
 
     def stream_response(self, request_id: str):
         """
@@ -634,28 +1047,115 @@ class WebChannel(ChatChannel):
         q = self.sse_queues[request_id]
         idle_timeout = 600  # 10 minutes without any real event
         deadline = time.time() + idle_timeout
-        done = False
+        # After the main reply is done we keep the stream open for a short
+        # tail so async post-processing (TTS auto-synthesis) can deliver a
+        # `voice_attach` event before the client disconnects.
+        POST_DONE_TAIL_SECONDS = 60
+        post_done = False
+        post_deadline = 0.0
 
         try:
             while time.time() < deadline:
+                # Mark the stream alive on every loop. While the client keeps
+                # consuming, the generator runs and refreshes this, so the
+                # janitor won't reclaim a long-running but active stream.
+                self.sse_last_active[request_id] = time.time()
                 try:
                     item = q.get(timeout=1)
                 except Empty:
+                    if post_done and time.time() >= post_deadline:
+                        break
                     yield b": keepalive\n\n"
                     continue
 
-                # Real event received, reset idle deadline
                 deadline = time.time() + idle_timeout
-
                 payload = json.dumps(item, ensure_ascii=False)
                 yield f"data: {payload}\n\n".encode("utf-8")
 
-                if item.get("type") == "done":
-                    done = True
-                    break
+                itype = item.get("type")
+                if itype == "done":
+                    post_done = True
+                    post_deadline = time.time() + POST_DONE_TAIL_SECONDS
+                elif itype == "cancelled":
+                    # Close SSE tail quickly after cancel; don't wait for the
+                    # full TTS tail since the user already pressed Stop.
+                    post_done = True
+                    post_deadline = time.time() + 3
+                elif itype == "voice_attach":
+                    # WSGI buffers the previous chunk until the next yield;
+                    # shrink the tail so the generator wakes up quickly to
+                    # emit a couple of keepalive comments that push the
+                    # voice_attach payload through to the browser.
+                    post_done = True
+                    post_deadline = time.time() + 2  # 2s post-attach tail
+        except GeneratorExit:
+            # Client disconnected (WSGI closed the generator). If the reply is
+            # already complete there is nothing to resume, so reclaim now to
+            # release the socket fd. Otherwise keep the queue briefly so a
+            # reconnect with the same request_id can resume; the janitor will
+            # reclaim it if no reconnect happens.
+            if post_done:
+                self._drop_sse_request(request_id)
+            raise
         finally:
-            if done:
-                self.sse_queues.pop(request_id, None)
+            # Drop the queue once the reply is actually complete or the idle
+            # deadline has passed. Early client disconnects are handled by the
+            # GeneratorExit branch above and the background janitor.
+            if post_done or time.time() >= deadline:
+                self._drop_sse_request(request_id)
+
+    def cancel_request(self):
+        """
+        Cancel an in-flight agent run.
+
+        Body: {"request_id": "...", "session_id": "..."}
+        Either field is sufficient; request_id is preferred when known.
+        Always returns success even when nothing was running, so the
+        client's UX is idempotent.
+        """
+        try:
+            from agent.protocol import get_cancel_registry
+
+            data = web.data()
+            try:
+                json_data = json.loads(data) if data else {}
+            except Exception:
+                json_data = {}
+
+            request_id = (json_data.get("request_id") or "").strip()
+            session_id = (json_data.get("session_id") or "").strip()
+            lang = (json_data.get("lang") or "zh").lower()
+
+            registry = get_cancel_registry()
+            cancelled = 0
+
+            if request_id:
+                if registry.cancel_request(request_id):
+                    cancelled = 1
+
+            if cancelled == 0 and session_id:
+                cancelled = registry.cancel_session(session_id)
+
+            if request_id and request_id in self.sse_queues:
+                self.sse_queues[request_id].put({
+                    "type": "cancelled",
+                    "content": "🛑 Cancelled" if lang.startswith("en") else "🛑 已中止",
+                    "request_id": request_id,
+                    "timestamp": time.time(),
+                })
+
+            logger.info(
+                f"[WebChannel] cancel request: request_id={request_id!r}, "
+                f"session_id={session_id!r}, cancelled={cancelled}"
+            )
+            return json.dumps({
+                "status": "success",
+                "cancelled": cancelled,
+            })
+
+        except Exception as e:
+            logger.error(f"[WebChannel] cancel_request error: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
 
     def poll_response(self):
         """
@@ -695,50 +1195,92 @@ class WebChannel(ChatChannel):
         """Serve the chat HTML page."""
         file_path = os.path.join(os.path.dirname(__file__), 'chat.html')  # 使用绝对路径
         with open(file_path, 'r', encoding='utf-8') as f:
-            return f.read()
+            html = f.read()
+        # Inject the backend-resolved default language so the console can use
+        # it on first load (when the user has no saved cow_lang preference).
+        return html.replace("{{COW_DEFAULT_LANG}}", i18n.get_language())
 
     def startup(self):
         configured_host = conf().get("web_host", "")
         host = configured_host or ("0.0.0.0" if _is_password_enabled() else "127.0.0.1")
-        port = conf().get("web_port", 9899)
+        # The desktop app passes its chosen port via COW_WEB_PORT so its backend
+        # never collides with a source-run web console (default 9899). This makes
+        # the port a single source of truth owned by the Electron shell.
+        port = int(os.environ.get("COW_WEB_PORT") or conf().get("web_port", 9899))
         is_public_bind = host in ("0.0.0.0", "::")
 
-        # 打印可用渠道类型提示
+        self._cleanup_stale_voice_recordings()
+
+        # Print available channel types (ordered by language: prioritize
+        # locally-popular channels for the current UI language)
         logger.info(
-            "[WebChannel] 全部可用通道如下，可修改 config.json 配置文件中的 channel_type 字段进行切换，多个通道用逗号分隔：")
-        logger.info("[WebChannel]   1. weixin           - 微信")
-        logger.info("[WebChannel]   2. web              - 网页")
-        logger.info("[WebChannel]   3. terminal         - 终端")
-        logger.info("[WebChannel]   4. feishu           - 飞书")
-        logger.info("[WebChannel]   5. dingtalk         - 钉钉")
-        logger.info("[WebChannel]   6. wecom_bot        - 企微智能机器人")
-        logger.info("[WebChannel]   7. wechatcom_app    - 企微自建应用")
-        logger.info("[WebChannel]   8. wechatmp         - 个人公众号")
-        logger.info("[WebChannel]   9. wechatmp_service - 企业公众号")
-        logger.info("[WebChannel] ✅ Web控制台已运行")
-        logger.info(f"[WebChannel] 🌐 本地访问: http://localhost:{port}")
+            "[WebChannel] Available channels (edit `channel_type` in config.json to switch, separate multiple with commas):")
+        zh_channels = [
+            ("web", "Web"),
+            ("terminal", "Terminal"),
+            ("weixin", "WeChat"),
+            ("feishu", "Feishu"),
+            ("dingtalk", "DingTalk"),
+            ("wecom_bot", "WeCom Bot"),
+            ("wechatcom_app", "WeCom App"),
+            ("wechat_kf", "WeChat Customer Service"),
+            ("wechatmp", "WeChat Official Account"),
+            ("wechatmp_service", "WeChat Official Account (Service)"),
+            ("telegram", "Telegram"),
+            ("slack", "Slack"),
+            ("discord", "Discord"),
+        ]
+        en_channels = [
+            ("web", "Web"),
+            ("terminal", "Terminal"),
+            ("telegram", "Telegram"),
+            ("slack", "Slack"),
+            ("discord", "Discord"),
+            ("weixin", "WeChat"),
+            ("feishu", "Feishu"),
+            ("dingtalk", "DingTalk"),
+            ("wecom_bot", "WeCom Bot"),
+            ("wechatcom_app", "WeCom App"),
+            ("wechat_kf", "WeChat Customer Service"),
+            ("wechatmp", "WeChat Official Account"),
+            ("wechatmp_service", "WeChat Official Account (Service)"),
+        ]
+        channels = en_channels if i18n.get_language() == "en" else zh_channels
+        name_width = max(len(name) for name, _ in channels)
+        for idx, (name, label) in enumerate(channels, 1):
+            logger.info(f"[WebChannel]  {idx:>2}. {name:<{name_width}} - {label}")
+        logger.info("[WebChannel] ✅ Web console is running")
+        logger.info(f"[WebChannel] 🌐 Local access: http://localhost:{port}")
         if is_public_bind:
-            logger.info(f"[WebChannel] 🌍 服务器访问: http://YOUR_IP:{port} (将YOUR_IP替换为服务器IP)")
+            logger.info(f"[WebChannel] 🌍 Server access: http://YOUR_IP:{port} (replace YOUR_IP with your server IP)")
             if not _is_password_enabled():
-                logger.info("[WebChannel] ⚠️  当前监听 0.0.0.0 且未设置 web_password，公网部署建议在 config.json 中配置访问密码")
+                logger.info("[WebChannel] ⚠️  Listening on 0.0.0.0 without web_password set; set an access password in config.json for public deployment")
         else:
-            logger.info(f"[WebChannel] 🔒 当前仅监听 {host}，仅本机可访问。如需公网访问，请将 web_host 改为 0.0.0.0 并配置 web_password 密码")
+            logger.info(f"[WebChannel] 🔒 Listening on {host} only (local access). For public access, set web_host to 0.0.0.0 and configure web_password")
 
-        try:
-            import webbrowser
-            webbrowser.open(f"http://localhost:{port}")
-            logger.debug(f"[WebChannel] Opened browser at http://localhost:{port}")
-        except Exception as e:
-            logger.debug(f"[WebChannel] Could not open browser: {e}")
+        # In desktop mode the Electron shell renders the UI, so don't pop a
+        # browser window (also avoids issues when running detached/headless).
+        if os.environ.get("COW_DESKTOP") != "1":
+            try:
+                import webbrowser
+                webbrowser.open(f"http://localhost:{port}")
+                logger.debug(f"[WebChannel] Opened browser at http://localhost:{port}")
+            except Exception as e:
+                logger.debug(f"[WebChannel] Could not open browser: {e}")
 
-        # 确保静态文件目录存在
+        # Ensure the static dir exists. In a packaged build it ships read-only
+        # inside the bundle, so swallow errors instead of failing startup.
         static_dir = os.path.join(os.path.dirname(__file__), 'static')
         if not os.path.exists(static_dir):
-            os.makedirs(static_dir)
-            logger.debug(f"[WebChannel] Created static directory: {static_dir}")
+            try:
+                os.makedirs(static_dir)
+                logger.debug(f"[WebChannel] Created static directory: {static_dir}")
+            except OSError as e:
+                logger.debug(f"[WebChannel] Skipped creating static dir (read-only bundle?): {e}")
 
         urls = (
             '/', 'RootHandler',
+            '/api/health', 'HealthHandler',
             '/auth/login', 'AuthLoginHandler',
             '/auth/check', 'AuthCheckHandler',
             '/auth/logout', 'AuthLogoutHandler',
@@ -746,10 +1288,14 @@ class WebChannel(ChatChannel):
             '/upload', 'UploadHandler',
             '/uploads/(.*)', 'UploadsHandler',
             '/api/file', 'FileServeHandler',
+            '/api/voice/asr', 'VoiceAsrHandler',
+            '/api/voice/tts', 'VoiceTtsHandler',
             '/poll', 'PollHandler',
             '/stream', 'StreamHandler',
+            '/cancel', 'CancelHandler',
             '/chat', 'ChatHandler',
             '/config', 'ConfigHandler',
+            '/api/models', 'ModelsHandler',
             '/api/channels', 'ChannelsHandler',
             '/api/weixin/qrlogin', 'WeixinQrHandler',
             '/api/feishu/register', 'FeishuRegisterHandler',
@@ -760,12 +1306,18 @@ class WebChannel(ChatChannel):
             '/api/knowledge/list', 'KnowledgeListHandler',
             '/api/knowledge/read', 'KnowledgeReadHandler',
             '/api/knowledge/graph', 'KnowledgeGraphHandler',
+            '/api/knowledge/action', 'KnowledgeActionHandler',
+            '/api/knowledge/import', 'KnowledgeImportHandler',
             '/api/scheduler', 'SchedulerHandler',
+            '/api/scheduler/toggle', 'SchedulerToggleHandler',
+            '/api/scheduler/update', 'SchedulerUpdateHandler',
+            '/api/scheduler/delete', 'SchedulerDeleteHandler',
             '/api/sessions', 'SessionsHandler',
             '/api/sessions/(.*)/generate_title', 'SessionTitleHandler',
             '/api/sessions/(.*)/clear_context', 'SessionClearContextHandler',
             '/api/sessions/(.*)', 'SessionDetailHandler',
             '/api/history', 'HistoryHandler',
+            '/api/messages/delete', 'MessageDeleteHandler',
             '/api/logs', 'LogsHandler',
             '/api/version', 'VersionHandler',
             '/assets/(.*)', 'AssetsHandler',
@@ -792,6 +1344,8 @@ class WebChannel(ChatChannel):
         server.requests.min = 20
         server.requests.max = 80
         self._http_server = server
+        # Reclaim orphaned SSE queues so disconnected clients don't leak fds.
+        self._start_sse_janitor()
         try:
             server.start()
         except (KeyboardInterrupt, SystemExit):
@@ -819,6 +1373,16 @@ class RootHandler:
         raise web.seeother('/chat')
 
 
+class HealthHandler:
+    # Unauthenticated liveness probe. The desktop shell polls this to know the
+    # backend is up; it must never require auth (a set web_password would
+    # otherwise make startup hang). Returns no sensitive data.
+    def GET(self):
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        web.header('Cache-Control', 'no-store')
+        return json.dumps({"status": "ok"})
+
+
 class AuthCheckHandler:
     def GET(self):
         web.header('Content-Type', 'application/json; charset=utf-8')
@@ -838,15 +1402,17 @@ class AuthLoginHandler:
             data = json.loads(web.data())
         except Exception:
             return json.dumps({"status": "error", "message": "Invalid request"})
-        password = data.get("password", "")
-        expected = conf().get("web_password", "")
+        password = str(data.get("password", "") or "")
+        expected = _get_web_password()
         if not hmac.compare_digest(password, expected):
             logger.warning("[WebChannel] Invalid login attempt")
             return json.dumps({"status": "error", "message": "Wrong password"})
         token = _create_auth_token()
         web.setcookie("cow_auth_token", token, expires=_session_expire_seconds(),
                        path="/", httponly=True, samesite="Lax")
-        return json.dumps({"status": "success"})
+        # Also return the token in the body: the desktop client (file:// origin)
+        # can't rely on the cookie and sends it back via an Authorization header.
+        return json.dumps({"status": "success", "token": token})
 
 
 class AuthLogoutHandler:
@@ -867,6 +1433,103 @@ class UploadHandler:
         _require_auth()
         web.header('Content-Type', 'application/json; charset=utf-8')
         return WebChannel().upload_file()
+
+
+class VoiceAsrHandler:
+    """Receive a mic recording, persist it under uploads/ and run ASR.
+    Returns {status, text, audio_url} so the UI can render a playback bubble."""
+    def POST(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+
+        saved_path = None
+        try:
+            params = _raw_web_input()
+            file_obj = params.get("file")
+            if file_obj is None:
+                return json.dumps({"status": "error", "message": "no audio file"})
+
+            filename = getattr(file_obj, "filename", "") or "recording.webm"
+            ext = os.path.splitext(filename)[1].lower() or ".webm"
+            if ext not in (".webm", ".ogg", ".opus", ".mp4", ".m4a", ".mp3", ".wav"):
+                ext = ".webm"
+
+            upload_dir = _get_upload_dir()
+            os.makedirs(upload_dir, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            saved_name = f"voice_input_{ts}_{random.randint(0, 9999)}{ext}"
+            saved_path = os.path.join(upload_dir, saved_name)
+            with open(saved_path, "wb") as f:
+                f.write(file_obj.file.read() if hasattr(file_obj, "file") else file_obj.value)
+
+            audio_url = f"/uploads/{saved_name}"
+
+            from bridge.bridge import Bridge
+            reply = Bridge().fetch_voice_to_text(saved_path)
+            if reply is None:
+                return json.dumps({
+                    "status": "error",
+                    "message": "ASR returned no reply",
+                    "audio_url": audio_url,
+                })
+
+            from bridge.reply import ReplyType
+            if reply.type == ReplyType.TEXT:
+                return json.dumps({
+                    "status": "success",
+                    "text": reply.content or "",
+                    "audio_url": audio_url,
+                })
+            return json.dumps({
+                "status": "error",
+                "message": reply.content or "ASR failed",
+                "audio_url": audio_url,
+            })
+        except Exception as e:
+            logger.exception(f"[VoiceAsrHandler] failed: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+
+
+class VoiceTtsHandler:
+    """On-demand TTS for the in-chat "read aloud" button. Returns the
+    audio URL and (when session_id is given) persists it onto the message."""
+    def POST(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        try:
+            data = json.loads(web.data() or b"{}")
+            text = (data.get("text") or "").strip()
+            session_id = (data.get("session_id") or "").strip()
+            if not text:
+                return json.dumps({"status": "error", "message": "empty text"})
+            # `@singleton` makes WebChannel a factory function — go via instance.
+            channel = WebChannel()
+            if not channel._tts_provider_ready():
+                return json.dumps({"status": "error", "message": "tts not configured"})
+
+            from bridge.bridge import Bridge
+            reply = Bridge().fetch_text_to_voice(text)
+            if reply is None or reply.type != ReplyType.VOICE or not reply.content:
+                msg = getattr(reply, "content", "") or "tts failed"
+                return json.dumps({"status": "error", "message": str(msg)})
+
+            url = channel._publish_tts_audio(reply.content)
+            if not url:
+                return json.dumps({"status": "error", "message": "publish failed"})
+
+            if session_id:
+                try:
+                    from agent.memory import get_conversation_store
+                    get_conversation_store().attach_extras_to_last_assistant(
+                        session_id, {"audio": {"url": url, "kind": "tts"}},
+                    )
+                except Exception as e:
+                    logger.debug(f"[VoiceTtsHandler] persist skipped: {e}")
+
+            return json.dumps({"status": "success", "audio_url": url})
+        except Exception as e:
+            logger.exception(f"[VoiceTtsHandler] failed: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
 
 
 class UploadsHandler:
@@ -899,7 +1562,20 @@ class FileServeHandler:
             file_path = params.path
             if not file_path or not os.path.isabs(file_path):
                 raise web.notfound()
-            file_path = os.path.normpath(file_path)
+            # Resolve symlinks and confine access to the allowed root dirs,
+            # so this endpoint can't be abused to read arbitrary files (e.g. /etc/passwd, ~/.ssh).
+            # Defaults to the user home dir plus the agent workspace; set web_file_serve_root="/"
+            # to allow the whole filesystem.
+            file_path = os.path.realpath(file_path)
+            serve_root = conf().get("web_file_serve_root", "~") or "~"
+            allowed_roots = [
+                os.path.realpath(os.path.expanduser(serve_root)),
+                os.path.realpath(os.path.expanduser(conf().get("agent_workspace", "~/cow"))),
+            ]
+            if os.sep not in allowed_roots and not any(
+                os.path.commonpath([file_path, root]) == root for root in allowed_roots
+            ):
+                raise web.notfound()
             if not os.path.isfile(file_path):
                 raise web.notfound()
             content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
@@ -921,6 +1597,12 @@ class PollHandler:
     def POST(self):
         _require_auth()
         return WebChannel().poll_response()
+
+
+class CancelHandler:
+    def POST(self):
+        _require_auth()
+        return WebChannel().cancel_request()
 
 
 class StreamHandler:
@@ -949,22 +1631,27 @@ class ChatHandler:
         cache_bust = str(int(time.time()))
         html = html.replace('assets/js/console.js', f'assets/js/console.js?v={cache_bust}')
         html = html.replace('assets/css/console.css', f'assets/css/console.css?v={cache_bust}')
+        # Inject the backend-resolved default language for first-load fallback.
+        html = html.replace("{{COW_DEFAULT_LANG}}", i18n.get_language())
         return html
 
 
 class ConfigHandler:
 
     _RECOMMENDED_MODELS = [
-        const.DEEPSEEK_V4_FLASH, const.DEEPSEEK_V4_PRO, const.DEEPSEEK_CHAT, const.DEEPSEEK_REASONER,
-        const.MINIMAX_M2_7_HIGHSPEED, const.MINIMAX_M2_7, const.MINIMAX_M2_5, const.MINIMAX_M2_1, const.MINIMAX_M2_1_LIGHTNING,
-        const.CLAUDE_4_6_SONNET, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_OPUS, const.CLAUDE_4_5_SONNET,
-        const.GEMINI_31_FLASH_LITE_PRE, const.GEMINI_31_PRO_PRE, const.GEMINI_3_FLASH_PRE,
-        const.GPT_54, const.GPT_54_MINI, const.GPT_54_NANO, const.GPT_5, const.GPT_41, const.GPT_4o,
-        const.GLM_5_1, const.GLM_5_TURBO, const.GLM_5, const.GLM_4_7,
-        const.QWEN36_PLUS, const.QWEN35_PLUS, const.QWEN3_MAX,
-        const.DOUBAO_SEED_2_PRO, const.DOUBAO_SEED_2_CODE,
-        const.KIMI_K2_6, const.KIMI_K2_5, const.KIMI_K2,
+        const.DEEPSEEK_V4_FLASH, const.DEEPSEEK_V4_PRO,
+        const.MINIMAX_M3, const.MINIMAX_M2_7_HIGHSPEED, const.MINIMAX_M2_7,
+        # claude-sonnet-5 is the Claude default; claude-fable-5 is dropped
+        # from this web console list for now.
+        const.CLAUDE_SONNET_5, const.CLAUDE_4_8_OPUS, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_SONNET, const.CLAUDE_4_6_OPUS,
+        const.GEMINI_35_FLASH, const.GEMINI_31_FLASH_LITE_PRE, const.GEMINI_31_PRO_PRE, const.GEMINI_3_FLASH_PRE,
+        const.GPT_55, const.GPT_54, const.GPT_54_MINI, const.GPT_54_NANO, const.GPT_5, const.GPT_41, const.GPT_4o,
+        const.GLM_5_2, const.GLM_5_1, const.GLM_5_TURBO, const.GLM_5, const.GLM_4_7,
+        const.QWEN37_PLUS, const.QWEN37_MAX, const.QWEN36_PLUS,
+        const.DOUBAO_SEED_2_1_PRO, const.DOUBAO_SEED_2_1_TURBO, const.DOUBAO_SEED_2_CODE,
+        const.KIMI_K2_7_CODE, const.KIMI_K2_7_CODE_HIGHSPEED, const.KIMI_K2_6, const.KIMI_K2_5, const.KIMI_K2,
         const.ERNIE_5_1, const.ERNIE_5, const.ERNIE_X1_1, const.ERNIE_45_TURBO_128K, const.ERNIE_45_TURBO_32K,
+        const.MIMO_V2_5_PRO, const.MIMO_V2_5,
     ]
 
     # Generic placeholder hints surfaced in the web console. We deliberately
@@ -993,7 +1680,7 @@ class ConfigHandler:
             "api_base_key": None,
             "api_base_default": None,
             "api_base_placeholder": "",
-            "models": [const.MINIMAX_M2_7, const.MINIMAX_M2_7_HIGHSPEED, const.MINIMAX_M2_5, const.MINIMAX_M2_1, const.MINIMAX_M2_1_LIGHTNING],
+            "models": [const.MINIMAX_M3, const.MINIMAX_M2_7, const.MINIMAX_M2_7_HIGHSPEED],
         }),
         ("claudeAPI", {
             "label": "Claude",
@@ -1001,7 +1688,7 @@ class ConfigHandler:
             "api_base_key": "claude_api_base",
             "api_base_default": "https://api.anthropic.com/v1",
             "api_base_placeholder": _PLACEHOLDER_V1,
-            "models": [const.CLAUDE_4_6_SONNET, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_OPUS, const.CLAUDE_4_5_SONNET],
+            "models": [const.CLAUDE_SONNET_5, const.CLAUDE_4_8_OPUS, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_SONNET, const.CLAUDE_4_6_OPUS],
         }),
         ("gemini", {
             "label": "Gemini",
@@ -1009,7 +1696,7 @@ class ConfigHandler:
             "api_base_key": "gemini_api_base",
             "api_base_default": "https://generativelanguage.googleapis.com",
             "api_base_placeholder": _PLACEHOLDER_GEMINI,
-            "models": [const.GEMINI_31_FLASH_LITE_PRE, const.GEMINI_31_PRO_PRE, const.GEMINI_3_FLASH_PRE],
+            "models": [const.GEMINI_35_FLASH, const.GEMINI_31_FLASH_LITE_PRE, const.GEMINI_31_PRO_PRE, const.GEMINI_3_FLASH_PRE],
         }),
         ("openai", {
             "label": "OpenAI",
@@ -1017,31 +1704,31 @@ class ConfigHandler:
             "api_base_key": "open_ai_api_base",
             "api_base_default": "https://api.openai.com/v1",
             "api_base_placeholder": _PLACEHOLDER_V1,
-            "models": [const.GPT_54, const.GPT_54_MINI, const.GPT_54_NANO, const.GPT_5, const.GPT_41, const.GPT_4o],
+            "models": [const.GPT_55, const.GPT_54, const.GPT_54_MINI, const.GPT_54_NANO, const.GPT_5, const.GPT_41, const.GPT_4o],
         }),
         ("zhipu", {
-            "label": "智谱AI",
+            "label": {"zh": "智谱AI", "en": "GLM"},
             "api_key_field": "zhipu_ai_api_key",
             "api_base_key": "zhipu_ai_api_base",
             "api_base_default": "https://open.bigmodel.cn/api/paas/v4",
             "api_base_placeholder": _PLACEHOLDER_ZHIPU,
-            "models": [const.GLM_5_1, const.GLM_5_TURBO, const.GLM_5, const.GLM_4_7],
+            "models": [const.GLM_5_2, const.GLM_5_1, const.GLM_5_TURBO, const.GLM_5, const.GLM_4_7],
         }),
         ("dashscope", {
-            "label": "通义千问",
+            "label": {"zh": "通义千问", "en": "Qwen"},
             "api_key_field": "dashscope_api_key",
             "api_base_key": None,
             "api_base_default": None,
             "api_base_placeholder": "",
-            "models": [const.QWEN36_PLUS, const.QWEN35_PLUS, const.QWEN3_MAX],
+            "models": [const.QWEN37_PLUS, const.QWEN37_MAX, const.QWEN36_PLUS],
         }),
         ("doubao", {
-            "label": "豆包",
+            "label": {"zh": "豆包", "en": "Doubao"},
             "api_key_field": "ark_api_key",
             "api_base_key": "ark_base_url",
             "api_base_default": "https://ark.cn-beijing.volces.com/api/v3",
             "api_base_placeholder": _PLACEHOLDER_DOUBAO,
-            "models": [const.DOUBAO_SEED_2_PRO, const.DOUBAO_SEED_2_CODE],
+            "models": [const.DOUBAO_SEED_2_1_PRO, const.DOUBAO_SEED_2_1_TURBO, const.DOUBAO_SEED_2_PRO, const.DOUBAO_SEED_2_CODE],
         }),
         ("moonshot", {
             "label": "Kimi",
@@ -1049,23 +1736,23 @@ class ConfigHandler:
             "api_base_key": "moonshot_base_url",
             "api_base_default": "https://api.moonshot.cn/v1",
             "api_base_placeholder": _PLACEHOLDER_V1,
-            "models": [const.KIMI_K2_6, const.KIMI_K2_5, const.KIMI_K2],
+            "models": [const.KIMI_K2_7_CODE, const.KIMI_K2_7_CODE_HIGHSPEED, const.KIMI_K2_6, const.KIMI_K2_5, const.KIMI_K2],
         }),
         ("qianfan", {
-            "label": "百度千帆",
+            "label": {"zh": "百度千帆", "en": "ERNIE"},
             "api_key_field": "qianfan_api_key",
             "api_base_key": "qianfan_api_base",
             "api_base_default": "https://qianfan.baidubce.com/v2",
             "api_base_placeholder": _PLACEHOLDER_QIANFAN,
             "models": [const.ERNIE_5_1, const.ERNIE_5, const.ERNIE_X1_1, const.ERNIE_45_TURBO_128K, const.ERNIE_45_TURBO_32K],
         }),
-        ("modelscope", {
-            "label": "ModelScope",
-            "api_key_field": "modelscope_api_key",
-            "api_base_key": None,
-            "api_base_default": None,
-            "api_base_placeholder": "",
-            "models": [const.QWEN3_5_27B, const.QWEN3_235B_A22B_INSTRUCT_2507],
+        ("mimo", {
+            "label": {"zh": "小米 MiMo", "en": "MiMo"},
+            "api_key_field": "mimo_api_key",
+            "api_base_key": "mimo_api_base",
+            "api_base_default": "https://api.xiaomimimo.com/v1",
+            "api_base_placeholder": _PLACEHOLDER_V1,
+            "models": [const.MIMO_V2_5_PRO, const.MIMO_V2_5],
         }),
         ("linkai", {
             "label": "LinkAI",
@@ -1076,7 +1763,7 @@ class ConfigHandler:
             "models": _RECOMMENDED_MODELS,
         }),
         ("custom", {
-            "label": "自定义",
+            "label": {"zh": "自定义", "en": "Custom"},
             "api_key_field": "custom_api_key",
             "api_base_key": "custom_api_base",
             "api_base_default": "",
@@ -1086,14 +1773,16 @@ class ConfigHandler:
     ])
 
     EDITABLE_KEYS = {
+        "cow_lang",
         "model", "bot_type", "use_linkai",
         "open_ai_api_base", "deepseek_api_base", "qianfan_api_base", "claude_api_base", "gemini_api_base",
-        "zhipu_ai_api_base", "moonshot_base_url", "ark_base_url", "custom_api_base",
+        "zhipu_ai_api_base", "moonshot_base_url", "ark_base_url", "custom_api_base", "mimo_api_base",
         "open_ai_api_key", "deepseek_api_key", "qianfan_api_key", "claude_api_key", "gemini_api_key",
         "zhipu_ai_api_key", "dashscope_api_key", "moonshot_api_key",
-        "ark_api_key", "minimax_api_key", "linkai_api_key", "custom_api_key",
+        "ark_api_key", "minimax_api_key", "linkai_api_key", "custom_api_key", "mimo_api_key",
+        "custom_providers",
         "agent_max_context_tokens", "agent_max_context_turns", "agent_max_steps",
-        "enable_thinking", "web_password",
+        "enable_thinking", "self_evolution_enabled", "web_password",
     }
 
     @staticmethod
@@ -1108,7 +1797,7 @@ class ConfigHandler:
         web.header('Content-Type', 'application/json; charset=utf-8')
         try:
             local_config = conf()
-            use_agent = local_config.get("agent", False)
+            use_agent = local_config.get("agent", True)
             title = "CowAgent" if use_agent else "AI Assistant"
 
             api_bases = {}
@@ -1133,10 +1822,36 @@ class ConfigHandler:
                     "api_key_field": p.get("api_key_field"),
                 }
 
-            raw_pwd = local_config.get("web_password", "")
+            # Expose user-defined custom providers as "custom:<id>" entries so
+            # the legacy config page can display and select them. Credentials
+            # are managed on the Models page, hence the null key/base fields.
+            # Mirrors the Models page: when expanded entries exist, the bare
+            # legacy "custom" entry is hidden — unless the flat single-provider
+            # custom config is still active or filled in.
+            try:
+                from models.custom_provider import get_custom_providers
+                custom_list = get_custom_providers()
+                legacy_custom_in_use = ModelsHandler._legacy_custom_in_use(local_config)
+                if custom_list and not legacy_custom_in_use:
+                    providers.pop("custom", None)
+                for cp in custom_list:
+                    cid = f"custom:{cp.get('id')}"
+                    cname = cp.get("name") or cp.get("id")
+                    providers[cid] = {
+                        "label": {"zh": cname, "en": cname},
+                        "models": [cp["model"]] if cp.get("model") else [],
+                        "api_base_key": None,
+                        "api_base_default": None,
+                        "api_base_placeholder": "",
+                        "api_key_field": None,
+                    }
+            except Exception as cp_err:
+                logger.warning(f"[ConfigHandler] failed to expand custom providers: {cp_err}")
+
+            raw_pwd = str(local_config.get("web_password", "") or "")
             masked_pwd = ("*" * len(raw_pwd)) if raw_pwd else ""
 
-            return json.dumps({
+            result = {
                 "status": "success",
                 "use_agent": use_agent,
                 "title": title,
@@ -1148,11 +1863,18 @@ class ConfigHandler:
                 "agent_max_context_turns": local_config.get("agent_max_context_turns", 20),
                 "agent_max_steps": local_config.get("agent_max_steps", 20),
                 "enable_thinking": bool(local_config.get("enable_thinking", False)),
+                "self_evolution_enabled": bool(local_config.get("self_evolution_enabled", False)),
                 "api_bases": api_bases,
                 "api_keys": api_keys_masked,
                 "providers": providers,
                 "web_password_masked": masked_pwd,
-            }, ensure_ascii=False)
+            }
+            # The desktop app runs on the local trusted machine, so it can edit
+            # the real password in place (cursor at the end, delete to clear).
+            # Browser access only ever sees the masked value.
+            if os.environ.get("COW_DESKTOP") == "1":
+                result["web_password"] = raw_pwd
+            return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Error getting config: {e}")
             return json.dumps({"status": "error", "message": str(e)})
@@ -1173,7 +1895,7 @@ class ConfigHandler:
                     continue
                 if key in ("agent_max_context_tokens", "agent_max_context_turns", "agent_max_steps"):
                     value = int(value)
-                if key in ("use_linkai", "enable_thinking"):
+                if key in ("use_linkai", "enable_thinking", "self_evolution_enabled"):
                     value = bool(value)
                 local_config[key] = value
                 applied[key] = value
@@ -1181,11 +1903,14 @@ class ConfigHandler:
             if not applied:
                 return json.dumps({"status": "error", "message": "no valid keys to update"})
 
-            config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__)))), "config.json")
+            config_path = os.path.join(get_data_root(), "config.json")
+            old_password = ""  # Store old password before update
             if os.path.exists(config_path):
                 with open(config_path, "r", encoding="utf-8") as f:
                     file_cfg = json.load(f)
+                    # Capture old password before updating
+                    if "web_password" in applied:
+                        old_password = file_cfg.get("web_password", "")
             else:
                 file_cfg = {}
             file_cfg.update(applied)
@@ -1193,6 +1918,35 @@ class ConfigHandler:
                 json.dump(file_cfg, f, indent=4, ensure_ascii=False)
 
             logger.info(f"[WebChannel] Config updated: {list(applied.keys())}")
+
+            # Apply a language change immediately so backend logs, agent
+            # replies and CLI output switch without a restart.
+            if "cow_lang" in applied:
+                try:
+                    i18n.resolve_language(applied["cow_lang"])
+                    logger.info(f"[WebChannel] Language switched to: {i18n.get_language()}")
+                except Exception as lang_err:
+                    logger.warning(f"[WebChannel] Failed to apply language: {lang_err}")
+
+            # Check if password was cleared: if there was a password before clearing,
+            # the service is likely bound to 0.0.0.0 (public), so warn the user.
+            password_warning = None
+            if "web_password" in applied:
+                new_password = applied["web_password"]
+                configured_host = file_cfg.get("web_host", "")
+                
+                # If password was cleared and there was a password before
+                if not new_password and old_password:
+                    # If web_host is not explicitly set, the service auto-binds based on password
+                    # With password → 0.0.0.0 (public), without password → 127.0.0.1 (local)
+                    # So clearing password when it was previously set means going from public to local
+                    if not configured_host or configured_host == "0.0.0.0":
+                        password_warning = "password_cleared_with_public_host"
+                        logger.warning(
+                            "[WebChannel] Password cleared while service is likely bound to 0.0.0.0. "
+                            "Consider restarting the service to rebind to 127.0.0.1 "
+                            "or explicitly set web_host in config to prevent unauthorized access."
+                        )
 
             # Reset Bridge so that bot routing reflects the new config.
             # Without this, Bridge keeps its cached bot instance (e.g. LinkAIBot)
@@ -1206,10 +1960,1639 @@ class ConfigHandler:
                 except Exception as reset_err:
                     logger.warning(f"[WebChannel] Failed to reset bridge: {reset_err}")
 
-            return json.dumps({"status": "success", "applied": applied}, ensure_ascii=False)
+            return json.dumps({"status": "success", "applied": applied, "warning": password_warning}, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Error updating config: {e}")
             return json.dumps({"status": "error", "message": str(e)})
+
+
+class ModelsHandler:
+    """API for the unified Models console.
+
+    Layered model:
+      Layer 1 (providers): vendor credentials shared across capabilities.
+                            Stored as flat *_api_key / *_api_base fields in
+                            config.json — the same fields ConfigHandler
+                            already manages.
+      Layer 2 (capabilities): which provider/model is used by chat / vision /
+                            asr / tts / embedding / image / search.
+
+    GET  /api/models           -> overview (providers + capabilities)
+    POST /api/models/provider  -> upsert a vendor credential
+    DELETE /api/models/provider -> clear a vendor credential
+    POST /api/models/capability -> set provider/model for a capability
+    """
+
+    # Capability -> provider ids drawn from ConfigHandler.PROVIDER_MODELS.
+    _ASR_PROVIDERS = ["openai", "dashscope", "zhipu", "linkai"]
+    # Web-console white-list. Other vendors stay usable via direct config.
+    _TTS_PROVIDERS = ["openai", "minimax", "dashscope", "mimo", "linkai"]
+
+    # TTS engine catalog (speech models, not voice timbres). Entries are
+    # either a bare code or {value, hint?} when a friendly label helps.
+    _TTS_PROVIDER_MODELS = {
+        "openai":    ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"],
+        "minimax": [
+            {"value": "speech-2.8-hd",    "hint": "情绪渲染融合语气词,自然听感"},
+            {"value": "speech-2.8-turbo", "hint": "极致生成速度,更自然逼真"},
+            {"value": "speech-2.6-hd",    "hint": "超低延时,归一化升级"},
+            {"value": "speech-2.6-turbo", "hint": "更快更便宜,适合语音聊天/数字人"},
+        ],
+        "dashscope": [
+            {"value": "qwen3-tts-flash", "hint": "覆盖普通话、方言与主流外语"},
+        ],
+        # 小米 MiMo TTS 系列，通过 chat completions 接口合成
+        "mimo": [
+            {"value": "mimo-v2.5-tts", "hint": "预置音色 · 支持唱歌模式"},
+        ],
+        # Aggregating gateway: a single endpoint multiplexes several
+        # underlying TTS engines, selected via the `model` field.
+        # Each engine exposes its own voice catalog (see _TTS_PROVIDER_VOICES).
+        "linkai": [
+            {"value": "tts-1",  "hint": "OpenAI · 多语种通用"},
+            {"value": "doubao", "hint": "字节豆包 · 中文音色丰富"},
+            {"value": "baidu",  "hint": "百度 · 中文主播音色"},
+        ],
+    }
+
+    # ASR engine catalog per provider. The first entry of each list is the
+    # runtime default (mirrors DEFAULT_ASR_MODEL in voice/*). Users can still
+    # pick "custom" in the UI to send any other model id.
+    _ASR_PROVIDER_MODELS = {
+        "openai": [
+            {"value": "gpt-4o-mini-transcribe", "hint": "默认 · 速度快"},
+            {"value": "gpt-4o-transcribe",      "hint": "更高准确率"},
+            {"value": "whisper-1",              "hint": "经典 Whisper"},
+        ],
+        "dashscope": [
+            {"value": "qwen3-asr-flash", "hint": "覆盖普通话、方言与主流外语"},
+        ],
+        "zhipu": [
+            {"value": "glm-asr-2512", "hint": "智谱语音识别"},
+        ],
+        # LinkAI gateway pins whisper-1 for ASR and ignores any other id,
+        # so expose only that to avoid misleading the user.
+        "linkai": [
+            {"value": "whisper-1", "hint": "网关固定使用"},
+        ],
+    }
+
+    # Per-provider voice timbres. Entries can be a bare code string
+    # (label = code) or {value, hint?} when a friendly secondary label
+    # helps recognition. We keep `value` as the raw API code so power
+    # users can cross-reference config.json.
+    _TTS_PROVIDER_VOICES = {
+        "openai":    [
+            "alloy", "echo", "fable", "onyx", "nova", "shimmer",
+            "ash", "ballad", "coral", "sage", "verse",
+        ],
+        "minimax": [
+            # Mandarin Chinese (full catalog)
+            {"value": "male-qn-qingse",                           "hint": "中文 · 青涩青年（男）"},
+            {"value": "male-qn-jingying",                         "hint": "中文 · 精英青年（男）"},
+            {"value": "male-qn-badao",                            "hint": "中文 · 霸道青年（男）"},
+            {"value": "male-qn-daxuesheng",                       "hint": "中文 · 青年大学生（男）"},
+            {"value": "female-shaonv",                            "hint": "中文 · 少女（女）"},
+            {"value": "female-yujie",                             "hint": "中文 · 御姐（女）"},
+            {"value": "female-chengshu",                          "hint": "中文 · 成熟女性（女）"},
+            {"value": "female-tianmei",                           "hint": "中文 · 甜美女性（女）"},
+            {"value": "male-qn-qingse-jingpin",                   "hint": "中文 · 青涩青年-beta（男）"},
+            {"value": "male-qn-jingying-jingpin",                 "hint": "中文 · 精英青年-beta（男）"},
+            {"value": "male-qn-badao-jingpin",                    "hint": "中文 · 霸道青年-beta（男）"},
+            {"value": "male-qn-daxuesheng-jingpin",               "hint": "中文 · 青年大学生-beta（男）"},
+            {"value": "female-shaonv-jingpin",                    "hint": "中文 · 少女-beta（女）"},
+            {"value": "female-yujie-jingpin",                     "hint": "中文 · 御姐-beta（女）"},
+            {"value": "female-chengshu-jingpin",                  "hint": "中文 · 成熟女性-beta（女）"},
+            {"value": "female-tianmei-jingpin",                   "hint": "中文 · 甜美女性-beta（女）"},
+            {"value": "clever_boy",                               "hint": "中文 · 聪明男童"},
+            {"value": "cute_boy",                                 "hint": "中文 · 可爱男童"},
+            {"value": "lovely_girl",                              "hint": "中文 · 萌萌女童"},
+            {"value": "cartoon_pig",                              "hint": "中文 · 卡通猪小琪"},
+            {"value": "bingjiao_didi",                            "hint": "中文 · 病娇弟弟"},
+            {"value": "junlang_nanyou",                           "hint": "中文 · 俊朗男友"},
+            {"value": "chunzhen_xuedi",                           "hint": "中文 · 纯真学弟"},
+            {"value": "lengdan_xiongzhang",                       "hint": "中文 · 冷淡学长"},
+            {"value": "badao_shaoye",                             "hint": "中文 · 霸道少爷"},
+            {"value": "tianxin_xiaoling",                         "hint": "中文 · 甜心小玲"},
+            {"value": "qiaopi_mengmei",                           "hint": "中文 · 俏皮萌妹"},
+            {"value": "wumei_yujie",                              "hint": "中文 · 妩媚御姐"},
+            {"value": "diadia_xuemei",                            "hint": "中文 · 嗲嗲学妹"},
+            {"value": "danya_xuejie",                             "hint": "中文 · 淡雅学姐"},
+            {"value": "Chinese (Mandarin)_Reliable_Executive",    "hint": "中文 · 沉稳高管"},
+            {"value": "Chinese (Mandarin)_News_Anchor",           "hint": "中文 · 新闻女声"},
+            {"value": "Chinese (Mandarin)_Mature_Woman",          "hint": "中文 · 傲娇御姐"},
+            {"value": "Chinese (Mandarin)_Unrestrained_Young_Man","hint": "中文 · 不羁青年"},
+            {"value": "Arrogant_Miss",                            "hint": "中文 · 嚣张小姐"},
+            {"value": "Robot_Armor",                              "hint": "中文 · 机械战甲"},
+            {"value": "Chinese (Mandarin)_Kind-hearted_Antie",    "hint": "中文 · 热心大婶"},
+            {"value": "Chinese (Mandarin)_HK_Flight_Attendant",   "hint": "中文 · 港普空姐"},
+            {"value": "Chinese (Mandarin)_Humorous_Elder",        "hint": "中文 · 搞笑大爷"},
+            {"value": "Chinese (Mandarin)_Gentleman",             "hint": "中文 · 温润男声"},
+            {"value": "Chinese (Mandarin)_Warm_Bestie",           "hint": "中文 · 温暖闺蜜"},
+            {"value": "Chinese (Mandarin)_Male_Announcer",        "hint": "中文 · 播报男声"},
+            {"value": "Chinese (Mandarin)_Sweet_Lady",            "hint": "中文 · 甜美女声"},
+            {"value": "Chinese (Mandarin)_Southern_Young_Man",    "hint": "中文 · 南方小哥"},
+            {"value": "Chinese (Mandarin)_Wise_Women",            "hint": "中文 · 阅历姐姐"},
+            {"value": "Chinese (Mandarin)_Gentle_Youth",          "hint": "中文 · 温润青年"},
+            {"value": "Chinese (Mandarin)_Warm_Girl",             "hint": "中文 · 温暖少女"},
+            {"value": "Chinese (Mandarin)_Kind-hearted_Elder",    "hint": "中文 · 花甲奶奶"},
+            {"value": "Chinese (Mandarin)_Cute_Spirit",           "hint": "中文 · 憨憨萌兽"},
+            {"value": "Chinese (Mandarin)_Radio_Host",            "hint": "中文 · 电台男主播"},
+            {"value": "Chinese (Mandarin)_Lyrical_Voice",         "hint": "中文 · 抒情男声"},
+            {"value": "Chinese (Mandarin)_Straightforward_Boy",   "hint": "中文 · 率真弟弟"},
+            {"value": "Chinese (Mandarin)_Sincere_Adult",         "hint": "中文 · 真诚青年"},
+            {"value": "Chinese (Mandarin)_Gentle_Senior",         "hint": "中文 · 温柔学姐"},
+            {"value": "Chinese (Mandarin)_Stubborn_Friend",       "hint": "中文 · 嘴硬竹马"},
+            {"value": "Chinese (Mandarin)_Crisp_Girl",            "hint": "中文 · 清脆少女"},
+            {"value": "Chinese (Mandarin)_Pure-hearted_Boy",      "hint": "中文 · 清澈邻家弟弟"},
+            {"value": "Chinese (Mandarin)_Soft_Girl",             "hint": "中文 · 柔和少女"},
+            # Cantonese (full catalog)
+            {"value": "Cantonese_ProfessionalHost（F)",            "hint": "粤语 · 专业女主持"},
+            {"value": "Cantonese_GentleLady",                     "hint": "粤语 · 温柔女声"},
+            {"value": "Cantonese_ProfessionalHost（M)",            "hint": "粤语 · 专业男主持"},
+            {"value": "Cantonese_PlayfulMan",                     "hint": "粤语 · 活泼男声"},
+            {"value": "Cantonese_CuteGirl",                       "hint": "粤语 · 可爱女孩"},
+            {"value": "Cantonese_KindWoman",                      "hint": "粤语 · 善良女声"},
+            # English (curated: 1F + 1M)
+            {"value": "English_Graceful_Lady",                    "hint": "英文 · Graceful Lady（女）"},
+            {"value": "English_Trustworthy_Man",                  "hint": "英文 · Trustworthy Man（男）"},
+            # Japanese (curated: 1F + 1M)
+            {"value": "Japanese_KindLady",                        "hint": "日文 · Kind Lady（女）"},
+            {"value": "Japanese_LoyalKnight",                     "hint": "日文 · Loyal Knight（男）"},
+            # Korean (curated: 1F + 1M)
+            {"value": "Korean_SweetGirl",                         "hint": "韩文 · Sweet Girl（女）"},
+            {"value": "Korean_CheerfulBoyfriend",                 "hint": "韩文 · Cheerful Boyfriend（男）"},
+        ],
+        "dashscope": [
+            {"value": "Cherry",   "hint": "芊悦 · 阳光女声"},
+            {"value": "Serena",   "hint": "苏瑶 · 温柔女声"},
+            {"value": "Chelsie",  "hint": "千雪 · 二次元少女"},
+            {"value": "Ethan",    "hint": "晨煦 · 阳光男声"},
+            {"value": "Moon",     "hint": "月白 · 率性男声"},
+            {"value": "Kai",      "hint": "凯 · 治愈男声"},
+            {"value": "Nofish",   "hint": "不吃鱼 · 设计师男声"},
+            {"value": "Bella",    "hint": "萌宝 · 小萝莉"},
+            {"value": "Bunny",    "hint": "萌小姬 · 萌系少女"},
+            {"value": "Stella",   "hint": "少女阿月 · 元气少女"},
+            {"value": "Neil",     "hint": "阿闻 · 新闻主播"},
+            {"value": "Seren",    "hint": "小婉 · 助眠女声"},
+            {"value": "Jada",     "hint": "上海话 · 阿珍"},
+            {"value": "Dylan",    "hint": "北京话 · 晓东"},
+            {"value": "Sunny",    "hint": "四川话 · 晴儿"},
+            {"value": "Eric",     "hint": "四川话 · 程川"},
+            {"value": "Rocky",    "hint": "粤语 · 阿强"},
+            {"value": "Kiki",     "hint": "粤语 · 阿清"},
+            {"value": "Peter",    "hint": "天津话 · 李彼得"},
+            {"value": "Marcus",   "hint": "陕西话 · 秦川"},
+            {"value": "Roy",      "hint": "闽南语 · 阿杰"},
+        ],
+        # 小米 MiMo 预置音色列表（mimo-v2.5-tts），文档：
+        # https://platform.xiaomimimo.com/docs/zh-CN/usage-guide/speech-synthesis-v2.5
+        "mimo": [
+            {"value": "冰糖",   "hint": "中文 · 女声 · 冰糖"},
+            {"value": "茉莉",   "hint": "中文 · 女声 · 茉莉"},
+            {"value": "苏打",   "hint": "中文 · 男声 · 苏打"},
+            {"value": "白桦",   "hint": "中文 · 男声 · 白桦"},
+            {"value": "Mia",   "hint": "英文 · 女声 · Mia"},
+            {"value": "Chloe", "hint": "英文 · 女声 · Chloe"},
+            {"value": "Milo",  "hint": "英文 · 男声 · Milo"},
+            {"value": "Dean",  "hint": "英文 · 男声 · Dean"},
+        ],
+        # Aggregating gateway: voices are scoped per engine model. The
+        # frontend picks the correct list based on the selected model so
+        # users don't see incompatible timbres for the active engine.
+        "linkai": {
+            "tts-1": [
+                "alloy", "echo", "fable", "onyx", "nova", "shimmer",
+            ],
+            "doubao": [
+                {"value": "zh_female_wanwanxiaohe_moon_bigtts",       "hint": "湾湾小何"},
+                {"value": "BV007_streaming",                          "hint": "亲切女声"},
+                {"value": "BV001_streaming",                          "hint": "通用女声"},
+                {"value": "BV002_streaming",                          "hint": "通用男声"},
+                {"value": "BV051_streaming",                          "hint": "奶气萌娃"},
+                {"value": "zh_female_linjianvhai_moon_bigtts",        "hint": "邻家女孩"},
+                {"value": "BV700_streaming",                          "hint": "灿灿"},
+                {"value": "BV019_streaming",                          "hint": "重庆小伙"},
+                {"value": "BV524_streaming",                          "hint": "日语男声"},
+                {"value": "BV021_streaming",                          "hint": "东北老铁"},
+                {"value": "BV701_streaming",                          "hint": "擎苍"},
+                {"value": "BV113_streaming",                          "hint": "甜宠少御"},
+                {"value": "BV056_streaming",                          "hint": "阳光男声"},
+                {"value": "BV213_streaming",                          "hint": "广西表哥"},
+                {"value": "BV119_streaming",                          "hint": "通用赘婿"},
+                {"value": "BV705_streaming",                          "hint": "炀炀"},
+                {"value": "BV033_streaming",                          "hint": "温柔小哥"},
+                {"value": "BV102_streaming",                          "hint": "儒雅青年"},
+                {"value": "BV522_streaming",                          "hint": "气质女生"},
+                {"value": "BV034_streaming",                          "hint": "知性姐姐 · 双语"},
+                {"value": "BV005_streaming",                          "hint": "活泼女声"},
+                {"value": "zh_female_wanqudashu_moon_bigtts",         "hint": "湾区大叔"},
+                {"value": "zh_female_daimengchuanmei_moon_bigtts",    "hint": "呆萌川妹"},
+                {"value": "zh_male_guozhoudege_moon_bigtts",          "hint": "广州德哥"},
+                {"value": "zh_male_beijingxiaoye_moon_bigtts",        "hint": "北京小爷"},
+                {"value": "zh_male_shaonianzixin_moon_bigtts",        "hint": "少年梓辛 / Brayan"},
+                {"value": "zh_female_meilinvyou_moon_bigtts",         "hint": "魅力女友"},
+                {"value": "zh_male_shenyeboke_moon_bigtts",           "hint": "深夜播客"},
+                {"value": "zh_female_sajiaonvyou_moon_bigtts",        "hint": "柔美女友"},
+                {"value": "zh_female_yuanqinvyou_moon_bigtts",        "hint": "撒娇学妹"},
+                {"value": "zh_male_haoyuxiaoge_moon_bigtts",          "hint": "浩宇小哥"},
+                {"value": "zh_male_guangxiyuanzhou_moon_bigtts",      "hint": "广西远舟"},
+                {"value": "zh_female_meituojieer_moon_bigtts",        "hint": "妹坨洁儿"},
+                {"value": "zh_male_yuzhouzixuan_moon_bigtts",         "hint": "豫州子轩"},
+                {"value": "BV115_streaming",                          "hint": "古风少御"},
+                {"value": "zh_female_gaolengyujie_moon_bigtts",       "hint": "高冷御姐"},
+                {"value": "zh_male_yuanboxiaoshu_moon_bigtts",        "hint": "渊博小叔"},
+                {"value": "zh_male_yangguangqingnian_moon_bigtts",    "hint": "阳光青年"},
+                {"value": "zh_male_aojiaobazong_moon_bigtts",         "hint": "傲娇霸总"},
+                {"value": "zh_male_jingqiangkanye_moon_bigtts",       "hint": "京腔侃爷 / Harmony"},
+                {"value": "zh_female_shuangkuaisisi_moon_bigtts",     "hint": "爽快思思 / Skye"},
+                {"value": "zh_male_wennuanahu_moon_bigtts",           "hint": "温暖阿虎 / Alvin"},
+                {"value": "multi_female_shuangkuaisisi_moon_bigtts",  "hint": "はるこ / Esmeralda"},
+                {"value": "multi_male_jingqiangkanye_moon_bigtts",    "hint": "かずね / Javier or Álvaro"},
+                {"value": "multi_female_gaolengyujie_moon_bigtts",    "hint": "あけみ"},
+                {"value": "multi_male_wanqudashu_moon_bigtts",        "hint": "ひろし / Roberto"},
+                {"value": "ICL_zh_female_bingruoshaonv_tob",          "hint": "病弱少女"},
+                {"value": "ICL_zh_female_huoponvhai_tob",             "hint": "活泼女孩"},
+                {"value": "ICL_zh_female_heainainai_tob",             "hint": "和蔼奶奶"},
+                {"value": "ICL_zh_female_linjuayi_tob",               "hint": "邻居阿姨"},
+                {"value": "zh_female_wenrouxiaoya_moon_bigtts",       "hint": "温柔小雅"},
+                {"value": "zh_female_tianmeixiaoyuan_moon_bigtts",    "hint": "甜美小源"},
+                {"value": "zh_female_qingchezizi_moon_bigtts",        "hint": "清澈梓梓"},
+                {"value": "zh_male_dongfanghaoran_moon_bigtts",       "hint": "东方浩然"},
+                {"value": "zh_male_jieshuoxiaoming_moon_bigtts",      "hint": "解说小明"},
+                {"value": "zh_female_kailangjiejie_moon_bigtts",      "hint": "开朗姐姐"},
+                {"value": "zh_male_linjiananhai_moon_bigtts",         "hint": "邻家男孩"},
+                {"value": "zh_female_tianmeiyueyue_moon_bigtts",      "hint": "甜美悦悦"},
+                {"value": "zh_female_xinlingjitang_moon_bigtts",      "hint": "心灵鸡汤"},
+            ],
+            "baidu": [
+                {"value": "baidu_0",    "hint": "度小美 · 标准女主播"},
+                {"value": "baidu_1",    "hint": "度小宇 · 亲切男声"},
+                {"value": "baidu_3",    "hint": "度逍遥 · 情感男声"},
+                {"value": "baidu_4",    "hint": "度丫丫 · 童声"},
+                {"value": "baidu_5",    "hint": "度小娇 · 成熟女主播"},
+                {"value": "baidu_5003", "hint": "度逍遥 · 情感男声"},
+                {"value": "baidu_5118", "hint": "度小鹿 · 甜美女声"},
+                {"value": "baidu_103",  "hint": "度米朵 · 可爱童声"},
+                {"value": "baidu_106",  "hint": "度博文 · 专业男主播"},
+                {"value": "baidu_110",  "hint": "度小童 · 童声主播"},
+                {"value": "baidu_111",  "hint": "度小萌 · 软萌妹子"},
+                {"value": "baidu_4003", "hint": "度逍遥 · 情感男声"},
+                {"value": "baidu_4100", "hint": "度小雯 · 活力女主播"},
+                {"value": "baidu_4103", "hint": "度米朵 · 可爱女声"},
+                {"value": "baidu_4105", "hint": "度灵儿 · 清澈女声"},
+                {"value": "baidu_4106", "hint": "度博文 · 专业男主播"},
+                {"value": "baidu_4115", "hint": "度小贤 · 电台男主播"},
+                {"value": "baidu_4117", "hint": "度小乔 · 活泼女声"},
+                {"value": "baidu_4119", "hint": "度小鹿 · 甜美女声"},
+                {"value": "baidu_4129", "hint": "度小彦 · 知识男主播"},
+                {"value": "baidu_4140", "hint": "度小新 · 专业女主播"},
+                {"value": "baidu_4143", "hint": "度清风 · 配音男声"},
+                {"value": "baidu_4144", "hint": "度姗姗 · 娱乐女声"},
+                {"value": "baidu_4149", "hint": "度星河 · 广告男声"},
+                {"value": "baidu_4206", "hint": "度博文 · 综艺男声"},
+                {"value": "baidu_4226", "hint": "南方 · 电台女主播"},
+                {"value": "baidu_4254", "hint": "度小清 · 广告女声"},
+                {"value": "baidu_4278", "hint": "度小贝 · 知识女主播"},
+            ],
+        },
+    }
+    _EMBEDDING_PROVIDERS = ["openai", "dashscope", "doubao", "zhipu", "linkai", "custom"]
+
+    # Embedding model catalog per provider. Mirrors the default_model in
+    # agent/memory/embedding/provider.py::EMBEDDING_VENDORS.
+    # Custom providers have no preset list — model names vary per vendor,
+    # so the user always types the model id manually.
+    _EMBEDDING_PROVIDER_MODELS = {
+        "openai":    ["text-embedding-3-small", "text-embedding-3-large"],
+        "dashscope": ["text-embedding-v4"],
+        "doubao":    ["doubao-embedding-vision-251215"],
+        "zhipu":     ["embedding-3"],
+        "linkai":    ["text-embedding-3-small"],
+        "custom":    [],
+    }
+
+    # Capability-scoped model catalogs. The chat dropdown can reuse the
+    # provider's generic model list, but vision and image generation are
+    # served by a narrower subset that the runtime actually dispatches to —
+    # see agent/tools/vision/vision.py and skills/image-generation/SKILL.md.
+    # Anything not listed here intentionally hides the model dropdown so
+    # users cannot pin a chat-only model and silently get a 4xx at runtime.
+    _VISION_PROVIDER_MODELS = {
+        # OpenAI ordering matches the recommended GPT-5.4 family first, then
+        # GPT-5 and the GPT-4.1/4o backstops.
+        "openai":    [
+            const.GPT_55,
+            const.GPT_54,
+            const.GPT_54_MINI,
+            const.GPT_54_NANO,
+            const.GPT_5,
+            const.GPT_41,
+            const.GPT_41_MINI,
+            const.GPT_4o,
+        ],
+        "doubao":    [const.DOUBAO_SEED_2_1_PRO, const.DOUBAO_SEED_2_1_TURBO, const.DOUBAO_SEED_2_PRO],
+        "moonshot":  [const.KIMI_K2_6],
+        "dashscope": [const.QWEN37_PLUS, const.QWEN36_PLUS],
+        "claudeAPI": [const.CLAUDE_SONNET_5, const.CLAUDE_4_8_OPUS, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_SONNET, const.CLAUDE_4_6_OPUS],
+        "gemini":    [const.GEMINI_35_FLASH, const.GEMINI_31_FLASH_LITE_PRE, const.GEMINI_31_PRO_PRE, const.GEMINI_3_FLASH_PRE],
+        "qianfan":   [const.ERNIE_45_TURBO_VL],
+        # Zhipu's bot hard-codes the call to glm-5v-turbo regardless of what
+        # name is passed in (see models/zhipuai/zhipuai_bot.py::call_vision),
+        # so listing the chat models here would silently route to the same
+        # endpoint. Surface only the model the runtime can truly dispatch to.
+        "zhipu":     [const.GLM_5V_TURBO],
+        # MiniMax's vision endpoint is similarly hard-coded to MiniMax-Text-01
+        # (see models/minimax/minimax_bot.py::call_vision); the M2.x chat
+        # family is text-only.
+        "minimax":   [const.MINIMAX_TEXT_01],
+        # MiMo 原生全模态模型：v2.5-pro / v2.5 支持图像/音频/视频输入
+        "mimo":      [const.MIMO_V2_5_PRO, const.MIMO_V2_5],
+        # LinkAI proxies the underlying vendor; surface a curated set of
+        # multimodal models. Order: gpt-4.1-mini → gpt-5.4-mini as the
+        # cross-vendor baselines, then each vendor's recommended default.
+        "linkai":    [
+            const.GPT_41_MINI,
+            const.GPT_54_MINI,
+            const.QWEN37_PLUS,
+            const.DOUBAO_SEED_2_1_PRO,
+            const.KIMI_K2_6,
+            const.CLAUDE_SONNET_5,
+            const.GEMINI_31_FLASH_LITE_PRE,
+        ],
+        # Custom OpenAI-compatible providers have no preset list — model
+        # names vary per vendor, so the user types the model id manually.
+        "custom": [],
+    }
+
+    # Image-generation catalog. Source of truth: skills/image-generation/SKILL.md.
+    # Listed verbatim (not via const.*) because these are skill-side names
+    # the script forwards directly to the vendor's image endpoint.
+    #
+    # Two shapes are accepted per model entry:
+    #   - bare string                           → the model id, no hint
+    #   - {"value": ..., "hint": "..."}         → model id + dim secondary
+    #                                             label rendered on the right
+    #                                             of the dropdown row. Useful
+    #                                             for surfacing brand names
+    #                                             (e.g. "Nano Banana 2" next
+    #                                             to gemini-3.1-flash-image-preview).
+    # The skill itself maps either form to the real vendor endpoint, so the
+    # hint is purely cosmetic.
+    _IMAGE_PROVIDER_MODELS = {
+        "openai":    ["gpt-image-2", "gpt-image-1"],
+        "gemini": [
+            {"value": "gemini-3.1-flash-image-preview", "hint": "Nano Banana 2"},
+            {"value": "gemini-3-pro-image-preview",     "hint": "Nano Banana Pro"},
+            {"value": "gemini-2.5-flash-image",         "hint": "Nano Banana"},
+        ],
+        "doubao":    ["seedream-5.0-lite", "seedream-4.5"],
+        "dashscope": ["qwen-image-2.0-pro", "qwen-image-2.0"],
+        "minimax":   ["image-01"],
+        "linkai": [
+            "gpt-image-2",
+            {"value": "gemini-3.1-flash-image-preview", "hint": "Nano Banana 2"},
+            {"value": "gemini-3-pro-image-preview",     "hint": "Nano Banana Pro"},
+            "seedream-5.0-lite",
+        ],
+    }
+
+    @staticmethod
+    def _config_path() -> str:
+        return os.path.join(get_data_root(), "config.json")
+
+    @classmethod
+    def _read_file_config(cls) -> dict:
+        path = cls._config_path()
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    @classmethod
+    def _write_file_config(cls, data: dict) -> None:
+        with open(cls._config_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+
+    @staticmethod
+    def _is_real_key(value: str) -> bool:
+        return bool(value) and value not in ("", "YOUR API KEY", "YOUR_API_KEY")
+
+    @classmethod
+    def _custom_provider_cards(cls, local_config: dict) -> List[dict]:
+        """Expand ``custom_providers`` into one card per provider.
+
+        Each user-defined OpenAI-compatible provider becomes its own card with
+        id ``custom:<id>`` so the frontend can render, edit, delete and
+        activate them independently. The card carries ``is_custom=True`` and
+        ``active`` flags that the UI uses to render the extra controls.
+
+        Returns an empty list when no multi-providers are configured, in which
+        case the caller keeps the single legacy ``custom`` card untouched —
+        guaranteeing backward compatibility with the flat
+        ``custom_api_key`` / ``custom_api_base`` config.
+        """
+        try:
+            from models.custom_provider import get_custom_providers, parse_custom_bot_type
+            providers = get_custom_providers()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"[ModelsHandler] failed to load custom_providers: {e}")
+            providers = []
+        if not providers:
+            return []
+
+        # Determine the currently active provider id from bot_type.
+        bot_type = local_config.get("bot_type") or ""
+        _, active_id = parse_custom_bot_type(bot_type)
+
+        meta = ConfigHandler.PROVIDER_MODELS.get("custom") or {}
+        cards = []
+        for p in providers:
+            pid = p.get("id") or ""
+            name = p.get("name") or pid
+            raw_key = p.get("api_key") or ""
+            raw_base = p.get("api_base") or ""
+            configured = cls._is_real_key(raw_key)
+            cards.append({
+                "id": f"custom:{pid}",
+                "label": {"zh": name, "en": name},
+                "configured": configured,
+                "is_custom": True,
+                "custom_id": pid,
+                "custom_name": name,
+                "active": (pid == active_id),
+                "model": p.get("model") or "",
+                # Custom cards are edited via the dedicated set_custom_provider
+                # action, not the field-based set_provider flow, so the field
+                # names are intentionally null.
+                "api_key_field": None,
+                "api_base_field": None,
+                "api_key_masked": ConfigHandler._mask_key(raw_key) if configured else "",
+                "api_base": raw_base,
+                "api_base_default": "",
+                "api_base_placeholder": meta.get("api_base_placeholder") or "",
+                "models": [p.get("model")] if p.get("model") else [],
+            })
+        return cards
+
+    @classmethod
+    def _legacy_custom_in_use(cls, local_config: dict) -> bool:
+        """True when the flat single-provider custom config is still relevant:
+        either it is the active bot_type, or its key/base fields are filled.
+        In that case the legacy "custom" card must stay visible even when
+        multi ``custom_providers`` entries exist."""
+        if (local_config.get("bot_type") or "") == "custom":
+            return True
+        return (cls._is_real_key(local_config.get("custom_api_key") or "")
+                or bool(local_config.get("custom_api_base")))
+
+    @classmethod
+    def _provider_overview(cls) -> List[dict]:
+        """All known providers (configured first, unconfigured after).
+        Re-uses ConfigHandler.PROVIDER_MODELS for the canonical list.
+
+        When the user has defined multiple custom (OpenAI-compatible)
+        providers via ``custom_providers``, the single built-in ``custom``
+        card is replaced by one card per provider (see
+        ``_custom_provider_cards``). Otherwise the legacy single ``custom``
+        card is shown unchanged.
+        """
+        local_config = conf()
+        custom_cards = cls._custom_provider_cards(local_config)
+        # Keep the legacy single "custom" card visible alongside the expanded
+        # ones when the flat custom_api_key/base config is active or filled,
+        # so existing single-provider setups never disappear from the UI.
+        keep_legacy_custom = cls._legacy_custom_in_use(local_config)
+        items = []
+        for pid, p in ConfigHandler.PROVIDER_MODELS.items():
+            if pid == "custom" and custom_cards:
+                # Multi-provider mode: emit the expanded cards, plus the
+                # legacy card when it is still in use.
+                items.extend(custom_cards)
+                if not keep_legacy_custom:
+                    continue
+            key_field = p.get("api_key_field")
+            base_field = p.get("api_base_key")
+            raw_key = local_config.get(key_field, "") if key_field else ""
+            raw_base = local_config.get(base_field, "") if base_field else ""
+            configured = cls._is_real_key(raw_key)
+            items.append({
+                "id": pid,
+                "label": p["label"],
+                "configured": configured,
+                "is_custom": (pid == "custom"),
+                "api_key_field": key_field,
+                "api_base_field": base_field,
+                "api_key_masked": ConfigHandler._mask_key(raw_key) if configured else "",
+                "api_base": raw_base or (p.get("api_base_default") or ""),
+                "api_base_default": p.get("api_base_default") or "",
+                "api_base_placeholder": p.get("api_base_placeholder") or "",
+                "models": list(p.get("models") or []),
+            })
+
+        def _sort_key(it):
+            pid = it["id"]
+            # Custom expanded cards share the sort weight of the base "custom"
+            # entry so they cluster where the single custom card used to be.
+            base_id = "custom" if it.get("is_custom") else pid
+            try:
+                order = list(ConfigHandler.PROVIDER_MODELS.keys()).index(base_id)
+            except ValueError:
+                order = len(ConfigHandler.PROVIDER_MODELS)
+            return (0 if it["configured"] else 1, order)
+
+        items.sort(key=_sort_key)
+        return items
+
+    @classmethod
+    def _chat_capability(cls, local_config: dict) -> dict:
+        """Main chat model — drives the agent. bot_type maps to a provider id."""
+        bot_type = local_config.get("bot_type") or ""
+        provider_id = "openai" if bot_type == "chatGPT" else bot_type
+        is_custom_id = provider_id.startswith("custom:")
+        if (provider_id not in ConfigHandler.PROVIDER_MODELS and not is_custom_id
+                and local_config.get("use_linkai")):
+            provider_id = "linkai"
+        # In multi-provider mode, replace the single "custom" entry with the
+        # expanded "custom:<id>" ids so the chat dropdown matches the cards.
+        # The legacy "custom" entry stays when its flat config is still used.
+        provider_ids = []
+        custom_cards = cls._custom_provider_cards(local_config)
+        keep_legacy_custom = cls._legacy_custom_in_use(local_config)
+        for pid in ConfigHandler.PROVIDER_MODELS.keys():
+            if pid == "custom" and custom_cards:
+                provider_ids.extend(c["id"] for c in custom_cards)
+                if keep_legacy_custom:
+                    provider_ids.append(pid)
+            else:
+                provider_ids.append(pid)
+        return {
+            "editable": True,
+            "current_provider": provider_id,
+            "current_model": local_config.get("model", ""),
+            "providers": provider_ids,
+            "use_linkai": bool(local_config.get("use_linkai", False)),
+        }
+
+    # Auto-fallback order for vision when no explicit model is pinned.
+    # Mirrors agent/tools/vision/vision.py::_resolve_providers — DeepSeek and
+    # other text-only chat bots are intentionally absent, since they cannot
+    # actually serve a vision request. Each entry is
+    #   (provider_id, api_key_field, default_vision_model)
+    # and lookups are case-insensitive on the api_key_field. LinkAI and
+    # OpenAI are handled separately below so use_linkai can promote LinkAI
+    # to the front of the chain.
+    _VISION_AUTO_ORDER = [
+        ("moonshot",  "moonshot_api_key",  const.KIMI_K2_6),
+        ("doubao",    "ark_api_key",       const.DOUBAO_SEED_2_PRO),
+        ("dashscope", "dashscope_api_key", const.QWEN37_PLUS),
+        ("claudeAPI", "claude_api_key",    const.CLAUDE_SONNET_5),
+        ("gemini",    "gemini_api_key",    const.GEMINI_35_FLASH),
+        ("qianfan",   "qianfan_api_key",   const.ERNIE_45_TURBO_VL),
+        ("zhipu",     "zhipu_ai_api_key",  const.GLM_5V_TURBO),
+        ("minimax",   "minimax_api_key",   const.MINIMAX_TEXT_01),
+        ("mimo",      "mimo_api_key",      const.MIMO_V2_5_PRO),
+    ]
+
+    @classmethod
+    def _predict_vision_auto(cls, local_config: dict) -> dict:
+        """Predict which provider vision.py will actually dispatch to when
+        no tools.vision.model is set. Mirrors the fallback order in
+        agent/tools/vision/vision.py::_resolve_providers so the UI hint
+        matches reality."""
+        chat = cls._chat_capability(local_config)
+        main_provider = chat["current_provider"]
+        main_model = chat["current_model"]
+        use_linkai_flag = bool(local_config.get("use_linkai", False))
+        linkai_configured = cls._is_real_key(local_config.get("linkai_api_key", ""))
+
+        def _try(pid: str, model_default: str):
+            # Look up the api_key for this provider via the canonical
+            # provider table so we don't hardcode field names here.
+            meta = ConfigHandler.PROVIDER_MODELS.get(pid) or {}
+            key_field = meta.get("api_key_field")
+            if not key_field:
+                return None
+            if not cls._is_real_key(local_config.get(key_field, "")):
+                return None
+            # Pick a model that the vision runtime can actually dispatch to
+            # for this provider. Using `main_model` here is unsafe — for
+            # vendors like Zhipu/MiniMax the bot hard-codes the vision model
+            # name regardless of the chat-model name, so surfacing the chat
+            # model name in the hint is misleading. Trust the curated
+            # _VISION_PROVIDER_MODELS list: prefer the main model only if
+            # it appears there; otherwise show the vendor's first vision-
+            # capable model.
+            allowed = cls._VISION_PROVIDER_MODELS.get(pid, [])
+            if pid == main_provider and main_model and main_model in allowed:
+                return {"provider": pid, "model": main_model}
+            fallback = allowed[0] if allowed else model_default
+            return {"provider": pid, "model": fallback}
+
+        # 1. use_linkai → suppress the hint entirely. LinkAI is a proxy and
+        #    we don't observe which underlying model it picks; surfacing
+        #    "LinkAI" with no model would not tell the user anything useful.
+        if use_linkai_flag and linkai_configured:
+            return {"provider": "", "model": ""}
+
+        # 2. Main bot — only when it natively supports vision. We approximate
+        #    "natively supports" by membership in _VISION_PROVIDER_MODELS,
+        #    which is the same set vision.py's _DISCOVERABLE_MODELS covers
+        #    (minus the chat-only DeepSeek family).
+        if main_provider in cls._VISION_PROVIDER_MODELS:
+            hit = _try(main_provider, main_model)
+            if hit:
+                return hit
+
+        # 3. Other discoverable providers in declared order
+        for pid, _key, default_model in cls._VISION_AUTO_ORDER:
+            hit = _try(pid, default_model)
+            if hit:
+                return hit
+
+        # 4. OpenAI raw HTTP
+        if cls._is_real_key(local_config.get("open_ai_api_key", "")):
+            return {"provider": "openai", "model": const.GPT_55}
+
+        # 5. LinkAI as last resort (only reached when use_linkai is off)
+        if linkai_configured:
+            return {"provider": "linkai", "model": const.GPT_41_MINI}
+
+        return {"provider": "", "model": ""}
+
+    @classmethod
+    def _vision_capability(cls, local_config: dict) -> dict:
+        """Vision model. tools.vision.model is the explicit override; otherwise
+        the runtime fallback chain in agent/tools/vision/vision.py decides."""
+        tools_conf = local_config.get("tools") or local_config.get("tool") or {}
+        if not isinstance(tools_conf, dict):
+            tools_conf = {}
+        vision_conf = tools_conf.get("vision") or {}
+        if not isinstance(vision_conf, dict):
+            vision_conf = {}
+        user_specified = (vision_conf.get("model") or "").strip()
+        explicit_provider = (vision_conf.get("provider") or "").strip()
+
+        # Build provider list: built-in providers + expanded custom:<id> entries.
+        # Same pattern as _embedding_capability — each user-created custom
+        # provider gets its own dropdown entry showing the user-chosen name.
+        providers = []
+        custom_cards = cls._custom_provider_cards(local_config)
+        for pid in cls._VISION_PROVIDER_MODELS:
+            if pid == "custom":
+                if custom_cards:
+                    providers.extend(c["id"] for c in custom_cards)
+            else:
+                providers.append(pid)
+
+        # Provider resolution priority:
+        #   1. Explicit `tools.vision.provider` (persisted via UI; supports
+        #      custom model names that prefix-inference can't recognize).
+        #   2. Scan per-provider model lists by model name.
+        # Empty provider keeps the dropdown on "auto" when we can't tell.
+        inferred_provider = ""
+        if explicit_provider and explicit_provider in providers:
+            inferred_provider = explicit_provider
+        elif user_specified:
+            for pid, models in cls._VISION_PROVIDER_MODELS.items():
+                if user_specified in models:
+                    # For "custom" key, map to the first custom card
+                    inferred_provider = custom_cards[0]["id"] if pid == "custom" and custom_cards else pid
+                    break
+
+        # In auto mode the hint should reflect what vision.py will actually
+        # dispatch to — surface that prediction via fallback_* so the UI
+        # shows e.g. "openai / gpt-4.1-mini" instead of the chat-model name.
+        predicted = cls._predict_vision_auto(local_config)
+
+        return {
+            "editable": True,
+            "strategy": "specified" if user_specified else "auto",
+            "user_specified_model": user_specified,
+            "current_provider": inferred_provider,
+            "current_model": user_specified,
+            "fallback_provider": predicted["provider"],
+            "fallback_model": predicted["model"],
+            "providers": providers,
+            "provider_models": cls._VISION_PROVIDER_MODELS,
+        }
+
+    @classmethod
+    def _asr_capability(cls, local_config: dict) -> dict:
+        # "Pick or empty" — when voice_to_text is unset we don't show a
+        # current selection. `suggested_provider` previews which vendor
+        # the bridge auto-picker would land on (purely a UX hint, NOT
+        # persisted). Once the user saves a vendor, we lock onto it.
+        explicit = (local_config.get("voice_to_text") or "").strip().lower()
+        suggested = ""
+        if not explicit:
+            for pid in cls._ASR_PROVIDERS:
+                meta = ConfigHandler.PROVIDER_MODELS.get(pid) or {}
+                key_field = meta.get("api_key_field")
+                if key_field and cls._is_real_key(local_config.get(key_field, "")):
+                    suggested = pid
+                    break
+        return {
+            "editable": True,
+            "current_provider": explicit,
+            "suggested_provider": suggested,
+            "current_model": (local_config.get("voice_to_text_model") or "") if explicit else "",
+            "providers": cls._ASR_PROVIDERS,
+            "provider_models": cls._ASR_PROVIDER_MODELS,
+        }
+
+    @classmethod
+    def _tts_capability(cls, local_config: dict) -> dict:
+        explicit = (local_config.get("text_to_voice") or "").strip().lower()
+        # Providers outside the white-list don't drive the picker, but their
+        # underlying runtime config is preserved so bridge still routes them.
+        ui_provider = explicit if explicit in cls._TTS_PROVIDERS else ""
+        suggested = ""
+        if not ui_provider:
+            for pid in cls._TTS_PROVIDERS:
+                meta = ConfigHandler.PROVIDER_MODELS.get(pid) or {}
+                key_field = meta.get("api_key_field")
+                if key_field and cls._is_real_key(local_config.get(key_field, "")):
+                    suggested = pid
+                    break
+        return {
+            "editable": True,
+            "current_provider": ui_provider,
+            "suggested_provider": suggested,
+            "current_model": (local_config.get("text_to_voice_model") or "") if ui_provider else "",
+            "current_voice": (local_config.get("tts_voice_id") or "") if ui_provider else "",
+            "providers": cls._TTS_PROVIDERS,
+            "provider_models": cls._TTS_PROVIDER_MODELS,
+            "provider_voices": cls._TTS_PROVIDER_VOICES,
+            "reply_mode": cls._tts_reply_mode(local_config),
+        }
+
+    @staticmethod
+    def _tts_reply_mode(local_config: dict) -> str:
+        if local_config.get("always_reply_voice", False):
+            return "always"
+        if local_config.get("voice_reply_voice", False):
+            return "voice_if_voice"
+        return "off"
+
+    @classmethod
+    def _embedding_capability(cls, local_config: dict) -> dict:
+        # Embedding is "pick or empty" — runtime's legacy openai/linkai
+        # fallback is a safety net, not a UX-visible auto mode.
+        # `suggested_provider` is a UI-only hint (NOT persisted) that
+        # preselects the dropdown to whichever configured vendor we'd
+        # recommend, so users don't have to expand the menu to find it.
+        explicit = (local_config.get("embedding_provider") or "").strip().lower()
+        suggested = ""
+        if not explicit:
+            for pid in cls._EMBEDDING_PROVIDERS:
+                if pid == "custom":
+                    continue
+                meta = ConfigHandler.PROVIDER_MODELS.get(pid) or {}
+                key_field = meta.get("api_key_field")
+                if key_field and cls._is_real_key(local_config.get(key_field, "")):
+                    suggested = pid
+                    break
+            if not suggested:
+                custom_cards = cls._custom_provider_cards(local_config)
+                if custom_cards:
+                    suggested = custom_cards[0]["id"]
+
+        # Build provider list: built-in providers + expanded custom:<id> entries
+        # Same pattern as _chat_capability — each user-created custom provider
+        # gets its own dropdown entry showing the user-chosen name.
+        providers = []
+        custom_cards = cls._custom_provider_cards(local_config)
+        for pid in cls._EMBEDDING_PROVIDERS:
+            if pid == "custom":
+                if custom_cards:
+                    providers.extend(c["id"] for c in custom_cards)
+                # No custom providers configured — skip the bare "custom" entry
+                # since the runtime cannot resolve its credentials.
+            else:
+                providers.append(pid)
+
+        return {
+            "editable": True,
+            "current_provider": explicit,
+            "suggested_provider": suggested,
+            "current_model": local_config.get("embedding_model", "") or "",
+            "current_dim": int(local_config.get("embedding_dimensions") or 0) or None,
+            "providers": providers,
+            "provider_models": cls._EMBEDDING_PROVIDER_MODELS,
+        }
+
+    # Auto-fallback order for image generation. Mirrors the global priority
+    # used inside skills/image-generation/scripts/generate.py
+    # (`_DEFAULT_PROVIDER_ORDER`): OpenAI → Gemini → Seedream(Ark/doubao) →
+    # Qwen(dashscope) → MiniMax → LinkAI. Each entry maps the
+    # provider-card id to the script's per-provider DEFAULT_MODEL so the
+    # hint matches what the runtime would actually request.
+    _IMAGE_AUTO_ORDER = [
+        ("openai",    "gpt-image-2"),
+        ("gemini",    "gemini-3.1-flash-image-preview"),  # nano-banana-2
+        ("doubao",    "seedream-5.0-lite"),
+        ("dashscope", "qwen-image-2.0"),
+        ("minimax",   "image-01"),
+        ("linkai",    "gpt-image-2"),
+    ]
+
+    @classmethod
+    def _predict_image_auto(cls, local_config: dict) -> dict:
+        """Predict which provider/model the image-generation skill will hit
+        when no SKILL_IMAGE_GENERATION_MODEL override is set. Mirrors
+        skills/image-generation/scripts/generate.py::_build_providers so
+        the UI hint matches reality. Chat-only providers (DeepSeek etc.)
+        are absent by design — image generation never falls back to a chat
+        bot regardless of the main model.
+
+        When use_linkai is enabled the hint is suppressed entirely — LinkAI
+        proxies to whichever backend it deems appropriate and surfacing
+        "LinkAI" alone tells the user nothing actionable."""
+        use_linkai_flag = bool(local_config.get("use_linkai", False))
+        linkai_configured = cls._is_real_key(local_config.get("linkai_api_key", ""))
+        if use_linkai_flag and linkai_configured:
+            return {"provider": "", "model": ""}
+
+        for pid, default_model in cls._IMAGE_AUTO_ORDER:
+            meta = ConfigHandler.PROVIDER_MODELS.get(pid) or {}
+            key_field = meta.get("api_key_field")
+            if not key_field:
+                continue
+            if cls._is_real_key(local_config.get(key_field, "")):
+                return {"provider": pid, "model": default_model}
+        return {"provider": "", "model": ""}
+
+    @classmethod
+    def _image_capability(cls, local_config: dict) -> dict:
+        """Image generation. Source of truth: config["skills"]["image-generation"]["model"]
+        (mirrors the per-skill config schema documented in skills/image-generation).
+        The runtime resolver in skills/image-generation/scripts/generate.py
+        reads this via the SKILL_IMAGE_GENERATION_MODEL env var that the
+        agent_initializer syncs at startup; provider is inferred from the
+        model name prefix, mirroring vision.py's design.
+
+        ``skill`` (singular) is still tolerated as a legacy fallback —
+        config.load_config() folds it into ``skills`` at startup.
+        """
+        skills_node = local_config.get("skills") or local_config.get("skill") or {}
+        if not isinstance(skills_node, dict):
+            skills_node = {}
+        img_node = skills_node.get("image-generation") or {}
+        if not isinstance(img_node, dict):
+            img_node = {}
+        explicit_model = (img_node.get("model") or "").strip()
+        explicit_provider = (img_node.get("provider") or "").strip()
+
+        # Provider resolution priority:
+        #   1. Explicit `skills.image-generation.provider` (persisted via UI;
+        #      supports custom model names that prefix-inference can't catch).
+        #   2. Scan per-provider model catalog by model name.
+        # Empty provider keeps the dropdown on "auto" when we can't tell.
+        inferred_provider = ""
+        if explicit_provider and explicit_provider in cls._IMAGE_PROVIDER_MODELS:
+            inferred_provider = explicit_provider
+        elif explicit_model:
+            for pid, models in cls._IMAGE_PROVIDER_MODELS.items():
+                for entry in models:
+                    val = entry if isinstance(entry, str) else (entry.get("value") or "")
+                    if val == explicit_model:
+                        inferred_provider = pid
+                        break
+                if inferred_provider:
+                    break
+
+        # In auto mode the hint should reflect what generate.py will actually
+        # dispatch to — surface that prediction via fallback_* so the UI
+        # never claims a chat-only bot (e.g. minimax/MiniMax-M2.7) "would
+        # generate the image", which is impossible.
+        predicted = cls._predict_image_auto(local_config)
+
+        return {
+            "editable": True,
+            "strategy": "specified" if explicit_model else "auto",
+            "current_provider": inferred_provider,
+            "current_model": explicit_model,
+            "fallback_provider": predicted["provider"],
+            "fallback_model": predicted["model"],
+            "providers": list(cls._IMAGE_PROVIDER_MODELS.keys()),
+            "provider_models": cls._IMAGE_PROVIDER_MODELS,
+            # The dispatcher that honors a pinned provider isn't wired up
+            # yet; advertise this so the UI can show a "saved but not active"
+            # banner until the runtime catches up.
+            "runtime_active": False,
+            "note": "router_pending",
+        }
+
+    # Canonical search provider order. Mirrors PROVIDER_ORDER in
+    # agent/tools/web_search/web_search.py — keep them in sync.
+    _SEARCH_PROVIDERS = ("bocha", "qianfan", "zhipu", "linkai")
+
+    _SEARCH_PROVIDER_LABELS = {
+        "bocha":   {"zh": "博查", "en": "Bocha"},
+        "zhipu":   {"zh": "智谱", "en": "GLM"},
+        "qianfan": {"zh": "百度千帆", "en": "ERNIE"},
+        "linkai":  {"zh": "LinkAI", "en": "LinkAI"},
+    }
+
+    @classmethod
+    def _search_provider_key(cls, provider: str, local_config: dict) -> str:
+        """Resolve the (raw) key for a given search provider."""
+        if provider == "bocha":
+            tools_cfg = local_config.get("tools") or {}
+            block = tools_cfg.get("web_search") or {} if isinstance(tools_cfg, dict) else {}
+            return (block.get("bocha_api_key") if isinstance(block, dict) else "") or os.environ.get("BOCHA_API_KEY", "")
+        if provider == "zhipu":
+            return local_config.get("zhipu_ai_api_key") or os.environ.get("ZHIPUAI_API_KEY", "")
+        if provider == "qianfan":
+            return local_config.get("qianfan_api_key") or os.environ.get("QIANFAN_API_KEY", "")
+        if provider == "linkai":
+            return local_config.get("linkai_api_key") or os.environ.get("LINKAI_API_KEY", "")
+        return ""
+
+    @classmethod
+    def _search_capability(cls, local_config: dict) -> dict:
+        """Search is editable: pick auto (default) or pin a specific backend.
+        Providers reuse model-vendor keys (zhipu/qianfan/linkai) so they show
+        up as configured once the user adds those vendors; bocha keeps its
+        own key under tools.web_search."""
+        tools_cfg = local_config.get("tools") or {}
+        ws_cfg = tools_cfg.get("web_search") or {} if isinstance(tools_cfg, dict) else {}
+        if not isinstance(ws_cfg, dict):
+            ws_cfg = {}
+
+        providers = []
+        configured_ids = []
+        for pid in cls._SEARCH_PROVIDERS:
+            ok = cls._is_real_key(cls._search_provider_key(pid, local_config))
+            raw_key = cls._search_provider_key(pid, local_config) if ok else ""
+            providers.append({
+                "id": pid,
+                "label": cls._SEARCH_PROVIDER_LABELS.get(pid, pid),
+                "configured": ok,
+                # bocha owns its key under tools.web_search; the other three
+                # piggy-back on a model-vendor credential. Frontend uses
+                # this hint to decide which credential editor to surface.
+                "needs_dedicated_key": pid == "bocha",
+                "api_key_masked": ConfigHandler._mask_key(raw_key) if raw_key else "",
+            })
+            if ok:
+                configured_ids.append(pid)
+
+        strategy = (ws_cfg.get("strategy") or "auto").strip().lower()
+        if strategy not in ("auto", "fixed"):
+            strategy = "auto"
+        fixed_provider = (ws_cfg.get("provider") or "").strip().lower()
+        if fixed_provider and fixed_provider not in configured_ids:
+            fixed_provider = ""
+
+        # current_provider drives the chip in the header — show the actually
+        # active backend (pinned or first auto-picked).
+        if strategy == "fixed" and fixed_provider:
+            current = fixed_provider
+        else:
+            current = configured_ids[0] if configured_ids else ""
+
+        return {
+            "editable": True,
+            "strategy": strategy,
+            "providers": providers,
+            "configured_providers": configured_ids,
+            "current_provider": current,
+            "fixed_provider": fixed_provider,
+            "available": bool(current),
+        }
+
+    @classmethod
+    def _capabilities(cls, local_config: dict) -> dict:
+        return {
+            "chat":      cls._chat_capability(local_config),
+            "vision":    cls._vision_capability(local_config),
+            "asr":       cls._asr_capability(local_config),
+            "tts":       cls._tts_capability(local_config),
+            "embedding": cls._embedding_capability(local_config),
+            "image":     cls._image_capability(local_config),
+            "search":    cls._search_capability(local_config),
+        }
+
+    def GET(self):
+        _require_auth()
+        web.header("Content-Type", "application/json; charset=utf-8")
+        try:
+            local_config = conf()
+            return json.dumps({
+                "status": "success",
+                "providers": self._provider_overview(),
+                "capabilities": self._capabilities(local_config),
+            }, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[ModelsHandler] GET failed: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+
+    def POST(self):
+        _require_auth()
+        web.header("Content-Type", "application/json; charset=utf-8")
+        try:
+            data = json.loads(web.data() or b"{}")
+            action = data.get("action") or ""
+            if action == "set_provider":
+                return self._handle_set_provider(data)
+            if action == "delete_provider":
+                return self._handle_delete_provider(data)
+            if action == "set_custom_provider":
+                return self._handle_set_custom_provider(data)
+            if action == "delete_custom_provider":
+                return self._handle_delete_custom_provider(data)
+            if action == "set_active_custom_provider":
+                return self._handle_set_active_custom_provider(data)
+            if action == "set_capability":
+                return self._handle_set_capability(data)
+            if action == "set_voice_reply_mode":
+                return self._handle_set_voice_reply_mode(data)
+            if action == "set_search_credential":
+                return self._handle_set_search_credential(data)
+            return json.dumps({"status": "error", "message": f"unknown action: {action!r}"})
+        except Exception as e:
+            logger.error(f"[ModelsHandler] POST failed: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+
+    def _handle_set_provider(self, data: dict) -> str:
+        provider_id = (data.get("provider_id") or "").strip()
+        meta = ConfigHandler.PROVIDER_MODELS.get(provider_id)
+        if not meta:
+            return json.dumps({"status": "error", "message": f"unknown provider: {provider_id}"})
+
+        # api_key absent / empty / null => leave the existing key untouched
+        # (used by the "edit only base url" flow). To clear the key, callers
+        # must use action=delete_provider explicitly.
+        api_key_raw = data.get("api_key")
+        api_key = api_key_raw.strip() if isinstance(api_key_raw, str) else ""
+
+        # api_base presence is significant: an explicit "" means "reset to
+        # default", whereas a missing key means "no change".
+        api_base_present = "api_base" in data
+        api_base = (data.get("api_base") or "").strip() if api_base_present else None
+
+        applied = {}
+        local_config = conf()
+        file_cfg = self._read_file_config()
+
+        key_field = meta.get("api_key_field")
+        if key_field and api_key:
+            local_config[key_field] = api_key
+            file_cfg[key_field] = api_key
+            applied[key_field] = True
+        base_field = meta.get("api_base_key")
+        if base_field and api_base_present:
+            local_config[base_field] = api_base
+            file_cfg[base_field] = api_base
+            applied[base_field] = True
+
+        if not applied:
+            # Nothing actually changed (e.g. user opened the modal and hit
+            # save without editing). Treat as a successful no-op so the
+            # frontend can show "Saved" instead of surfacing an error.
+            return json.dumps({"status": "success", "provider": provider_id, "noop": True})
+
+        self._write_file_config(file_cfg)
+        logger.info(f"[ModelsHandler] provider {provider_id} updated: {sorted(applied.keys())}")
+
+        # Vendor credentials affect bot routing for any capability that uses
+        # them; safest to reset Bridge so the next request rebuilds bots.
+        self._reset_bridge()
+        return json.dumps({"status": "success", "provider": provider_id})
+
+    def _handle_delete_provider(self, data: dict) -> str:
+        provider_id = (data.get("provider_id") or "").strip()
+        meta = ConfigHandler.PROVIDER_MODELS.get(provider_id)
+        if not meta:
+            return json.dumps({"status": "error", "message": f"unknown provider: {provider_id}"})
+
+        local_config = conf()
+        file_cfg = self._read_file_config()
+
+        cleared = []
+        for field_name in (meta.get("api_key_field"), meta.get("api_base_key")):
+            if not field_name:
+                continue
+            # Always write the key — even if it was absent before — so the
+            # in-memory conf() reflects the cleared state without needing a
+            # restart. (`in local_config` was too strict: provider keys that
+            # were ever set then deleted manually wouldn't get reset.)
+            local_config[field_name] = ""
+            file_cfg[field_name] = ""
+            cleared.append(field_name)
+
+        self._write_file_config(file_cfg)
+        logger.info(f"[ModelsHandler] provider {provider_id} cleared: {cleared}")
+        self._reset_bridge()
+        return json.dumps({"status": "success", "provider": provider_id, "cleared": cleared})
+
+    # ------------------------------------------------------------------
+    # Multiple custom (OpenAI-compatible) providers
+    # ------------------------------------------------------------------
+    # These actions manage the ``custom_providers`` list.  Activation is done
+    # by setting ``bot_type`` to ``"custom:<id>"``.  There is no separate
+    # ``custom_active_provider`` field — a single source of truth.
+
+    @staticmethod
+    def _normalize_custom_providers(raw) -> List[dict]:
+        """Return a clean list of provider dicts (drops malformed entries)."""
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for p in raw:
+            if isinstance(p, dict) and (p.get("id") or "").strip():
+                out.append(p)
+        return out
+
+    def _persist_custom_providers(self, providers: List[dict], bot_type=None) -> None:
+        """Write the providers list to both in-memory conf and the on-disk
+        config, then reset the bridge so bots rebuild.
+
+        If ``bot_type`` is given, also update ``bot_type``.  When activating a
+        provider (bot_type is ``custom:<id>``), also write the provider's
+        ``model`` into the global ``model`` field so that all paths (chat,
+        agent, vision) automatically use the correct model."""
+        from models.custom_provider import parse_custom_bot_type
+
+        local_config = conf()
+        file_cfg = self._read_file_config()
+        local_config["custom_providers"] = providers
+        file_cfg["custom_providers"] = providers
+        if bot_type is not None:
+            local_config["bot_type"] = bot_type
+            file_cfg["bot_type"] = bot_type
+            # Sync the provider's model into the global model field.
+            _, pid = parse_custom_bot_type(bot_type)
+            if pid:
+                provider = next((p for p in providers if p.get("id") == pid), None)
+                if provider and provider.get("model"):
+                    local_config["model"] = provider["model"]
+                    file_cfg["model"] = provider["model"]
+        self._write_file_config(file_cfg)
+        self._reset_bridge()
+
+    def _handle_set_custom_provider(self, data: dict) -> str:
+        """Add a new custom provider or update an existing one.
+
+        Payload::
+
+            {
+              "action": "set_custom_provider",
+              "id": "3f2a9c1b",             # required for edit; omit for create
+              "name": "my-provider",         # required, display label
+              "api_base": "https://...",     # required when creating
+              "api_key": "sk-...",           # optional on edit (keep existing)
+              "model": "model-name",         # optional default model
+              "make_active": true            # optional, also activate it
+            }
+        """
+        from models.custom_provider import generate_provider_id, parse_custom_bot_type
+
+        name = (data.get("name") or "").strip()
+        if not name:
+            return json.dumps({"status": "error", "message": "name is required"})
+
+        provider_id = (data.get("id") or "").strip()
+        api_base = (data.get("api_base") or "").strip()
+        # api_key omitted/empty on edit => keep the existing one.
+        api_key_raw = data.get("api_key")
+        api_key = api_key_raw.strip() if isinstance(api_key_raw, str) else ""
+        model = (data.get("model") or "").strip()
+        make_active = bool(data.get("make_active"))
+
+        local_config = conf()
+        providers = self._normalize_custom_providers(local_config.get("custom_providers"))
+
+        existing = next((p for p in providers if p.get("id") == provider_id), None) if provider_id else None
+        if existing is None:
+            # Creating a new provider — api_base is mandatory.
+            if not api_base:
+                return json.dumps({"status": "error", "message": "api_base is required"})
+            provider_id = generate_provider_id()
+            entry = {"id": provider_id, "name": name, "api_key": api_key, "api_base": api_base}
+            if model:
+                entry["model"] = model
+            providers.append(entry)
+            created = True
+        else:
+            existing["name"] = name
+            if api_base:
+                existing["api_base"] = api_base
+            if api_key:
+                existing["api_key"] = api_key
+            # Only touch model when explicitly provided in the payload; an
+            # explicit empty string clears it, a missing key keeps it (the
+            # UI modal no longer sends model, so manual config survives edits).
+            if "model" in data:
+                if model:
+                    existing["model"] = model
+                else:
+                    existing.pop("model", None)
+            created = False
+
+        # Decide bot_type — only switch when explicitly requested.
+        new_bot_type = None
+        if make_active:
+            new_bot_type = f"custom:{provider_id}"
+
+        self._persist_custom_providers(providers, new_bot_type)
+        logger.info(
+            f"[ModelsHandler] custom provider {name!r} (id={provider_id}) "
+            f"{'created' if created else 'updated'}"
+        )
+        return json.dumps({
+            "status": "success",
+            "id": provider_id,
+            "name": name,
+            "created": created,
+        })
+
+    def _handle_delete_custom_provider(self, data: dict) -> str:
+        """Remove a custom provider by id."""
+        from models.custom_provider import parse_custom_bot_type
+
+        provider_id = (data.get("id") or "").strip()
+        if not provider_id:
+            return json.dumps({"status": "error", "message": "id is required"})
+
+        local_config = conf()
+        providers = self._normalize_custom_providers(local_config.get("custom_providers"))
+        remaining = [p for p in providers if p.get("id") != provider_id]
+        if len(remaining) == len(providers):
+            return json.dumps({"status": "error", "message": f"unknown custom provider id: {provider_id}"})
+
+        # If the deleted provider was active, fall back to the first remaining.
+        _, current_active_id = parse_custom_bot_type(local_config.get("bot_type") or "")
+        new_bot_type = None
+        if current_active_id == provider_id:
+            if remaining:
+                new_bot_type = f"custom:{remaining[0]['id']}"
+            else:
+                new_bot_type = "custom"  # revert to legacy
+
+        self._persist_custom_providers(remaining, new_bot_type)
+        logger.info(f"[ModelsHandler] custom provider id={provider_id} deleted")
+        return json.dumps({"status": "success", "id": provider_id})
+
+    def _handle_set_active_custom_provider(self, data: dict) -> str:
+        """Activate a custom provider by setting bot_type to 'custom:<id>'."""
+        provider_id = (data.get("id") or "").strip()
+        if not provider_id:
+            return json.dumps({"status": "error", "message": "id is required"})
+
+        local_config = conf()
+        providers = self._normalize_custom_providers(local_config.get("custom_providers"))
+        if not any(p.get("id") == provider_id for p in providers):
+            return json.dumps({"status": "error", "message": f"unknown custom provider id: {provider_id}"})
+
+        new_bot_type = f"custom:{provider_id}"
+        self._persist_custom_providers(providers, new_bot_type)
+        logger.info(f"[ModelsHandler] active custom provider set to id={provider_id}")
+        return json.dumps({"status": "success", "active_id": provider_id})
+
+    def _handle_set_capability(self, data: dict) -> str:
+        capability = (data.get("capability") or "").strip()
+        provider_id = (data.get("provider_id") or "").strip()
+        model = (data.get("model") or "").strip()
+
+        if capability == "chat":
+            return self._set_chat(provider_id, model)
+        if capability == "vision":
+            return self._set_vision(provider_id, model)
+        if capability == "asr":
+            return self._set_asr(provider_id, model)
+        if capability == "tts":
+            return self._set_tts(provider_id, model, (data.get("voice") or "").strip())
+        if capability == "embedding":
+            return self._set_embedding(provider_id, model)
+        if capability == "image":
+            return self._set_image(provider_id, model)
+        if capability == "search":
+            return self._set_search(
+                (data.get("strategy") or "").strip().lower(),
+                (data.get("provider") or "").strip().lower(),
+            )
+        return json.dumps({"status": "error", "message": f"capability not editable: {capability}"})
+
+    def _set_image(self, provider_id: str, model: str) -> str:
+        # Source of truth: skills.image-generation.{provider, model}. The
+        # provider field is persisted so users picking a custom model under
+        # a specific vendor still get routed there — runtime falls back to
+        # model-name prefix inference only when provider is empty.
+        local_config = conf()
+        file_cfg = self._read_file_config()
+
+        self._set_nested_namespace_value(local_config, "skills", "image-generation", "model", model or "")
+        self._set_nested_namespace_value(file_cfg, "skills", "image-generation", "model", model or "")
+        self._set_nested_namespace_value(local_config, "skills", "image-generation", "provider", provider_id or "")
+        self._set_nested_namespace_value(file_cfg, "skills", "image-generation", "provider", provider_id or "")
+        self._drop_legacy_namespace(local_config, "skill", "skills", child="image-generation")
+        self._drop_legacy_namespace(file_cfg, "skill", "skills", child="image-generation")
+
+        self._write_file_config(file_cfg)
+
+        # The skill subprocess reads SKILL_IMAGE_GENERATION_{MODEL,PROVIDER}
+        # from env at startup; mirror the change so live edits apply without
+        # restart.
+        model_env = "SKILL_IMAGE_GENERATION_MODEL"
+        provider_env = "SKILL_IMAGE_GENERATION_PROVIDER"
+        if model:
+            os.environ[model_env] = model
+        else:
+            os.environ.pop(model_env, None)
+        if provider_id:
+            os.environ[provider_env] = provider_id
+        else:
+            os.environ.pop(provider_env, None)
+
+        logger.info(f"[ModelsHandler] image updated: provider={provider_id!r} model={model!r}")
+        return json.dumps({
+            "status": "success",
+            "provider": provider_id,
+            "model": model,
+            "router_pending": True,
+        })
+
+    def _set_chat(self, provider_id: str, model: str) -> str:
+        # Accept expanded custom provider ids ("custom:<id>") as well as the
+        # built-in vendors, so the chat capability card and the custom
+        # providers section behave consistently.
+        custom_provider = None
+        if provider_id.startswith("custom:"):
+            from models.custom_provider import parse_custom_bot_type
+            _, custom_id = parse_custom_bot_type(provider_id)
+            providers = self._normalize_custom_providers(conf().get("custom_providers"))
+            custom_provider = next((p for p in providers if p.get("id") == custom_id), None)
+            if custom_provider is None:
+                return json.dumps({"status": "error", "message": f"unknown custom provider id: {custom_id}"})
+        elif provider_id and provider_id not in ConfigHandler.PROVIDER_MODELS:
+            return json.dumps({"status": "error", "message": f"unknown provider: {provider_id}"})
+
+        applied = {}
+        local_config = conf()
+        file_cfg = self._read_file_config()
+
+        # Fall back to the custom provider's default model when none is given.
+        if not model and custom_provider:
+            model = custom_provider.get("model") or ""
+
+        if provider_id:
+            bot_type_value = "chatGPT" if provider_id == "openai" else provider_id
+            local_config["bot_type"] = bot_type_value
+            file_cfg["bot_type"] = bot_type_value
+            applied["bot_type"] = bot_type_value
+            use_linkai = (provider_id == "linkai")
+            local_config["use_linkai"] = use_linkai
+            file_cfg["use_linkai"] = use_linkai
+            applied["use_linkai"] = use_linkai
+        if model:
+            local_config["model"] = model
+            file_cfg["model"] = model
+            applied["model"] = model
+
+        if not applied:
+            return json.dumps({"status": "success", "applied": {}, "noop": True})
+
+        self._write_file_config(file_cfg)
+        logger.info(f"[ModelsHandler] chat updated: {applied}")
+        self._reset_bridge()
+        return json.dumps({"status": "success", "applied": applied})
+
+    def _set_vision(self, provider_id: str, model: str) -> str:
+        # Source of truth: tools.vision.{provider, model}. The provider field
+        # is persisted so users picking a custom model under a specific vendor
+        # still get routed there — runtime falls back to model-name prefix
+        # inference only when provider is empty.
+        # Validate provider_id — mirrors _set_chat / _set_embedding pattern.
+        if provider_id.startswith("custom:"):
+            from models.custom_provider import parse_custom_bot_type
+            _, custom_id = parse_custom_bot_type(provider_id)
+            providers = self._normalize_custom_providers(conf().get("custom_providers"))
+            custom_provider = next((p for p in providers if p.get("id") == custom_id), None)
+            if custom_provider is None:
+                return json.dumps({"status": "error", "message": f"unknown custom provider id: {custom_id}"})
+            if not model:
+                model = custom_provider.get("model") or ""
+        elif provider_id and provider_id not in {k for k in ModelsHandler._VISION_PROVIDER_MODELS if k != "custom"}:
+            return json.dumps({"status": "error", "message": f"unknown provider: {provider_id}"})
+
+        if provider_id and not model:
+            return json.dumps({
+                "status": "error",
+                "message": "vision model is required when a provider is selected",
+            })
+
+        local_config = conf()
+        file_cfg = self._read_file_config()
+        self._set_nested_namespace_value(file_cfg, "tools", "vision", "model", model)
+        self._set_nested_namespace_value(local_config, "tools", "vision", "model", model)
+        self._set_nested_namespace_value(file_cfg, "tools", "vision", "provider", provider_id or "")
+        self._set_nested_namespace_value(local_config, "tools", "vision", "provider", provider_id or "")
+        self._drop_legacy_namespace(file_cfg, "tool", "tools", child="vision")
+        self._drop_legacy_namespace(local_config, "tool", "tools", child="vision")
+
+        self._write_file_config(file_cfg)
+        logger.info(f"[ModelsHandler] vision updated: provider={provider_id!r} model={model!r}")
+        return json.dumps({"status": "success", "provider": provider_id, "model": model})
+
+    @staticmethod
+    def _set_nested_namespace_value(cfg, top: str, name: str, key: str, value):
+        """Set ``cfg[top][name][key] = value``, creating missing dicts."""
+        bucket = cfg.get(top)
+        if not isinstance(bucket, dict):
+            bucket = {}
+        node = bucket.get(name)
+        if not isinstance(node, dict):
+            node = {}
+        node[key] = value
+        bucket[name] = node
+        cfg[top] = bucket
+
+    @staticmethod
+    def _drop_legacy_namespace(cfg, legacy: str, canonical: str, child: str) -> None:
+        """Strip the deprecated singular key so config.json stays single-source."""
+        legacy_section = cfg.get(legacy)
+        if not isinstance(legacy_section, dict):
+            return
+        legacy_section.pop(child, None)
+        if legacy_section:
+            cfg[legacy] = legacy_section
+        else:
+            cfg.pop(legacy, None)
+
+    def _handle_set_voice_reply_mode(self, data: dict) -> str:
+        # UI picker (off / voice_if_voice / always) maps to the legacy
+        # always_reply_voice + voice_reply_voice pair that chat_channel.py
+        # reads, so all channels (web/feishu/wecom/...) share the routing.
+        mode = (data.get("mode") or "").strip().lower()
+        if mode not in ("off", "voice_if_voice", "always"):
+            return json.dumps({"status": "error", "message": f"invalid mode: {mode!r}"})
+        always = (mode == "always")
+        if_voice = (mode == "voice_if_voice")
+        local_config = conf()
+        file_cfg = self._read_file_config()
+        local_config["always_reply_voice"] = always
+        local_config["voice_reply_voice"] = if_voice
+        file_cfg["always_reply_voice"] = always
+        file_cfg["voice_reply_voice"] = if_voice
+        self._write_file_config(file_cfg)
+        logger.info(
+            f"[ModelsHandler] voice reply mode set: {mode!r} "
+            f"(always_reply_voice={always}, voice_reply_voice={if_voice})"
+        )
+        return json.dumps({"status": "success", "mode": mode})
+
+    def _set_simple(self, key: str, value: str) -> str:
+        local_config = conf()
+        file_cfg = self._read_file_config()
+        local_config[key] = value
+        file_cfg[key] = value
+        self._write_file_config(file_cfg)
+        logger.info(f"[ModelsHandler] {key} set: {value!r}")
+        # Hot-swap the cached voice bot so the change takes effect immediately.
+        if key in ("voice_to_text", "text_to_voice"):
+            self._refresh_voice_routing()
+        return json.dumps({"status": "success", key: value})
+
+    def _set_asr(self, provider_id: str, model: str) -> str:
+        local_config = conf()
+        file_cfg = self._read_file_config()
+        local_config["voice_to_text"] = provider_id
+        file_cfg["voice_to_text"] = provider_id
+        # Only overwrite the model when one is supplied. An empty model means
+        # "keep whatever is configured" so switching provider from the console
+        # never wipes a user's hand-set voice_to_text_model (runtime falls back
+        # to the engine default via `or DEFAULT_ASR_MODEL` regardless).
+        if model:
+            local_config["voice_to_text_model"] = model
+            file_cfg["voice_to_text_model"] = model
+        self._write_file_config(file_cfg)
+        logger.info(
+            f"[ModelsHandler] asr updated: provider={provider_id!r} "
+            f"model={model!r}"
+        )
+        self._refresh_voice_routing()
+        return json.dumps({
+            "status": "success",
+            "provider": provider_id,
+            "model": local_config.get("voice_to_text_model", ""),
+        })
+
+    def _set_tts(self, provider_id: str, model: str, voice: str = "") -> str:
+        local_config = conf()
+        file_cfg = self._read_file_config()
+        local_config["text_to_voice"] = provider_id
+        file_cfg["text_to_voice"] = provider_id
+        local_config["text_to_voice_model"] = model
+        file_cfg["text_to_voice_model"] = model
+        local_config["tts_voice_id"] = voice
+        file_cfg["tts_voice_id"] = voice
+        self._write_file_config(file_cfg)
+        logger.info(
+            f"[ModelsHandler] tts updated: provider={provider_id!r} "
+            f"model={model!r} voice={voice!r}"
+        )
+        self._refresh_voice_routing()
+        return json.dumps({
+            "status": "success",
+            "provider": provider_id, "model": model, "voice": voice,
+        })
+
+    @staticmethod
+    def _refresh_voice_routing() -> None:
+        try:
+            from bridge.bridge import Bridge
+            Bridge().refresh_voice()
+        except Exception as e:
+            logger.warning(f"[ModelsHandler] Bridge voice refresh failed: {e}")
+
+    def _set_embedding(self, provider_id: str, model: str) -> str:
+        # Validate provider_id — mirrors _set_chat's validation pattern.
+        if provider_id.startswith("custom:"):
+            from models.custom_provider import parse_custom_bot_type
+            _, custom_id = parse_custom_bot_type(provider_id)
+            providers = self._normalize_custom_providers(conf().get("custom_providers"))
+            custom_provider = next((p for p in providers if p.get("id") == custom_id), None)
+            if custom_provider is None:
+                return json.dumps({"status": "error", "message": f"unknown custom provider id: {custom_id}"})
+            # Fall back to the custom provider's default model when none is given.
+            if not model:
+                model = custom_provider.get("model") or ""
+        elif provider_id and provider_id not in {p for p in ModelsHandler._EMBEDDING_PROVIDERS if p != "custom"}:
+            return json.dumps({"status": "error", "message": f"unknown provider: {provider_id}"})
+
+        # A provider without a model leaves the runtime in a broken half-state,
+        # so reject that explicitly instead of silently writing it through.
+        if provider_id and not model:
+            return json.dumps({
+                "status": "error",
+                "message": "embedding model is required when a provider is selected",
+            })
+        local_config = conf()
+        file_cfg = self._read_file_config()
+        local_config["embedding_provider"] = provider_id
+        file_cfg["embedding_provider"] = provider_id
+        local_config["embedding_model"] = model
+        file_cfg["embedding_model"] = model
+        self._write_file_config(file_cfg)
+        logger.info(f"[ModelsHandler] embedding updated: provider={provider_id!r} model={model!r}")
+        # The next /memory rebuild-index command hot-swaps the provider onto
+        # the running MemoryManager (see plugins/cow_cli). The dim may have
+        # changed, so the frontend prompts the user to rebuild.
+        return json.dumps({"status": "success", "provider": provider_id, "model": model})
+
+    def _set_search(self, strategy: str, provider: str) -> str:
+        """Persist search routing under tools.web_search.{strategy,provider}.
+
+        strategy 'auto'  -> provider field is cleared (auto picks at call time)
+        strategy 'fixed' -> provider must be in the canonical list; runtime
+                            silently falls back to auto if its key is missing.
+        """
+        if strategy not in ("auto", "fixed"):
+            return json.dumps({"status": "error", "message": f"invalid strategy: {strategy!r}"})
+        if strategy == "fixed":
+            if provider not in self._SEARCH_PROVIDERS:
+                return json.dumps({"status": "error", "message": f"unknown provider: {provider!r}"})
+        else:
+            provider = ""
+
+        local_config = conf()
+        file_cfg = self._read_file_config()
+        self._set_nested_namespace_value(local_config, "tools", "web_search", "strategy", strategy)
+        self._set_nested_namespace_value(file_cfg,     "tools", "web_search", "strategy", strategy)
+        self._set_nested_namespace_value(local_config, "tools", "web_search", "provider", provider)
+        self._set_nested_namespace_value(file_cfg,     "tools", "web_search", "provider", provider)
+        self._write_file_config(file_cfg)
+        logger.info(f"[ModelsHandler] search updated: strategy={strategy!r} provider={provider!r}")
+        return json.dumps({"status": "success", "strategy": strategy, "provider": provider})
+
+    def _handle_set_search_credential(self, data: dict) -> str:
+        """Persist the bocha API key under tools.web_search.bocha_api_key.
+
+        The other three providers (zhipu/qianfan/linkai) reuse model-vendor
+        credentials, so they go through set_provider with the standard
+        model-vendor flow.
+        """
+        api_key = (data.get("api_key") or "").strip() if isinstance(data.get("api_key"), str) else ""
+        local_config = conf()
+        file_cfg = self._read_file_config()
+        self._set_nested_namespace_value(local_config, "tools", "web_search", "bocha_api_key", api_key)
+        self._set_nested_namespace_value(file_cfg,     "tools", "web_search", "bocha_api_key", api_key)
+        self._write_file_config(file_cfg)
+        logger.info(f"[ModelsHandler] search credential set: bocha_api_key={'***' if api_key else ''}")
+        return json.dumps({"status": "success", "provider": "bocha"})
+
+    @staticmethod
+    def _reset_bridge() -> None:
+        try:
+            from bridge.bridge import Bridge
+            Bridge().reset_bot()
+            logger.info("[ModelsHandler] Bridge bot routing reset")
+        except Exception as e:
+            logger.warning(f"[ModelsHandler] Bridge reset failed: {e}")
 
 
 class ChannelsHandler:
@@ -1271,6 +3654,18 @@ class ChannelsHandler:
                 {"key": "wechatcomapp_port", "label": "Port", "type": "number", "default": 9898},
             ],
         }),
+        ("wechat_kf", {
+            "label": {"zh": "微信客服", "en": "WeChat Customer Service"},
+            "icon": "fa-headset",
+            "color": "emerald",
+            "fields": [
+                {"key": "wechat_kf_corp_id", "label": "Corp ID", "type": "text"},
+                {"key": "wechat_kf_secret", "label": "Secret", "type": "secret"},
+                {"key": "wechat_kf_token", "label": "Token", "type": "secret"},
+                {"key": "wechat_kf_aes_key", "label": "AES Key", "type": "secret"},
+                {"key": "wechat_kf_port", "label": "Port", "type": "number", "default": 9888},
+            ],
+        }),
         ("wechatmp", {
             "label": {"zh": "公众号", "en": "WeChat MP"},
             "icon": "fa-comment-dots",
@@ -1281,6 +3676,31 @@ class ChannelsHandler:
                 {"key": "wechatmp_token", "label": "Token", "type": "secret"},
                 {"key": "wechatmp_aes_key", "label": "AES Key", "type": "secret"},
                 {"key": "wechatmp_port", "label": "Port", "type": "number", "default": 8080},
+            ],
+        }),
+        ("telegram", {
+            "label": {"zh": "Telegram", "en": "Telegram"},
+            "icon": "fa-paper-plane",
+            "color": "sky",
+            "fields": [
+                {"key": "telegram_token", "label": "Bot Token", "type": "secret"},
+            ],
+        }),
+        ("slack", {
+            "label": {"zh": "Slack", "en": "Slack"},
+            "icon": "fa-hashtag",
+            "color": "purple",
+            "fields": [
+                {"key": "slack_bot_token", "label": "Bot Token (xoxb-)", "type": "secret"},
+                {"key": "slack_app_token", "label": "App Token (xapp-)", "type": "secret"},
+            ],
+        }),
+        ("discord", {
+            "label": {"zh": "Discord", "en": "Discord"},
+            "icon": "fa-discord",
+            "color": "indigo",
+            "fields": [
+                {"key": "discord_token", "label": "Bot Token", "type": "secret"},
             ],
         }),
     ])
@@ -1321,10 +3741,16 @@ class ChannelsHandler:
         _require_auth()
         web.header('Content-Type', 'application/json; charset=utf-8')
         try:
+            from common import i18n
             local_config = conf()
             active_channels = self._active_channel_set()
+            # Desktop build ships without lark-oapi, so hide Feishu from the list.
+            desktop_mode = os.environ.get("COW_DESKTOP") == "1"
             channels = []
+            is_hant = i18n.get_language() == i18n.ZH_HANT
             for ch_name, ch_def in self.CHANNEL_DEFS.items():
+                if desktop_mode and ch_name == "feishu":
+                    continue
                 fields_out = []
                 for f in ch_def["fields"]:
                     raw_val = local_config.get(f["key"], f.get("default", ""))
@@ -1332,16 +3758,32 @@ class ChannelsHandler:
                         display_val = self._mask_secret(str(raw_val))
                     else:
                         display_val = raw_val
+                    
+                    label_val = f["label"]
+                    if is_hant and isinstance(label_val, str):
+                        label_val = i18n.to_traditional(label_val)
+                    elif is_hant and isinstance(label_val, dict):
+                        label_val = label_val.copy()
+                        label_val["zh-Hant"] = i18n.to_traditional(label_val.get("zh", ""))
+
                     fields_out.append({
                         "key": f["key"],
-                        "label": f["label"],
+                        "label": label_val,
                         "type": f["type"],
                         "value": display_val,
                         "default": f.get("default", ""),
                     })
+                
+                label_val = ch_def["label"]
+                if is_hant and isinstance(label_val, str):
+                    label_val = i18n.to_traditional(label_val)
+                elif is_hant and isinstance(label_val, dict):
+                    label_val = label_val.copy()
+                    label_val["zh-Hant"] = i18n.to_traditional(label_val.get("zh", ""))
+
                 ch_info = {
                     "name": ch_name,
-                    "label": ch_def["label"],
+                    "label": label_val,
                     "icon": ch_def["icon"],
                     "color": ch_def["color"],
                     "active": ch_name in active_channels,
@@ -1406,8 +3848,7 @@ class ChannelsHandler:
         if not applied:
             return json.dumps({"status": "error", "message": "no valid fields to update"})
 
-        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), "config.json")
+        config_path = os.path.join(get_data_root(), "config.json")
         if os.path.exists(config_path):
             with open(config_path, "r", encoding="utf-8") as f:
                 file_cfg = json.load(f)
@@ -1477,8 +3918,7 @@ class ChannelsHandler:
         new_channel_type = ",".join(existing)
         local_config["channel_type"] = new_channel_type
 
-        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), "config.json")
+        config_path = os.path.join(get_data_root(), "config.json")
         if os.path.exists(config_path):
             with open(config_path, "r", encoding="utf-8") as f:
                 file_cfg = json.load(f)
@@ -1533,8 +3973,7 @@ class ChannelsHandler:
         local_config = conf()
         local_config["channel_type"] = new_channel_type
 
-        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), "config.json")
+        config_path = os.path.join(get_data_root(), "config.json")
         if os.path.exists(config_path):
             with open(config_path, "r", encoding="utf-8") as f:
                 file_cfg = json.load(f)
@@ -1684,9 +4123,7 @@ class WeixinQrHandler:
             if not bot_token or not bot_id:
                 return json.dumps({"status": "error", "message": "Login confirmed but missing token"})
 
-            cred_path = os.path.expanduser(
-                conf().get("weixin_credentials_path", "~/.weixin_cow_credentials.json")
-            )
+            cred_path = get_weixin_credentials_path()
             from channel.weixin.weixin_channel import _save_credentials
             _save_credentials(cred_path, {
                 "token": bot_token,
@@ -1903,16 +4340,26 @@ class ToolsHandler:
         web.header('Content-Type', 'application/json; charset=utf-8')
         try:
             from agent.tools.tool_manager import ToolManager
+            from common import i18n
             tm = ToolManager()
             if not tm.tool_classes:
                 tm.load_tools()
             tools = []
+            lang = i18n.get_language()
             for name, cls in tm.tool_classes.items():
                 try:
                     instance = cls()
+                    desc = instance.description
+                    if lang == i18n.ZH_HANT and desc:
+                        desc = i18n.to_traditional(desc)
+                    elif lang == "en" and name == "scheduler":
+                        desc = (
+                            "Create, query and manage scheduled tasks (reminders, periodic tasks, etc.).\n\n"
+                            "⚠️ IMPORTANT: Only use this tool when delayed or periodic execution is needed."
+                        )
                     tools.append({
                         "name": name,
-                        "description": instance.description,
+                        "description": desc,
                     })
                 except Exception:
                     tools.append({"name": name, "description": ""})
@@ -1929,10 +4376,17 @@ class SkillsHandler:
         try:
             from agent.skills.service import SkillService
             from agent.skills.manager import SkillManager
+            from common import i18n
             workspace_root = _get_workspace_root()
             manager = SkillManager(custom_dir=os.path.join(workspace_root, "skills"))
             service = SkillService(manager)
             skills = service.query()
+            if i18n.get_language() == i18n.ZH_HANT:
+                for skill in skills:
+                    if isinstance(skill, dict):
+                        for k, v in list(skill.items()):
+                            if k in ("name", "description", "display_name") and isinstance(v, str):
+                                skill[k] = i18n.to_traditional(v)
             return json.dumps({"status": "success", "skills": skills}, ensure_ascii=False)
         except Exception as e:
             logger.error(f"[WebChannel] Skills API error: {e}")
@@ -2018,6 +4472,141 @@ class SchedulerHandler:
             return json.dumps({"status": "success", "tasks": tasks}, ensure_ascii=False)
         except Exception as e:
             logger.error(f"[WebChannel] Scheduler API error: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+
+
+class SchedulerToggleHandler:
+    def POST(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        try:
+            body = json.loads(web.data())
+            task_id = body.get("task_id")
+            enabled = body.get("enabled", True)
+            if not task_id:
+                return json.dumps({"status": "error", "message": "task_id required"})
+            from agent.tools.scheduler.task_store import TaskStore
+            workspace_root = _get_workspace_root()
+            store_path = os.path.join(workspace_root, "scheduler", "tasks.json")
+            store = TaskStore(store_path)
+            store.enable_task(task_id, enabled)
+            task = store.get_task(task_id)
+            return json.dumps({"status": "success", "task": task}, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[WebChannel] Scheduler toggle error: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+
+
+class SchedulerUpdateHandler:
+    def POST(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        try:
+            body = json.loads(web.data())
+            task_id = body.get("task_id")
+            if not task_id:
+                return json.dumps({"status": "error", "message": "task_id required"})
+            
+            from agent.tools.scheduler.task_store import TaskStore
+            from agent.tools.scheduler.scheduler_service import SchedulerService
+            from datetime import datetime
+            workspace_root = _get_workspace_root()
+            store_path = os.path.join(workspace_root, "scheduler", "tasks.json")
+            store = TaskStore(store_path)
+            
+            # Get original task (single query to avoid repeated I/O)
+            original_task = store.get_task(task_id)
+            if not original_task:
+                return json.dumps({"status": "error", "message": f"Task '{task_id}' not found"})
+            
+            # Build updates dict
+            updates = {}
+            if "name" in body:
+                updates["name"] = body["name"]
+            if "enabled" in body:
+                updates["enabled"] = body["enabled"]
+            
+            # Update schedule
+            if "schedule" in body:
+                updates["schedule"] = body["schedule"]
+                # If schedule config changed, recalculate next_run_at
+                # Build merged temp task data for calculation (without modifying the original object)
+                merged = dict(original_task)
+                merged.update(updates)
+                if "action" in body:
+                    merged["action"] = body["action"]
+                temp_service = SchedulerService(store, lambda t: None)
+                next_run = temp_service._calculate_next_run(merged, datetime.now())
+                if next_run:
+                    updates["next_run_at"] = next_run.isoformat()
+                else:
+                    # Cannot calculate next run time, schedule config may be invalid
+                    return json.dumps({
+                        "status": "error", 
+                        "message": "Cannot calculate next run time. Please check the schedule config (e.g., cron expression format, or whether the one-time task time has already passed)."
+                    }, ensure_ascii=False)
+            
+            # Update action
+            if "action" in body:
+                action = body["action"]
+                channel_type = action.get("channel_type", "web")
+                
+                # Get the task's original channel_type
+                old_channel = original_task.get("action", {}).get("channel_type", "web")
+                
+                # If channel type changed or no receiver, reject the update.
+                # Note: the web UI disables the channel selector, so this branch
+                # is only reachable via direct API calls. Changing a task's channel
+                # after creation is not supported because the receiver identity is
+                # channel-bound and cannot be trivially re-populated (e.g. weixin
+                # requires a valid context_token tied to the original user-session).
+                if old_channel and old_channel != channel_type:
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Cannot change channel type from '{old_channel}' to '{channel_type}'. Please create a new task on the target channel instead."
+                    }, ensure_ascii=False)
+                if not action.get("receiver"):
+                    return json.dumps({
+                        "status": "error",
+                        "message": "Receiver is required. Please create a new task through the chat interface."
+                    }, ensure_ascii=False)
+                updates["action"] = action
+                
+                # If schedule was not updated but action was, ensure next_run_at exists
+                if "schedule" not in body and "next_run_at" not in original_task:
+                    merged = dict(original_task)
+                    merged.update(updates)
+                    temp_service = SchedulerService(store, lambda t: None)
+                    next_run = temp_service._calculate_next_run(merged, datetime.now())
+                    if next_run:
+                        updates["next_run_at"] = next_run.isoformat()
+            
+            store.update_task(task_id, updates)
+            task = store.get_task(task_id)
+            return json.dumps({"status": "success", "task": task}, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[WebChannel] Scheduler update error: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+
+
+class SchedulerDeleteHandler:
+    def POST(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        try:
+            body = json.loads(web.data())
+            task_id = body.get("task_id")
+            if not task_id:
+                return json.dumps({"status": "error", "message": "task_id required"})
+            
+            from agent.tools.scheduler.task_store import TaskStore
+            workspace_root = _get_workspace_root()
+            store_path = os.path.join(workspace_root, "scheduler", "tasks.json")
+            store = TaskStore(store_path)
+            store.delete_task(task_id)
+            return json.dumps({"status": "success"}, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[WebChannel] Scheduler delete error: {e}")
             return json.dumps({"status": "error", "message": str(e)})
 
 
@@ -2174,6 +4763,40 @@ class HistoryHandler:
             return json.dumps({"status": "error", "message": str(e)})
 
 
+class MessageDeleteHandler:
+    def POST(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        web.header('Access-Control-Allow-Origin', '*')
+        try:
+            data = json.loads(web.data())
+            session_id = data.get('session_id', '').strip()
+            user_seq = data.get('user_seq')
+            delete_user = data.get('delete_user', True)
+            cascade = data.get('cascade', False)
+            
+            if not session_id or user_seq is None:
+                return json.dumps({"status": "error", "message": "session_id and user_seq required"})
+            
+            # 1. Delete from database
+            from agent.memory import get_conversation_store
+            store = get_conversation_store()
+            deleted = store.delete_message_pair(session_id, int(user_seq), delete_user=delete_user, cascade=cascade)
+
+            # 2. Sync agent's in-memory context so its next turn sees the
+            # same history as the DB. Handled by the agent_bridge helper.
+            try:
+                from bridge.bridge import Bridge
+                Bridge().get_agent_bridge().sync_session_messages_from_store(session_id)
+            except Exception as sync_err:
+                logger.warning(f"[WebChannel] Failed to sync agent memory: {sync_err}")
+
+            return json.dumps({"status": "success", "deleted": deleted}, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[WebChannel] Message delete error: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+
+
 class LogsHandler:
     def GET(self):
         _require_auth()
@@ -2181,8 +4804,7 @@ class LogsHandler:
         web.header('Cache-Control', 'no-cache')
         web.header('X-Accel-Buffering', 'no')
 
-        from config import get_root
-        log_path = os.path.join(get_root(), "run.log")
+        log_path = os.path.join(get_data_root(), "run.log")
 
         def generate():
             if not os.path.isfile(log_path):
@@ -2242,7 +4864,12 @@ class AssetsHandler:
                 raise web.notfound()
 
             if not os.path.exists(full_path) or not os.path.isfile(full_path):
-                logger.error(f"File not found: {full_path}")
+                # Browsers routinely probe optional asset variants (e.g. a
+                # .ttf fallback declared alongside .woff2 in @font-face);
+                # logging these as errors floods the console with harmless
+                # noise. Keep it at debug level — real misconfigurations
+                # will still surface via the network panel.
+                logger.debug(f"Static file not found: {full_path}")
                 raise web.notfound()
 
             # 设置正确的Content-Type
@@ -2257,8 +4884,12 @@ class AssetsHandler:
             with open(full_path, 'rb') as f:
                 return f.read()
 
+        except web.HTTPError:
+            # The 404 path above already logged at debug; re-raise as-is so
+            # web.py returns the original status to the client.
+            raise
         except Exception as e:
-            logger.error(f"Error serving static file: {e}", exc_info=True)  # 添加更详细的错误信息
+            logger.error(f"Error serving static file: {e}", exc_info=True)
             raise web.notfound()
 
 
@@ -2304,6 +4935,90 @@ class KnowledgeGraphHandler:
         except Exception as e:
             logger.error(f"[WebChannel] Knowledge graph error: {e}")
             return json.dumps({"nodes": [], "links": []})
+
+
+class KnowledgeActionHandler:
+    def POST(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        try:
+            body = json.loads(web.data() or b"{}")
+            action = body.get("action", "")
+            payload = body.get("payload") or {}
+            from agent.knowledge.service import KnowledgeService
+            result = KnowledgeService(_get_workspace_root()).dispatch(action, payload)
+            return json.dumps({
+                "status": "success" if result["code"] < 300 else "error",
+                **result,
+            }, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[WebChannel] Knowledge action error: {e}")
+            return json.dumps({"status": "error", "code": 500, "message": str(e), "payload": None})
+
+
+class KnowledgeImportHandler:
+    def POST(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        try:
+            from agent.knowledge.service import KnowledgeService
+            content_length = int(getattr(web.ctx, "env", {}).get("CONTENT_LENGTH") or 0)
+            if content_length > KnowledgeService.MAX_IMPORT_TOTAL_SIZE:
+                return json.dumps({
+                    "status": "error",
+                    "code": 413,
+                    "message": "import batch too large",
+                    "payload": None,
+                })
+            params = _raw_web_input()
+            target_category = params.get("target_category", "")
+            conflict_strategy = params.get("conflict_strategy", "skip")
+            uploaded = _ensure_list(params.get("files"))
+            single = params.get("file")
+            if single is not None:
+                uploaded.append(single)
+            if not uploaded:
+                return json.dumps({"status": "error", "code": 400, "message": "No files uploaded", "payload": None})
+            if len(uploaded) > KnowledgeService.MAX_IMPORT_FILES:
+                return json.dumps({
+                    "status": "error",
+                    "code": 400,
+                    "message": f"too many files: max {KnowledgeService.MAX_IMPORT_FILES}",
+                    "payload": None,
+                })
+
+            files = []
+            total_size = 0
+            for file_obj in uploaded:
+                if file_obj is None:
+                    continue
+                filename = getattr(file_obj, "filename", "") or getattr(file_obj, "name", "")
+                content = _read_uploaded_file_bytes_limited(file_obj, KnowledgeService.MAX_IMPORT_FILE_SIZE)
+                total_size += len(content)
+                if total_size > KnowledgeService.MAX_IMPORT_TOTAL_SIZE:
+                    return json.dumps({
+                        "status": "error",
+                        "code": 413,
+                        "message": "import batch too large",
+                        "payload": None,
+                    })
+                files.append({
+                    "filename": filename,
+                    "content": content,
+                })
+
+            result = KnowledgeService(_get_workspace_root()).dispatch("import_documents", {
+                "target_category": target_category,
+                "conflict_strategy": conflict_strategy,
+                "files": files,
+            })
+            return json.dumps({
+                "status": "success" if result["code"] < 300 else "error",
+                **result,
+            }, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[WebChannel] Knowledge import error: {e}", exc_info=True)
+            return json.dumps({"status": "error", "code": 500, "message": str(e), "payload": None})
 
 
 class VersionHandler:

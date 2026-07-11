@@ -15,6 +15,11 @@ import threading
 
 _channel_mgr = None
 
+# Desktop mode: a lighter runtime for the packaged Electron client. Plugins are
+# loaded in a background thread (so command plugins like cow_cli/godcmd work
+# without slowing startup), while MCP warmup is still skipped to keep it fast.
+DESKTOP_MODE = os.environ.get("COW_DESKTOP") == "1"
+
 
 def get_channel_manager():
     return _channel_mgr
@@ -76,7 +81,15 @@ class ChannelManager:
                 self._primary_channel = channels[0][1]
 
             if first_start:
-                PluginManager().load_plugins()
+                if DESKTOP_MODE:
+                    # Load plugins in the background so command plugins
+                    # (cow_cli / godcmd, e.g. /status, #help) work in the
+                    # desktop client, without blocking web-service readiness.
+                    threading.Thread(
+                        target=PluginManager().load_plugins, daemon=True
+                    ).start()
+                else:
+                    PluginManager().load_plugins()
 
                 # Cloud client is optional. It is only started when
                 # use_linkai=True AND cloud_deployment_id is set.
@@ -231,10 +244,14 @@ def _clear_singleton_cache(channel_name: str):
         "wechatmp": "channel.wechatmp.wechatmp_channel.WechatMPChannel",
         "wechatmp_service": "channel.wechatmp.wechatmp_channel.WechatMPChannel",
         "wechatcom_app": "channel.wechatcom.wechatcomapp_channel.WechatComAppChannel",
+        const.WECHAT_KF: "channel.wechat_kf.wechat_kf_channel.WechatKfChannel",
         const.FEISHU: "channel.feishu.feishu_channel.FeiShuChanel",
         const.DINGTALK: "channel.dingtalk.dingtalk_channel.DingTalkChanel",
         const.WECOM_BOT: "channel.wecom_bot.wecom_bot_channel.WecomBotChannel",
         const.QQ: "channel.qq.qq_channel.QQChannel",
+        const.TELEGRAM: "channel.telegram.telegram_channel.TelegramChannel",
+        const.SLACK: "channel.slack.slack_channel.SlackChannel",
+        const.DISCORD: "channel.discord.discord_channel.DiscordChannel",
         const.WEIXIN: "channel.weixin.weixin_channel.WeixinChannel",
         "wx": "channel.weixin.weixin_channel.WeixinChannel",
     }
@@ -286,6 +303,16 @@ def _warmup_mcp_tools():
         ToolManager()._load_mcp_tools()
     except Exception as e:
         logger.warning(f"[App] MCP warmup failed (non-fatal): {e}")
+
+
+def _warmup_scheduler():
+    """Eager-init AgentBridge so the scheduler thread starts at process
+    boot rather than waiting for the first user message."""
+    try:
+        from bridge.bridge import Bridge
+        Bridge().get_agent_bridge()
+    except Exception as e:
+        logger.warning(f"[App] Scheduler warmup failed: {e}")
 
 
 def _sync_builtin_skills():
@@ -350,8 +377,18 @@ def run():
         _sync_builtin_skills()
 
         # Kick off MCP server loading in the background so first-message
-        # latency isn't dominated by npx package downloads.
-        _warmup_mcp_tools()
+        # latency isn't dominated by npx package downloads. Skipped in desktop
+        # mode (MCP relies on external npx/uvx runtimes that aren't bundled).
+        if not DESKTOP_MODE:
+            _warmup_mcp_tools()
+
+        if DESKTOP_MODE:
+            # Defer the (heavy) AgentBridge/scheduler warmup to a background
+            # thread so the web API becomes available within a couple seconds.
+            # The scheduler still starts; it just doesn't block UI readiness.
+            threading.Thread(target=_warmup_scheduler, daemon=True).start()
+        else:
+            _warmup_scheduler()
 
         logger.info(f"[App] Starting channels: {channel_names}")
 

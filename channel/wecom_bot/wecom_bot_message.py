@@ -87,11 +87,14 @@ def _get_tmp_dir() -> str:
 class WecomBotMessage(ChatMessage):
     """Message wrapper for wecom bot (websocket long-connection mode)."""
 
-    def __init__(self, msg_body: dict, is_group: bool = False):
+    def __init__(self, msg_body: dict, is_group: bool = False, default_aeskey: str = ""):
         super().__init__(msg_body)
         self.msg_id = msg_body.get("msgid")
         self.create_time = msg_body.get("create_time")
         self.is_group = is_group
+        # In callback (webhook) mode the media bodies carry no per-message aeskey;
+        # the download url is encrypted with the bot's EncodingAESKey instead.
+        self._default_aeskey = default_aeskey
 
         msg_type = msg_body.get("msgtype")
         from_userid = msg_body.get("from", {}).get("userid", "")
@@ -113,7 +116,7 @@ class WecomBotMessage(ChatMessage):
             self.ctype = ContextType.IMAGE
             image_info = msg_body.get("image", {})
             image_url = image_info.get("url", "")
-            aeskey = image_info.get("aeskey", "")
+            aeskey = image_info.get("aeskey", "") or self._default_aeskey
             tmp_dir = _get_tmp_dir()
             image_path = os.path.join(tmp_dir, f"wecom_{self.msg_id}.png")
 
@@ -147,7 +150,7 @@ class WecomBotMessage(ChatMessage):
                 elif item_type == "image":
                     img_info = item.get("image", {})
                     img_url = img_info.get("url", "")
-                    img_aeskey = img_info.get("aeskey", "")
+                    img_aeskey = img_info.get("aeskey", "") or self._default_aeskey
                     img_path = os.path.join(tmp_dir, f"wecom_{self.msg_id}_{idx}.png")
                     try:
                         img_data = _decrypt_media(img_url, img_aeskey)
@@ -166,7 +169,7 @@ class WecomBotMessage(ChatMessage):
             self.ctype = ContextType.FILE
             file_info = msg_body.get("file", {})
             file_url = file_info.get("url", "")
-            aeskey = file_info.get("aeskey", "")
+            aeskey = file_info.get("aeskey", "") or self._default_aeskey
             tmp_dir = _get_tmp_dir()
             base_path = os.path.join(tmp_dir, f"wecom_{self.msg_id}")
             self.content = base_path
@@ -188,7 +191,7 @@ class WecomBotMessage(ChatMessage):
             self.ctype = ContextType.FILE
             video_info = msg_body.get("video", {})
             video_url = video_info.get("url", "")
-            aeskey = video_info.get("aeskey", "")
+            aeskey = video_info.get("aeskey", "") or self._default_aeskey
             tmp_dir = _get_tmp_dir()
             self.content = os.path.join(tmp_dir, f"wecom_{self.msg_id}.mp4")
 

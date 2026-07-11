@@ -7,9 +7,13 @@ Supports multiple OpenAI-compatible embedding vendors:
   - dashscope  (Aliyun Tongyi text-embedding-v4)
   - doubao     (ByteDance Doubao Seed1.5 / large-text on Volcengine Ark)
   - zhipu      (ZhipuAI embedding-3)
+  - custom     (any OpenAI-compatible endpoint)
 
 Vendor keys here intentionally match the project's bot_type constants in
 common.const (OPENAI, LINKAI, QWEN_DASHSCOPE, DOUBAO, ZHIPU_AI).
+
+Custom providers (bot_type "custom" or "custom:<id>") reuse the same
+OpenAI-compatible REST client with user-supplied api_key / api_base.
 
 All providers share a single OpenAI-compatible REST client. Vendor-specific
 behaviors (truncation, query instruction prefix) are configured via metadata.
@@ -135,6 +139,22 @@ EMBEDDING_VENDORS = {
         "supports_dim_param": True,
         "needs_client_truncate": False,
         "needs_client_normalize": False,
+        "query_instruction": "",
+        "max_batch_size": 64,
+    },
+    # Custom provider — any OpenAI-compatible /embeddings endpoint. The
+    # user must supply api_key + api_base + model via the web console
+    # (stored in custom_providers list or legacy custom_api_key / custom_api_base).
+    # Dimensions defaults to 1024 but can be overridden via config's
+    # embedding_dimensions. No dim-param support assumption — safest
+    # default for unknown endpoints.
+    "custom": {
+        "default_base_url": "",
+        "default_model": "",
+        "default_dimensions": 1024,
+        "supports_dim_param": False,
+        "needs_client_truncate": False,
+        "needs_client_normalize": True,
         "query_instruction": "",
         "max_batch_size": 64,
     },
@@ -472,10 +492,19 @@ def create_embedding_provider(
         )
 
     final_dim = dimensions if (dimensions and dimensions > 0) else meta["default_dimensions"]
+    resolved_model = model or meta["default_model"]
+    resolved_base = api_base or meta["default_base_url"]
+    # Custom providers require explicit api_base and model — they cannot
+    # fall back to OpenAI defaults like built-in vendors do.
+    if provider == "custom":
+        if not resolved_base:
+            raise ValueError("Custom embedding provider requires an api_base URL")
+        if not resolved_model:
+            raise ValueError("Custom embedding provider requires a model name")
     return OpenAIEmbeddingProvider(
-        model=model or meta["default_model"],
+        model=resolved_model,
         api_key=api_key,
-        api_base=api_base or meta["default_base_url"],
+        api_base=resolved_base,
         extra_headers=extra_headers,
         dimensions=final_dim,
         supports_dim_param=meta["supports_dim_param"],

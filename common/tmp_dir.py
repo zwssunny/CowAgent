@@ -1,18 +1,21 @@
 import os
-import pathlib
 
+from common.utils import expand_path
 from config import conf
 
 
 class TmpDir(object):
-    """A temporary directory that is deleted when the object is destroyed."""
+    """Temporary directory for transient artifacts (e.g. synthesized voice).
 
-    tmpFilePath = pathlib.Path("./tmp/")
+    Resolves to ``<agent_workspace>/tmp`` (default ``~/cow/tmp``) so temp files
+    land inside the agent workspace instead of a CWD-relative ``./tmp``, which
+    is unreliable for the packaged desktop app where CWD is undefined.
+    """
 
     def __init__(self):
-        pathExists = os.path.exists(self.tmpFilePath)
-        if not pathExists:
-            os.makedirs(self.tmpFilePath)
+        ws_root = expand_path(conf().get("agent_workspace", "~/cow"))
+        self.tmpFilePath = os.path.join(ws_root, "tmp")
+        os.makedirs(self.tmpFilePath, exist_ok=True)
 
     def path(self):
         return str(self.tmpFilePath) + "/"

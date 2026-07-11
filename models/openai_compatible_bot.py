@@ -89,8 +89,9 @@ class OpenAICompatibleBot:
                     messages[0] = {"role": "system", "content": system_prompt}
             
             # Build request parameters
+            model_name = kwargs.get("model", api_config.get('model', 'gpt-5.4'))
             request_params = {
-                "model": kwargs.get("model", api_config.get('model', 'gpt-3.5-turbo')),
+                "model": model_name,
                 "messages": messages,
                 "temperature": kwargs.get("temperature", api_config.get('default_temperature', 0.9)),
                 "top_p": kwargs.get("top_p", api_config.get('default_top_p', 1.0)),
@@ -98,6 +99,10 @@ class OpenAICompatibleBot:
                 "presence_penalty": kwargs.get("presence_penalty", api_config.get('default_presence_penalty', 0.0)),
                 "stream": stream
             }
+            # GPT-5 / GPT-5.5 / o1 series only accept default temperature/top_p and reject penalty params
+            if model_name in ("gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.5", "o1", "o1-mini"):
+                for key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
+                    request_params.pop(key, None)
             
             # Add max_tokens if specified
             if kwargs.get("max_tokens"):
@@ -410,7 +415,7 @@ class OpenAICompatibleBot:
             }
             resp = requests.post(
                 f"{api_base}/chat/completions",
-                headers=headers, json=payload, timeout=60,
+                headers=headers, json=payload, timeout=180,
             )
             if resp.status_code != 200:
                 body = resp.text[:500]

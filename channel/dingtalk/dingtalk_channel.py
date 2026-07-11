@@ -86,6 +86,8 @@ def _check(func):
 
 @singleton
 class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
+    NOT_SUPPORT_REPLYTYPE = []
+
     dingtalk_client_id = conf().get('dingtalk_client_id')
     dingtalk_client_secret = conf().get('dingtalk_client_secret')
 
@@ -870,6 +872,48 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
                     self.reply_text("抱歉，文件上传失败", incoming_message)
             return
         
+        # Native sampleAudio. Upload only accepts ogg/amr, so convert TTS mp3/wav to amr.
+        elif reply.type == ReplyType.VOICE:
+            logger.info(f"[DingTalk] Sending voice: {reply.content}")
+            access_token = self.get_access_token()
+            if not access_token:
+                logger.error("[DingTalk] Cannot get access token for voice")
+                self.reply_text("抱歉，语音发送失败（无法获取token）", incoming_message)
+                return
+
+            voice_path = reply.content
+            if voice_path.startswith("file://"):
+                voice_path = voice_path[7:]
+
+            amr_path = voice_path
+            duration_ms = 0
+            if not voice_path.lower().endswith((".amr", ".ogg")):
+                try:
+                    from voice.audio_convert import any_to_amr
+                    amr_path = os.path.splitext(voice_path)[0] + ".amr"
+                    duration_ms = int(any_to_amr(voice_path, amr_path) or 0)
+                except Exception as e:
+                    logger.error(f"[DingTalk] Failed to convert voice to amr: {e}")
+                    self.reply_text("抱歉，语音转码失败", incoming_message)
+                    return
+
+            media_id = self.upload_media(amr_path, media_type="voice")
+            if not media_id:
+                logger.error("[DingTalk] Failed to upload voice media")
+                self.reply_text("抱歉，语音上传失败", incoming_message)
+                return
+
+            msg_param = {
+                "mediaId": media_id,
+                "duration": str(duration_ms or 1000),
+            }
+            success = self._send_file_message(
+                access_token, incoming_message, "sampleAudio", msg_param, isgroup
+            )
+            if not success:
+                self.reply_text("抱歉，语音发送失败", incoming_message)
+            return
+
         # 处理文本消息
         elif reply.type == ReplyType.TEXT:
             logger.info(f"[DingTalk] Sending text message, length={len(reply.content)}")

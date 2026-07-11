@@ -4,19 +4,41 @@
 - `$角色/$role <角色名>` - 让AI扮演该角色，角色名支持模糊匹配。
 - `$停止扮演` - 停止角色扮演。
 
-添加自定义角色请在`roles/roles.json`中添加。
+## 目录结构
+
+```
+plugins/role/
+├── README.md
+├── __init__.py
+├── role.py                  # 插件主逻辑
+├── roles.json               # 内置角色库（所有默认角色）
+├── schema/
+│   └── role_template.json   # 角色模板，新增角色时复制此文件
+└── roles/                   # 可选：放自定义角色文件，自动加载
+    └── 我的角色.json         # 同title会覆盖内置角色，不同则追加
+```
+
+## 添加自定义角色
+
+1. 新建roles目录
+2. 复制 下面模板 到 `roles/` 目录并重命名（如 `我的角色.json`）。
+3. 编辑文件内容，填写角色信息。
+4. 重启Bot即可生效，插件会自动扫描 `roles/` 目录下的所有 `.json` 文件。
+
+> **覆盖规则**：如果自定义角色的 `title` 与内置角色同名，则覆盖内置角色；否则作为新角色追加。无需修改任何映射文件。
 
 (大部分prompt来自https://github.com/rockbenben/ChatGPT-Shortcut/blob/main/src/data/users.tsx)
 
-以下为例子:
+以下为角色文件内容例子:
 ```json
-    {
-      "title": "写作助理",
-      "description": "As a writing improvement assistant, your task is to improve the spelling, grammar, clarity, concision, and overall readability of the text I provided, while breaking down long sentences, reducing repetition, and providing suggestions for improvement. Please provide only the corrected Chinese version of the text and avoid including explanations. Please treat every message I send later as text content.",
-      "descn": "作为一名中文写作改进助理，你的任务是改进所提供文本的拼写、语法、清晰、简洁和整体可读性，同时分解长句，减少重复，并提供改进建议。请只提供文本的更正版本，避免包括解释。请把我之后的每一条消息都当作文本内容。",
-      "wrapper": "内容是:\n\"%s\"",
-      "remark": "最常使用的角色，用于优化文本的语法、清晰度和简洁度，提高可读性。"
-    }
+{
+  "title": "写作助理",
+  "description": "As a writing improvement assistant...",
+  "descn": "作为一名中文写作改进助理...",
+  "wrapper": "内容是:\n\"%s\"",
+  "remark": "最常使用的角色，用于优化文本的语法、清晰度和简洁度，提高可读性。",
+  "tags": ["favorite", "write"]
+}
 ```
 
 - `title`: 角色名。
@@ -24,3 +46,16 @@
 - `descn`: 使用`$角色`触发时，使用中文prompt。
 - `wrapper`: 用于包装用户消息，可起到强调作用，避免回复离题。
 - `remark`: 简短描述该角色，在打印帮助文档时显示。
+- `tags`: 角色分类标签，可用`$角色类型 <标签>`查看。
+
+
+```json
+{
+  "title": "",
+  "description": "",
+  "descn": "",
+  "wrapper": "",
+  "remark": "",
+  "tags": []
+}
+```

@@ -394,7 +394,7 @@ class TestQianfanVisionTool(unittest.TestCase):
             "open_ai_api_key": "",
             "linkai_api_key": "",
             "use_linkai": False,
-            "tool": {},
+            "tools": {},
         }
         if values:
             data.update(values)
@@ -424,7 +424,7 @@ class TestQianfanVisionTool(unittest.TestCase):
     def test_vision_routes_ernie_model_override_to_qianfan(self):
         fake_conf = self._fake_conf({
             "qianfan_api_key": "test-qianfan-key",
-            "tool": {"vision": {"model": "ernie-4.5-turbo-vl-32k"}},
+            "tools": {"vision": {"model": "ernie-4.5-turbo-vl-32k"}},
         })
         fake_bot = MagicMock()
         fake_bot.call_vision = MagicMock()

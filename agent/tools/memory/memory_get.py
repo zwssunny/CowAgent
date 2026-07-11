@@ -4,6 +4,8 @@ Memory get tool
 Allows agents to read specific sections from memory files
 """
 
+import os
+
 from agent.tools.base_tool import BaseTool
 
 
@@ -87,8 +89,13 @@ class MemoryGetTool(BaseTool):
             
             file_path = (workspace_dir / path).resolve()
             workspace_resolved = workspace_dir.resolve()
-            
-            if not str(file_path).startswith(str(workspace_resolved) + '/') and file_path != workspace_resolved:
+
+            # Use os.path.realpath + os.sep for cross-platform path validation.
+            # str(Path).startswith(str + '/') fails on Windows where Path uses
+            # backslashes — see MemoryService._resolve_path for the same pattern.
+            real_file = os.path.realpath(str(file_path))
+            real_workspace = os.path.realpath(str(workspace_resolved))
+            if real_file != real_workspace and not real_file.startswith(real_workspace + os.sep):
                 return ToolResult.fail(f"Error: Access denied: path outside workspace")
             
             if not file_path.exists():

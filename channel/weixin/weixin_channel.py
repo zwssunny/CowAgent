@@ -24,7 +24,7 @@ from channel.weixin.weixin_message import WeixinMessage
 from common.expired_dict import ExpiredDict
 from common.log import logger
 from common.singleton import singleton
-from config import conf
+from config import conf, get_weixin_credentials_path
 
 MAX_CONSECUTIVE_FAILURES = 3
 BACKOFF_DELAY = 30
@@ -47,18 +47,23 @@ def _load_credentials(cred_path: str) -> dict:
 
 
 def _save_credentials(cred_path: str, data: dict):
-    """Save credentials to JSON file."""
+    """Atomically save credentials to JSON file (tmp + rename)."""
     os.makedirs(os.path.dirname(cred_path), exist_ok=True)
-    with open(cred_path, "w") as f:
+    tmp_path = f"{cred_path}.tmp"
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
     try:
-        os.chmod(cred_path, 0o600)
+        os.chmod(tmp_path, 0o600)
     except Exception:
         pass
+    os.replace(tmp_path, cred_path)
 
 
 @singleton
 class WeixinChannel(ChatChannel):
+
+    # ilink bot protocol has no outbound voice item; deliver TTS as a file.
+    NOT_SUPPORT_REPLYTYPE = []
 
     LOGIN_STATUS_IDLE = "idle"
     LOGIN_STATUS_WAITING = "waiting_scan"
@@ -70,7 +75,10 @@ class WeixinChannel(ChatChannel):
         self.api = None
         self._stop_event = threading.Event()
         self._poll_thread = None
-        self._context_tokens = {}  # user_id -> context_token
+        # user_id -> context_token. Guarded by _context_tokens_lock for any
+        # mutation that races with disk persistence.
+        self._context_tokens = {}
+        self._context_tokens_lock = threading.Lock()
         self._received_msgs = ExpiredDict(60 * 60 * 7.1)
         self._get_updates_buf = ""
         self._credentials_path = ""
@@ -88,15 +96,20 @@ class WeixinChannel(ChatChannel):
         cdn_base_url = conf().get("weixin_cdn_base_url", CDN_BASE_URL)
         token = conf().get("weixin_token", "")
 
-        self._credentials_path = os.path.expanduser(
-            conf().get("weixin_credentials_path", "~/.weixin_cow_credentials.json")
-        )
+        self._credentials_path = get_weixin_credentials_path()
 
+        # Always load credentials so we can restore context_tokens even when
+        # the bot token itself comes from config.
+        creds = _load_credentials(self._credentials_path)
         if not token:
-            creds = _load_credentials(self._credentials_path)
             token = creds.get("token", "")
             if creds.get("base_url"):
                 base_url = creds["base_url"]
+
+        # Restore persisted context_tokens so scheduler can deliver pushes
+        # immediately after restart, without waiting for the user to ping
+        # the bot first.
+        self._restore_context_tokens_from_creds(creds)
 
         if not token:
             token, base_url = self._login_with_retry(base_url)
@@ -137,11 +150,16 @@ class WeixinChannel(ChatChannel):
     def _relogin(self) -> bool:
         """Re-login after session expiry. Returns True on success."""
         base_url = self.api.base_url if self.api else DEFAULT_BASE_URL
-        if os.path.exists(self._credentials_path):
-            try:
-                os.remove(self._credentials_path)
-            except Exception:
-                pass
+        # Clearing the whole credentials file is intentional: the new login
+        # will issue a fresh `token` and persisted context_tokens belong to
+        # the previous bot identity, so they must not survive.
+        with self._context_tokens_lock:
+            self._context_tokens.clear()
+            if os.path.exists(self._credentials_path):
+                try:
+                    os.remove(self._credentials_path)
+                except Exception:
+                    pass
         self.login_status = self.LOGIN_STATUS_WAITING
         result = self._qr_login(base_url)
         if not result:
@@ -153,8 +171,61 @@ class WeixinChannel(ChatChannel):
             cdn_base_url=self.api.cdn_base_url if self.api else CDN_BASE_URL,
         )
         self.login_status = self.LOGIN_STATUS_OK
-        self._context_tokens.clear()
         return True
+
+    # ── Context token persistence ──────────────────────────────────────
+    # ilink requires every outbound send to echo the context_token from the
+    # user's latest inbound message. We mirror the in-memory map into the
+    # credentials JSON so scheduled pushes survive process restarts.
+    # All mutation + disk IO is serialized via _context_tokens_lock so that
+    # concurrent updates can never lose each other's writes.
+
+    def _restore_context_tokens_from_creds(self, creds: dict) -> None:
+        if not isinstance(creds, dict):
+            return
+        tokens = creds.get("context_tokens")
+        if not isinstance(tokens, dict):
+            return
+        restored = 0
+        with self._context_tokens_lock:
+            for user_id, token in tokens.items():
+                if isinstance(user_id, str) and isinstance(token, str) and token:
+                    self._context_tokens[user_id] = token
+                    restored += 1
+        if restored:
+            logger.info(f"[Weixin] Restored {restored} context_tokens from credentials")
+
+    def _persist_context_tokens_locked(self) -> None:
+        """Flush the token map to disk. Caller must hold _context_tokens_lock."""
+        if not self._credentials_path:
+            return
+        try:
+            creds = _load_credentials(self._credentials_path) or {}
+            creds["context_tokens"] = dict(self._context_tokens)
+            _save_credentials(self._credentials_path, creds)
+        except Exception as e:
+            logger.warning(f"[Weixin] Failed to persist context_tokens: {e}")
+
+    def _update_context_token(self, user_id: str, token: str) -> None:
+        """Update the in-memory token for a user; flush to disk only on change."""
+        if not user_id or not token:
+            return
+        with self._context_tokens_lock:
+            if self._context_tokens.get(user_id) == token:
+                return
+            self._context_tokens[user_id] = token
+            self._persist_context_tokens_locked()
+
+    def _invalidate_context_token(self, user_id: str) -> None:
+        """Drop the cached token for a user (used after -14 / send rejection)."""
+        if not user_id:
+            return
+        with self._context_tokens_lock:
+            if user_id not in self._context_tokens:
+                return
+            del self._context_tokens[user_id]
+            logger.info(f"[Weixin] Invalidated stale context_token for {user_id}")
+            self._persist_context_tokens_locked()
 
     # ── QR Login ───────────────────────────────────────────────────────
 
@@ -388,7 +459,7 @@ class WeixinChannel(ChatChannel):
         context_token = raw_msg.get("context_token", "")
 
         if context_token and from_user:
-            self._context_tokens[from_user] = context_token
+            self._update_context_token(from_user, context_token)
 
         cdn_base_url = self.api.cdn_base_url if self.api else CDN_BASE_URL
         try:
@@ -464,6 +535,14 @@ class WeixinChannel(ChatChannel):
             else:
                 context.type = ContextType.TEXT
             context.content = content.strip()
+            if "desire_rtype" not in context and conf().get("always_reply_voice"):
+                context["desire_rtype"] = ReplyType.VOICE
+
+        elif ctype == ContextType.VOICE:
+            if "desire_rtype" not in context and (
+                conf().get("voice_reply_voice") or conf().get("always_reply_voice")
+            ):
+                context["desire_rtype"] = ReplyType.VOICE
 
         return context
 
@@ -486,6 +565,9 @@ class WeixinChannel(ChatChannel):
             self._send_file(reply.content, receiver, context_token)
         elif reply.type in (ReplyType.VIDEO, ReplyType.VIDEO_URL):
             self._send_video(reply.content, receiver, context_token)
+        elif reply.type == ReplyType.VOICE:
+            # ilink has no outbound voice item; deliver TTS as a file attachment.
+            self._send_file(reply.content, receiver, context_token)
         else:
             logger.warning(f"[Weixin] Unsupported reply type: {reply.type}, fallback to text")
             self._send_text(str(reply.content), receiver, context_token)
@@ -496,10 +578,30 @@ class WeixinChannel(ChatChannel):
             return msg.context_token
         return self._context_tokens.get(receiver, "")
 
+    def _check_send_response(self, resp, receiver: str) -> None:
+        """Inspect a send-API response; drop stale context_token on -14.
+
+        ilink uses ret/errcode = -14 to signal that the session (and any
+        cached context_token) is no longer valid. The plugin keeps running
+        because the bot itself can re-login; we just need to forget the
+        per-user token so the next push won't retry forever.
+        """
+        if not isinstance(resp, dict):
+            return
+        ret = resp.get("ret")
+        errcode = resp.get("errcode")
+        if ret == -14 or errcode == -14:
+            logger.warning(
+                f"[Weixin] Send returned -14 (session expired) for "
+                f"receiver={receiver}; dropping cached context_token"
+            )
+            self._invalidate_context_token(receiver)
+
     def _send_text(self, text: str, receiver: str, context_token: str):
         if len(text) <= TEXT_CHUNK_LIMIT:
             try:
-                self.api.send_text(receiver, text, context_token)
+                resp = self.api.send_text(receiver, text, context_token)
+                self._check_send_response(resp, receiver)
                 logger.debug(f"[Weixin] Text sent to {receiver}, len={len(text)}")
             except Exception as e:
                 logger.error(f"[Weixin] Failed to send text: {e}")
@@ -508,7 +610,8 @@ class WeixinChannel(ChatChannel):
         chunks = self._split_text(text, TEXT_CHUNK_LIMIT)
         for i, chunk in enumerate(chunks):
             try:
-                self.api.send_text(receiver, chunk, context_token)
+                resp = self.api.send_text(receiver, chunk, context_token)
+                self._check_send_response(resp, receiver)
                 logger.debug(f"[Weixin] Text chunk {i+1}/{len(chunks)} sent to {receiver}, len={len(chunk)}")
             except Exception as e:
                 logger.error(f"[Weixin] Failed to send text chunk {i+1}/{len(chunks)}: {e}")
@@ -542,13 +645,14 @@ class WeixinChannel(ChatChannel):
             return
         try:
             result = upload_media_to_cdn(self.api, local_path, receiver, media_type=1)
-            self.api.send_image_item(
+            resp = self.api.send_image_item(
                 to=receiver,
                 context_token=context_token,
                 encrypt_query_param=result["encrypt_query_param"],
                 aes_key_b64=result["aes_key_b64"],
                 ciphertext_size=result["ciphertext_size"],
             )
+            self._check_send_response(resp, receiver)
             logger.info(f"[Weixin] Image sent to {receiver}")
         except Exception as e:
             logger.error(f"[Weixin] Image send failed: {e}")
@@ -561,7 +665,7 @@ class WeixinChannel(ChatChannel):
             return
         try:
             result = upload_media_to_cdn(self.api, local_path, receiver, media_type=3)
-            self.api.send_file_item(
+            resp = self.api.send_file_item(
                 to=receiver,
                 context_token=context_token,
                 encrypt_query_param=result["encrypt_query_param"],
@@ -569,6 +673,7 @@ class WeixinChannel(ChatChannel):
                 file_name=os.path.basename(local_path),
                 file_size=result["raw_size"],
             )
+            self._check_send_response(resp, receiver)
             logger.info(f"[Weixin] File sent to {receiver}")
         except Exception as e:
             logger.error(f"[Weixin] File send failed: {e}")
@@ -581,13 +686,14 @@ class WeixinChannel(ChatChannel):
             return
         try:
             result = upload_media_to_cdn(self.api, local_path, receiver, media_type=2)
-            self.api.send_video_item(
+            resp = self.api.send_video_item(
                 to=receiver,
                 context_token=context_token,
                 encrypt_query_param=result["encrypt_query_param"],
                 aes_key_b64=result["aes_key_b64"],
                 ciphertext_size=result["ciphertext_size"],
             )
+            self._check_send_response(resp, receiver)
             logger.info(f"[Weixin] Video sent to {receiver}")
         except Exception as e:
             logger.error(f"[Weixin] Video send failed: {e}")

@@ -20,6 +20,11 @@ from .diff import (
     FuzzyMatchResult
 )
 
+from .url_safety import (
+    validate_url_safe,
+    assert_public_ip
+)
+
 __all__ = [
     'truncate_head',
     'truncate_tail',
@@ -36,5 +41,7 @@ __all__ = [
     'normalize_for_fuzzy_match',
     'fuzzy_find_text',
     'generate_diff_string',
-    'FuzzyMatchResult'
+    'FuzzyMatchResult',
+    'validate_url_safe',
+    'assert_public_ip'
 ]

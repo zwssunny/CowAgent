@@ -752,6 +752,9 @@ class FeiShuChanel(ChatChannel):
         init_in_flight = [False]
         # 一旦初始化失败就长期标记为 disabled，本次回复不再尝试任何流式调用
         disabled = [False]
+        # True after agent_cancelled: agent_end stops rewriting the card
+        # with stale final_response and just finalizes current content.
+        cancelled = [False]
         lock = threading.Lock()
 
         # ---- 异步推送队列 ----------------------------------------------------
@@ -1076,18 +1079,42 @@ class FeiShuChanel(ChatChannel):
                     message_id[0] = None
                     sequence[0] = 0
 
+            elif event_type == "agent_cancelled":
+                # Lock channel into "no-rewrite" mode: the subsequent
+                # agent_end's final_response is from the last *completed*
+                # turn (the user already saw it), so rewriting the card
+                # would duplicate it visually.
+                with lock:
+                    cancelled[0] = True
+
             elif event_type == "agent_end":
                 # 最终回复：用 final_response 覆盖当前流式卡片，然后关闭流式模式。
                 final_response = data.get("final_response", "")
-                if not final_response:
-                    return
-                final_text = str(final_response)
                 # 标记 streamed 让 chat_channel 跳过 send()
                 context["feishu_streamed"] = True
 
                 with lock:
+                    was_cancelled = cancelled[0]
                     has_card = card_id[0] is not None
                     init_busy = init_in_flight[0]
+                    pending_text = current_text[0]
+
+                if was_cancelled:
+                    # Cancelled path: finalize the in-flight card with
+                    # partial output (or a short marker if empty); drop
+                    # stale final_response to avoid duplicating last turn.
+                    if has_card:
+                        _drain_push_queue()
+                        partial = (pending_text or "").rstrip()
+                        final_text = partial or "_(已中止)_"
+                        _stream_update_text(final_text)
+                        _close_streaming_mode(final_text)
+                    push_queue.put(None)
+                    return
+
+                if not final_response:
+                    return
+                final_text = str(final_response)
 
                 # 罕见情况：agent_end 触发时还没创建过卡片（极快返回 / 没有
                 # message_update），主动创建一张承载 final_text。
@@ -1515,10 +1542,16 @@ class FeiShuChanel(ChatChannel):
             else:
                 context.type = ContextType.TEXT
             context.content = content.strip()
+            # Text input opts into voice replies only when the always-on toggle is set.
+            if "desire_rtype" not in context and conf().get("always_reply_voice"):
+                context["desire_rtype"] = ReplyType.VOICE
 
         elif context.type == ContextType.VOICE:
-            # 2.语音请求
-            if "desire_rtype" not in context and conf().get("voice_reply_voice"):
+            # 2.语音请求: voice input replies with voice if either
+            # voice_reply_voice (mirror reply) or always_reply_voice is on.
+            if "desire_rtype" not in context and (
+                conf().get("voice_reply_voice") or conf().get("always_reply_voice")
+            ):
                 context["desire_rtype"] = ReplyType.VOICE
 
         return context

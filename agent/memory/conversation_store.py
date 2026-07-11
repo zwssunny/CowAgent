@@ -13,6 +13,7 @@ Storage path: ~/cow/sessions/conversations.db
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role         TEXT    NOT NULL,
     content      TEXT    NOT NULL,
     created_at   INTEGER NOT NULL,
+    extras       TEXT    NOT NULL DEFAULT '',
     UNIQUE (session_id, seq)
 );
 
@@ -65,6 +67,12 @@ ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT '';
 
 _MIGRATION_ADD_CONTEXT_START_SEQ = """
 ALTER TABLE sessions ADD COLUMN context_start_seq INTEGER NOT NULL DEFAULT 0;
+"""
+
+# Generic JSON sidecar for per-message attachments (TTS audio URL, future use).
+# Always optional — readers must tolerate missing column / empty / invalid JSON.
+_MIGRATION_ADD_MSG_EXTRAS = """
+ALTER TABLE messages ADD COLUMN extras TEXT NOT NULL DEFAULT '';
 """
 
 DEFAULT_MAX_AGE_DAYS: int = 30
@@ -100,6 +108,48 @@ def _extract_display_text(content: Any) -> str:
         ]
         return "\n".join(p for p in parts if p).strip()
     return ""
+
+
+# Internal markers written into the session for the agent's own bookkeeping
+# (scheduler injection / self-evolution undo). They must stay in the stored
+# content (the LLM reads them, e.g. to find a backup_id for undo) but should
+# never be shown verbatim to the user in the chat history UI.
+_SCHEDULED_DISPLAY_MARKERS = ("[SCHEDULED]", "Scheduled task")
+_EVOLUTION_DISPLAY_MARKER = "[EVOLUTION]"
+
+
+def _is_internal_user_marker(text: str) -> bool:
+    """True if a user-turn text is an internal injection marker (hide from UI)."""
+    t = (text or "").lstrip()
+    return any(t.startswith(m) for m in _SCHEDULED_DISPLAY_MARKERS)
+
+
+def _is_evolution_text(text: str) -> bool:
+    """True if assistant text is a self-evolution summary (before cleaning)."""
+    return (text or "").lstrip().startswith(_EVOLUTION_DISPLAY_MARKER)
+
+
+def _clean_display_text(text: str) -> str:
+    """Strip internal markers from assistant text for user-facing display.
+
+    Removes a leading ``[EVOLUTION]`` tag and a trailing ``(backup_id: ...)``
+    undo hint. The raw stored message is untouched, so undo + LLM context still
+    work; only the rendered chat bubble is cleaned.
+    """
+    if not text:
+        return text
+    cleaned = text
+    stripped = cleaned.lstrip()
+    if stripped.startswith(_EVOLUTION_DISPLAY_MARKER):
+        cleaned = stripped[len(_EVOLUTION_DISPLAY_MARKER):].lstrip()
+    # Drop a trailing backup_id undo hint line, e.g.
+    #   "(backup_id: 20260607-...; to undo, restore this backup)"
+    cleaned = re.sub(
+        r"\n*\(backup_id:[^\)]*\)\s*$",
+        "",
+        cleaned,
+    ).rstrip()
+    return cleaned
 
 
 def _extract_tool_calls(content: Any) -> List[Dict[str, Any]]:
@@ -169,20 +219,26 @@ def _group_into_display_turns(
     cur_rest: List[tuple] = []
     started = False
 
-    for role, raw_content, created_at in rows:
+    for role, raw_content, created_at, raw_extras in rows:
         try:
             content = json.loads(raw_content)
         except Exception:
             content = raw_content
+        try:
+            extras = json.loads(raw_extras) if raw_extras else {}
+            if not isinstance(extras, dict):
+                extras = {}
+        except Exception:
+            extras = {}
 
         if role == "user" and _is_visible_user_message(content):
             if started:
                 groups.append((cur_user, cur_rest))
-            cur_user = (content, created_at)
+            cur_user = (content, created_at, extras)
             cur_rest = []
             started = True
         else:
-            cur_rest.append((role, content, created_at))
+            cur_rest.append((role, content, created_at, extras))
 
     if started:
         groups.append((cur_user, cur_rest))
@@ -195,9 +251,12 @@ def _group_into_display_turns(
     for user_row, rest in groups:
         # User turn
         if user_row:
-            content, created_at = user_row
+            content, created_at, _u_extras = user_row
             text = _extract_display_text(content)
-            if text:
+            # Hide internal injection markers (scheduler / self-evolution) so the
+            # user never sees a synthetic "[SCHEDULED] self-evolution" bubble;
+            # the assistant reply that follows is still rendered.
+            if text and not _is_internal_user_marker(text):
                 turns.append({"role": "user", "content": text, "created_at": created_at})
 
         # Build an ordered list of steps preserving the original sequence:
@@ -206,8 +265,11 @@ def _group_into_display_turns(
         tool_results: Dict[str, str] = {}
         final_text = ""
         final_ts: Optional[int] = None
+        merged_extras: Dict[str, Any] = {}
 
-        for role, content, created_at in rest:
+        for role, content, created_at, extras in rest:
+            if role == "assistant" and isinstance(extras, dict):
+                merged_extras.update(extras)
             if role == "user":
                 tool_results.update(_extract_tool_results(content))
             elif role == "assistant":
@@ -249,6 +311,18 @@ def _group_into_display_turns(
                 step["result"] = tr.get("result", "")
                 step["is_error"] = tr.get("is_error", False)
 
+        # Detect a self-evolution bubble BEFORE cleaning the marker away, so the
+        # UI can flag it even though the visible text stays clean.
+        is_evolution = _is_evolution_text(final_text)
+
+        # Clean internal markers from the user-facing assistant text. Applies to
+        # both the final content and the mirrored content step so the rendered
+        # bubble shows clean text while the stored message keeps the markers.
+        final_text = _clean_display_text(final_text)
+        for step in steps:
+            if step.get("type") == "content":
+                step["content"] = _clean_display_text(step.get("content", ""))
+
         if steps or final_text:
             turn = {
                 "role": "assistant",
@@ -256,6 +330,10 @@ def _group_into_display_turns(
                 "steps": steps,
                 "created_at": final_ts or (user_row[1] if user_row else 0),
             }
+            if is_evolution:
+                turn["kind"] = "evolution"
+            if merged_extras:
+                turn["extras"] = merged_extras
             turns.append(turn)
 
     return turns
@@ -273,7 +351,7 @@ class ConversationStore:
 
     def __init__(self, db_path: Path):
         self._db_path = db_path
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # Use RLock to allow reentrant locking
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -411,13 +489,15 @@ class ConversationStore:
                         content = json.dumps(
                             msg.get("content", ""), ensure_ascii=False
                         )
+                        extras_obj = msg.get("extras") or {}
+                        extras = json.dumps(extras_obj, ensure_ascii=False) if extras_obj else ""
                         conn.execute(
                             """
                             INSERT OR IGNORE INTO messages
-                                (session_id, seq, role, content, created_at)
-                            VALUES (?, ?, ?, ?, ?)
+                                (session_id, seq, role, content, created_at, extras)
+                            VALUES (?, ?, ?, ?, ?, ?)
                             """,
-                            (session_id, next_seq, role, content, now),
+                            (session_id, next_seq, role, content, now, extras),
                         )
                         next_seq += 1
 
@@ -489,6 +569,65 @@ class ConversationStore:
             finally:
                 conn.close()
 
+    def get_latest_pair_seqs(self, session_id: str) -> Dict[str, Optional[int]]:
+        """Return the seq numbers of the latest visible user message and the
+        latest assistant message in a session.
+
+        A "visible" user message is one whose content is real user text
+        (not just a tool_result block), so tool-execution turns do not
+        shadow the actual user query.
+
+        Returns:
+            Dict with keys ``user_seq`` and ``bot_seq``; either may be None
+            when no matching message exists.
+        """
+        result: Dict[str, Optional[int]] = {"user_seq": None, "bot_seq": None}
+        with self._lock:
+            conn = self._connect()
+            try:
+                # Latest assistant message (cheap: single row by seq DESC).
+                row = conn.execute(
+                    "SELECT seq FROM messages "
+                    "WHERE session_id = ? AND role = 'assistant' "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if row:
+                    result["bot_seq"] = int(row[0])
+
+                # Latest visible user message: scan recent user rows and
+                # skip pure tool_result entries.
+                rows = conn.execute(
+                    "SELECT seq, content FROM messages "
+                    "WHERE session_id = ? AND role = 'user' "
+                    "ORDER BY seq DESC LIMIT 20",
+                    (session_id,),
+                ).fetchall()
+                for seq, content_raw in rows:
+                    try:
+                        content = json.loads(content_raw)
+                    except Exception:
+                        result["user_seq"] = int(seq)
+                        break
+                    if isinstance(content, list):
+                        has_text = any(
+                            isinstance(b, dict) and b.get("type") == "text"
+                            for b in content
+                        )
+                        has_tool_result = any(
+                            isinstance(b, dict) and b.get("type") == "tool_result"
+                            for b in content
+                        )
+                        if has_text and not has_tool_result:
+                            result["user_seq"] = int(seq)
+                            break
+                    else:
+                        result["user_seq"] = int(seq)
+                        break
+            finally:
+                conn.close()
+        return result
+
     def clear_session(self, session_id: str) -> None:
         """Delete all messages and the session record for a given session_id."""
         with self._lock:
@@ -501,6 +640,109 @@ class ConversationStore:
                     conn.execute(
                         "DELETE FROM sessions WHERE session_id = ?", (session_id,)
                     )
+            finally:
+                conn.close()
+
+    def delete_message_pair(self, session_id: str, user_seq: int, delete_user: bool = True, cascade: bool = False) -> int:
+        """Delete a user message and/or its corresponding assistant reply.
+
+        The assistant reply is identified as all messages between user_seq
+        and the next visible user message (or end of session).
+
+        Args:
+            session_id: Session identifier.
+            user_seq: The seq number of the user message.
+            delete_user: If True (default), delete the user message too.
+                        If False, only delete assistant reply (for regenerate scenarios).
+            cascade: If True, also delete all subsequent turns after this one.
+                    Used by edit-message which removes this turn and everything after.
+
+        Returns:
+            Number of message rows deleted.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    # Verify this is a user message
+                    row = conn.execute(
+                        "SELECT role FROM messages WHERE session_id = ? AND seq = ?",
+                        (session_id, user_seq),
+                    ).fetchone()
+                    if not row or row[0] != "user":
+                        return 0
+
+                    if cascade:
+                        # Delete from this message to end of session
+                        start_seq = user_seq if delete_user else user_seq + 1
+                        end_seq_row = conn.execute(
+                            "SELECT MAX(seq) FROM messages WHERE session_id = ?",
+                            (session_id,),
+                        ).fetchone()
+                        end_seq = (end_seq_row[0] or user_seq) + 1
+                    else:
+                        # Find the next visible user message seq (exclude tool_result)
+                        # Use batched query to avoid loading too many rows at once
+                        next_user_seq = None
+                        batch_size = 100
+                        offset = 0
+                        while True:
+                            batch = conn.execute(
+                                """
+                                SELECT seq, content FROM messages
+                                WHERE session_id = ? AND seq > ? AND role = 'user'
+                                ORDER BY seq ASC
+                                LIMIT ? OFFSET ?
+                                """,
+                                (session_id, user_seq, batch_size, offset),
+                            ).fetchall()
+                            if not batch:
+                                break
+                            for seq, content in batch:
+                                try:
+                                    content_obj = json.loads(content)
+                                except Exception:
+                                    content_obj = content
+                                if _is_visible_user_message(content_obj):
+                                    next_user_seq = seq
+                                    break
+                            if next_user_seq is not None:
+                                break
+                            offset += batch_size
+
+                        # Determine the end boundary for deletion
+                        if next_user_seq is not None:
+                            end_seq = next_user_seq
+                        else:
+                            end_seq_row = conn.execute(
+                                "SELECT MAX(seq) FROM messages WHERE session_id = ?",
+                                (session_id,),
+                            ).fetchone()
+                            end_seq = (end_seq_row[0] or user_seq) + 1
+
+                        # Determine the start boundary for deletion
+                        start_seq = user_seq if delete_user else user_seq + 1
+
+                    # Delete messages from start_seq to end_seq (exclusive)
+                    cur = conn.execute(
+                        "DELETE FROM messages WHERE session_id = ? AND seq >= ? AND seq < ?",
+                        (session_id, start_seq, end_seq),
+                    )
+                    deleted = cur.rowcount
+
+                    # Update session msg_count
+                    conn.execute(
+                        """
+                        UPDATE sessions
+                        SET msg_count = (
+                            SELECT COUNT(*) FROM messages WHERE session_id = ?
+                        )
+                        WHERE session_id = ?
+                        """,
+                        (session_id, session_id),
+                    )
+
+                    return deleted
             finally:
                 conn.close()
 
@@ -651,6 +893,55 @@ class ConversationStore:
             logger.info(f"[ConversationStore] Pruned {deleted} expired sessions")
         return deleted
 
+    def attach_extras_to_last_assistant(
+        self,
+        session_id: str,
+        extras: Dict[str, Any],
+    ) -> Optional[int]:
+        """
+        Merge ``extras`` into the latest assistant message of a session.
+
+        Used by post-processing (e.g. TTS) that needs to annotate an already
+        persisted bot reply with attachments such as audio URLs.
+
+        Returns the message seq that was updated, or ``None`` if no assistant
+        message exists or the update could not be applied.
+        """
+        if not extras:
+            return None
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    """
+                    SELECT seq, extras FROM messages
+                    WHERE session_id = ? AND role = 'assistant'
+                    ORDER BY seq DESC LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if not row:
+                    return None
+                seq, raw = row
+                try:
+                    cur = json.loads(raw) if raw else {}
+                    if not isinstance(cur, dict):
+                        cur = {}
+                except Exception:
+                    cur = {}
+                cur.update(extras)
+                conn.execute(
+                    "UPDATE messages SET extras = ? WHERE session_id = ? AND seq = ?",
+                    (json.dumps(cur, ensure_ascii=False), session_id, seq),
+                )
+                conn.commit()
+                return seq
+            except Exception as e:
+                logger.warning(f"[ConversationStore] attach_extras failed: {e}")
+                return None
+            finally:
+                conn.close()
+
     def load_history_page(
         self,
         session_id: str,
@@ -698,15 +989,31 @@ class ConversationStore:
                 ).fetchone()
                 ctx_start = ctx_row[0] if ctx_row else 0
 
-                rows = conn.execute(
-                    """
-                    SELECT seq, role, content, created_at
-                    FROM messages
-                    WHERE session_id = ?
-                    ORDER BY seq ASC
-                    """,
-                    (session_id,),
-                ).fetchall()
+                # extras column is added by migration; tolerate older DBs that
+                # might miss it by falling back to a NULL literal.
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT seq, role, content, created_at, extras
+                        FROM messages
+                        WHERE session_id = ?
+                        ORDER BY seq ASC
+                        """,
+                        (session_id,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    rows = [
+                        (seq, role, content, created_at, "")
+                        for (seq, role, content, created_at) in conn.execute(
+                            """
+                            SELECT seq, role, content, created_at
+                            FROM messages
+                            WHERE session_id = ?
+                            ORDER BY seq ASC
+                            """,
+                            (session_id,),
+                        ).fetchall()
+                    ]
             finally:
                 conn.close()
 
@@ -719,13 +1026,16 @@ class ConversationStore:
             include_thinking = False
 
         # Strip seq for display grouping, but record max seq per visible user group
-        plain_rows = [(role, content, created_at) for _seq, role, content, created_at in rows]
+        plain_rows = [
+            (role, content, created_at, extras_raw)
+            for _seq, role, content, created_at, extras_raw in rows
+        ]
         visible = _group_into_display_turns(plain_rows, include_thinking=include_thinking)
 
         # Build a mapping: find the seq of each visible user message to annotate context boundary.
         # Walk through rows to find visible user message seqs in order.
         visible_user_seqs: List[int] = []
-        for seq, role, raw_content, _ts in rows:
+        for seq, role, raw_content, _ts, _extras in rows:
             if role != "user":
                 continue
             try:
@@ -911,6 +1221,18 @@ class ConversationStore:
             except Exception as e:
                 logger.warning(f"[ConversationStore] Migration (context_start_seq) failed: {e}")
 
+        msg_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "extras" not in msg_cols:
+            try:
+                conn.execute(_MIGRATION_ADD_MSG_EXTRAS)
+                conn.commit()
+                logger.info("[ConversationStore] Migrated: added messages.extras column")
+            except Exception as e:
+                logger.warning(f"[ConversationStore] Migration (extras) failed: {e}")
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path), timeout=10)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -953,3 +1275,4 @@ def get_conversation_store() -> ConversationStore:
         _store_instance = ConversationStore(db_path)
         logger.debug(f"[ConversationStore] Using shared DB at: {db_path}")
         return _store_instance
+

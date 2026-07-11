@@ -52,6 +52,11 @@ class Agent:
         self.workspace_dir = workspace_dir  # Workspace directory
         self.enable_skills = enable_skills  # Skills enabled flag
         self.runtime_info = runtime_info  # Runtime info for dynamic time update
+        # Optional extra instructions appended AFTER the rebuilt full system
+        # prompt. Used by the self-evolution review agent to add its task brief
+        # on top of the full context (tools, workspace, user preferences, time)
+        # so it both follows the user's preferences and knows its evolution job.
+        self.extra_system_suffix = None
         
         # Initialize skill manager
         self.skill_manager = None
@@ -114,16 +119,26 @@ class Agent:
 
             context_files = load_context_files(self.workspace_dir) if self.workspace_dir else None
 
-            builder = PromptBuilder(workspace_dir=self.workspace_dir or "", language="zh")
-            return builder.build(
+            try:
+                from common import i18n
+                lang = i18n.get_language()
+            except Exception:
+                lang = "zh"
+            builder = PromptBuilder(workspace_dir=self.workspace_dir or "", language=lang)
+            full = builder.build(
                 tools=self.tools,
                 context_files=context_files,
                 skill_manager=self.skill_manager,
                 memory_manager=self.memory_manager,
                 runtime_info=self.runtime_info,
             )
+            if self.extra_system_suffix:
+                full = f"{full}\n\n{self.extra_system_suffix}"
+            return full
         except Exception as e:
             logger.warning(f"Failed to rebuild system prompt, using cached version: {e}")
+            if self.extra_system_suffix:
+                return f"{self.system_prompt}\n\n{self.extra_system_suffix}"
             return self.system_prompt
 
     def refresh_skills(self):
@@ -365,7 +380,8 @@ class Agent:
 
         return action
 
-    def run_stream(self, user_message: str, on_event=None, clear_history: bool = False, skill_filter=None) -> str:
+    def run_stream(self, user_message: str, on_event=None, clear_history: bool = False,
+                   skill_filter=None, cancel_event=None) -> str:
         """
         Execute single agent task with streaming (based on tool-call)
 
@@ -374,6 +390,7 @@ class Agent:
         - Multi-turn reasoning based on tool-call
         - Event callbacks
         - Persistent conversation history across calls
+        - User-initiated cancellation via ``cancel_event``
 
         Args:
             user_message: User message
@@ -381,6 +398,11 @@ class Agent:
                      event = {"type": str, "timestamp": float, "data": dict}
             clear_history: If True, clear conversation history before this call (default: False)
             skill_filter: Optional list of skill names to include in this run
+            cancel_event: Optional threading.Event polled at agent checkpoints.
+                When set, the loop exits at the next safe point, injects a
+                "[Interrupted by user]" assistant note, and returns the
+                partial response. ``messages`` stays in a valid state
+                (tool_use/tool_result pairs preserved).
 
         Returns:
             Final response text
@@ -424,7 +446,8 @@ class Agent:
             max_turns=self.max_steps,
             on_event=on_event,
             messages=messages_copy,  # Pass copied message history
-            max_context_turns=max_context_turns
+            max_context_turns=max_context_turns,
+            cancel_event=cancel_event,
         )
 
         # Execute

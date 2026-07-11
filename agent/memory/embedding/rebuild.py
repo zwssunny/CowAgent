@@ -163,10 +163,9 @@ def main() -> int:
     logger.info(f"[RebuildIndex] Workspace: {workspace_root}")
     logger.info(f"[RebuildIndex] Index db:  {memory_config.get_db_path()}")
 
-    from bridge.agent_initializer import AgentInitializer
+    from agent.memory.embedding import create_default_embedding_provider
 
-    initializer = AgentInitializer(bridge=None, agent_bridge=None)
-    embedding_provider = initializer._init_embedding_provider(memory_config, session_id=None)
+    embedding_provider = create_default_embedding_provider()
     if embedding_provider is None:
         logger.error(
             "[RebuildIndex] No embedding provider could be initialized. "

@@ -37,13 +37,16 @@ class Banwords(Plugin):
 
             self.searchr = WordsSearch()
             self.action = conf["action"]
+            # banwords.txt is gitignored / not shipped by default; treat a
+            # missing file as an empty ban list instead of failing to init.
             banwords_path = os.path.join(curdir, "banwords.txt")
-            with open(banwords_path, "r", encoding="utf-8") as f:
-                words = []
-                for line in f:
-                    word = line.strip()
-                    if word:
-                        words.append(word)
+            words = []
+            if os.path.exists(banwords_path):
+                with open(banwords_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        word = line.strip()
+                        if word:
+                            words.append(word)
             self.searchr.SetKeywords(words)
             self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
             if conf.get("reply_filter", True):

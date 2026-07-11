@@ -34,7 +34,9 @@ MCP コミュニティ標準に完全準拠しており、Claude Desktop / Curso
 | `command` | stdio | サーバーを起動する実行コマンド（`npx`、`python`、`uvx` など） |
 | `args` | 任意 | `command` に渡す引数 |
 | `env` | 任意 | サブプロセスの環境変数。API Key などに利用 |
-| `url` | SSE | SSE エンドポイントの URL（`command` と二者択一） |
+| `url` | SSE / Streamable HTTP | リモートエンドポイントの URL（`command` と二者択一） |
+| `type` | リモート | リモートトランスポート種別：`sse` または `streamable-http`（既定は `sse`） |
+| `headers` | 任意 | リモートリクエストの追加 HTTP ヘッダ（`Authorization` など）。Streamable HTTP のみ |
 | `disabled` | 任意 | `true` のとき該当サーバーをスキップ。一時的に無効化したいときに便利 |
 
 ### 完全な例
@@ -88,7 +90,8 @@ Agent は次のように動作します：
 | トランスポート | 説明 | 設定フィールド |
 | --- | --- | --- |
 | **stdio** | サブプロセス通信。最も一般的で、コミュニティのエコシステムが最も豊富 | `command` + `args` |
-| **SSE** | HTTP Server-Sent Events。リモートホスト型の MCP サービス向け | `url` |
+| **SSE** | HTTP Server-Sent Events。従来のリモート用トランスポート | `url`（既定） |
+| **Streamable HTTP** | 新しい単一エンドポイント方式。SSE を段階的に置き換え | `type: "streamable-http"` + `url` |
 
 ## トラブルシューティング
 
@@ -106,4 +109,4 @@ Agent は次のように動作します：
 - [mcp.so](https://mcp.so) — グローバル MCP サービスインデックス
 - [ModelScope MCP 広場](https://modelscope.cn/mcp) — 魔搭コミュニティの MCP 広場、中国本土からのアクセスが安定
 
-MCP 標準プロトコル（stdio / SSE）に準拠していれば、コードを一切変更せずに CowAgent に統合できます。
+MCP 標準プロトコル（stdio / SSE / Streamable HTTP）に準拠していれば、コードを一切変更せずに CowAgent に統合できます。

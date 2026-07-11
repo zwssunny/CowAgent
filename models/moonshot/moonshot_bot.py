@@ -47,9 +47,20 @@ class MoonshotBot(Bot):
         return model == "kimi-for-coding" or "api.kimi.com/coding" in base
 
     @staticmethod
-    def _model_supports_thinking(model_name: str) -> bool:
-        """Return True if the model supports the ``thinking`` request parameter."""
+    def _is_builtin_reasoning_model(model_name: str) -> bool:
+        """Return True for Kimi code models with built-in reasoning.
+
+        These models only accept thinking type=enabled and reject disabled,
+        so the thinking param must be omitted entirely.
+        """
+        return model_name.lower().startswith("kimi-k2.7-code")
+
+    @classmethod
+    def _model_supports_thinking(cls, model_name: str) -> bool:
+        """Return True if the model accepts the ``thinking`` request parameter."""
         m = model_name.lower()
+        if cls._is_builtin_reasoning_model(m):
+            return False
         return m.startswith("kimi-k2") or m.startswith("kimi-k1.5")
 
     def _build_headers(self) -> dict:
@@ -195,7 +206,7 @@ class MoonshotBot(Bot):
             }
             headers = self._build_headers()
             resp = requests.post(f"{self.base_url}/chat/completions",
-                                 headers=headers, json=payload, timeout=60)
+                                 headers=headers, json=payload, timeout=180)
             if resp.status_code != 200:
                 return {"error": True, "message": f"HTTP {resp.status_code}: {resp.text[:300]}"}
             data = resp.json()

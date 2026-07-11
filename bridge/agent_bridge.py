@@ -5,7 +5,7 @@ Agent Bridge - Integrates Agent system with existing COW bridge
 import os
 from typing import Optional, List
 
-from agent.protocol import Agent, LLMModel, LLMRequest
+from agent.protocol import Agent, LLMModel, LLMRequest, get_cancel_registry
 from bridge.agent_event_handler import AgentEventHandler
 from bridge.agent_initializer import AgentInitializer
 from bridge.bridge import Bridge
@@ -78,6 +78,7 @@ class AgentLLMModel(LLMModel):
         ("moonshot", const.MOONSHOT), ("kimi", const.MOONSHOT),
         ("doubao", const.DOUBAO), ("deepseek", const.DEEPSEEK),
         ("ernie", const.QIANFAN),
+        ("mimo-", const.MIMO),
     ]
 
     def __init__(self, bridge: Bridge, bot_type: str = "chat"):
@@ -285,6 +286,23 @@ class AgentBridge:
         
         # Create helper instances
         self.initializer = AgentInitializer(bridge, self)
+
+        # Eager-start the scheduler so cron tasks fire without waiting
+        # for the first user message. init_scheduler is idempotent.
+        try:
+            from agent.tools.scheduler.integration import init_scheduler
+            if init_scheduler(self):
+                self.scheduler_initialized = True
+        except Exception as e:
+            logger.warning(f"[AgentBridge] Eager scheduler init failed: {e}")
+
+        # Start the self-evolution idle trigger (idempotent, daemon thread).
+        try:
+            from agent.evolution.trigger import start_evolution_trigger
+            start_evolution_trigger(self)
+        except Exception as e:
+            logger.warning(f"[AgentBridge] Evolution trigger init failed: {e}")
+
     def create_agent(self, system_prompt: str, tools: List = None, **kwargs) -> Agent:
         """
         Create the super agent with COW integration
@@ -373,7 +391,49 @@ class AgentBridge:
         """Initialize agent for a specific session"""
         agent = self.initializer.initialize_agent(session_id=session_id)
         self.agents[session_id] = agent
-    
+
+    def sync_session_messages_from_store(self, session_id: str) -> int:
+        """Reload an agent's in-memory ``messages`` list from the persistent
+        conversation store.
+
+        Used after an external mutation (e.g. user edits / deletes a message
+        via the web console) so the agent's next turn sees the same history
+        as the database. The operation is a no-op when the agent has not been
+        instantiated yet for the session.
+
+        Returns:
+            Number of messages now held in the agent's memory. Returns -1 if
+            the agent does not exist or has no compatible ``messages`` attr.
+        """
+        if not session_id or session_id not in self.agents:
+            return -1
+        agent = self.agents[session_id]
+        if not (hasattr(agent, "messages") and hasattr(agent, "messages_lock")):
+            return -1
+        try:
+            from agent.memory import get_conversation_store
+            store = get_conversation_store()
+            # No turn cap here: we want a faithful mirror of what the store
+            # has for this session after deletion.
+            remaining = store.load_messages(session_id, max_turns=10**6)
+        except Exception as e:
+            logger.warning(
+                f"[AgentBridge] Failed to load messages for sync (session={session_id}): {e}"
+            )
+            return -1
+        with agent.messages_lock:
+            agent.messages.clear()
+            for msg in remaining:
+                agent.messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"],
+                })
+            count = len(agent.messages)
+        logger.info(
+            f"[AgentBridge] Synced agent memory for session={session_id}, messages={count}"
+        )
+        return count
+
     def agent_reply(self, query: str, context: Context = None, 
                    on_event=None, clear_history: bool = False) -> Reply:
         """
@@ -390,11 +450,22 @@ class AgentBridge:
         """
         session_id = None
         agent = None
+        request_id = None
+        cancel_event = None
         try:
             # Extract session_id from context for user isolation
             if context:
                 session_id = context.kwargs.get("session_id") or context.get("session_id")
-            
+                request_id = context.kwargs.get("request_id") or context.get("request_id")
+
+            # Register a cancel token. Prefer per-turn request_id (web),
+            # fall back to session_id (IM channels). The Event is polled by
+            # AgentStreamExecutor at safe checkpoints.
+            registry = get_cancel_registry()
+            token_key = request_id or session_id
+            if token_key:
+                cancel_event = registry.register(token_key, session_id=session_id)
+
             # Get agent for this session (will auto-initialize if needed)
             agent = self.get_agent(session_id=session_id)
             if not agent:
@@ -444,14 +515,40 @@ class AgentBridge:
                 )
                 self._trim_in_memory_to_turns(agent, scheduler_keep_turns)
 
+            # Eagerly persist the user message BEFORE running the agent so the
+            # session and the user's bubble are immediately visible — even if
+            # the user switches away or refreshes before the reply finishes.
+            # The reply (assistant/tool messages) is appended once the run
+            # completes; the final persist skips this already-stored user turn.
+            pre_persisted = self._pre_persist_user_message(
+                session_id, query, context, clear_history
+            )
+
+            # Mark this session as mid-run so the self-evolution idle scan does
+            # not fire concurrently when a single turn runs longer than
+            # idle_minutes.
+            try:
+                from agent.evolution.trigger import mark_run_active
+                mark_run_active(agent, True)
+            except Exception:
+                pass
+
             try:
                 # Use agent's run_stream method with event handler
                 response = agent.run_stream(
                     user_message=query,
                     on_event=event_handler.handle_event,
-                    clear_history=clear_history
+                    clear_history=clear_history,
+                    cancel_event=cancel_event,
                 )
             finally:
+                # Clear the mid-run flag so idle scans can review this session.
+                try:
+                    from agent.evolution.trigger import mark_run_active
+                    mark_run_active(agent, False)
+                except Exception:
+                    pass
+
                 # Restore original tools
                 if context and context.get("is_scheduled_task"):
                     agent.tools = original_tools
@@ -459,10 +556,21 @@ class AgentBridge:
                 # Log execution summary
                 event_handler.log_summary()
 
+                # Release cancel token; keep registry bounded.
+                if token_key:
+                    try:
+                        registry.unregister(token_key)
+                    except Exception:
+                        pass
+
             # Persist new messages generated during this run
             if session_id:
                 channel_type = (context.get("channel_type") or "") if context else ""
-                new_messages = getattr(agent, '_last_run_new_messages', [])
+                new_messages = list(getattr(agent, '_last_run_new_messages', []))
+                # The leading user turn was already persisted eagerly above;
+                # drop it here so it isn't stored twice.
+                if pre_persisted and new_messages and new_messages[0].get("role") == "user":
+                    new_messages = new_messages[1:]
                 if new_messages:
                     self._persist_messages(session_id, list(new_messages), channel_type)
                 else:
@@ -476,6 +584,23 @@ class AgentBridge:
                         except Exception as e:
                             logger.warning(f"[AgentBridge] Failed to clear DB after recovery: {e}")
             
+            # Record this user turn for the self-evolution idle trigger. Skip
+            # scheduler-injected / scheduled-task sessions so internal runs do
+            # not count as user activity.
+            if session_id and not session_id.startswith("scheduler_") and not (
+                context and context.get("is_scheduled_task")
+            ):
+                try:
+                    from agent.evolution.trigger import note_user_turn
+                    ch = (context.get("channel_type") or "") if context else ""
+                    rcv = (context.get("receiver") or "") if context else ""
+                    is_group = bool(context.get("isgroup")) if context else False
+                    # Only enable proactive push for single chats (group push is
+                    # noisy); group sessions still evolve, just without notify.
+                    note_user_turn(agent, channel_type=ch, receiver=(rcv if not is_group else ""))
+                except Exception:
+                    pass
+
             # Post-message hot-reload: detect edits to ~/cow/mcp.json and
             # sync any new/removed MCP tools into the live agent in the
             # background. Off the critical path so user latency is unaffected;
@@ -512,6 +637,12 @@ class AgentBridge:
                         logger.info(f"[AgentBridge] Cleared DB for session after error: {session_id}")
                 except Exception as db_err:
                     logger.warning(f"[AgentBridge] Failed to clear DB after error: {db_err}")
+            # Release cancel token on error path too (idempotent).
+            if cancel_event is not None and (request_id or session_id):
+                try:
+                    get_cancel_registry().unregister(request_id or session_id)
+                except Exception:
+                    pass
             return Reply(ReplyType.ERROR, f"Agent error: {str(e)}")
     
     def _schedule_mcp_hot_reload(self, agent):
@@ -553,11 +684,21 @@ class AgentBridge:
         """
         file_type = file_info.get("file_type", "file")
         file_path = file_info.get("path")
-        
+        # Remote URLs are passed through as-is; local paths get a file:// prefix
+        # so the channel can read them from disk.
+        remote_url = file_info.get("url", "")
+        is_remote = bool(remote_url) and remote_url.lower().startswith(("http://", "https://"))
+
+        def _to_channel_url(p: str) -> str:
+            if is_remote:
+                return remote_url
+            if p and p.lower().startswith(("http://", "https://")):
+                return p
+            return f"file://{p}"
+
         # For images, use IMAGE_URL type (channel will handle upload)
         if file_type == "image":
-            # Convert local path to file:// URL for channel processing
-            file_url = f"file://{file_path}"
+            file_url = _to_channel_url(file_path)
             logger.info(f"[AgentBridge] Sending image: {file_url}")
             reply = Reply(ReplyType.IMAGE_URL, file_url)
             # Attach text message if present (for channels that support text+image)
@@ -567,7 +708,7 @@ class AgentBridge:
         
         # For all file types (document, video, audio), use FILE type
         if file_type in ["document", "video", "audio"]:
-            file_url = f"file://{file_path}"
+            file_url = _to_channel_url(file_path)
             logger.info(f"[AgentBridge] Sending {file_type}: {file_url}")
             reply = Reply(ReplyType.FILE, file_url)
             reply.file_name = file_info.get("file_name", os.path.basename(file_path))
@@ -577,7 +718,7 @@ class AgentBridge:
             return reply
         
         # For all other file types (tar.gz, zip, etc.), also use FILE type
-        file_url = f"file://{file_path}"
+        file_url = _to_channel_url(file_path)
         logger.info(f"[AgentBridge] Sending generic file: {file_url}")
         reply = Reply(ReplyType.FILE, file_url)
         reply.file_name = file_info.get("file_name", os.path.basename(file_path))
@@ -655,6 +796,48 @@ class AgentBridge:
             except Exception as e:
                 logger.warning(f"[AgentBridge] Failed to sync API keys: {e}")
     
+    def _pre_persist_user_message(
+        self, session_id: str, query: str, context: Context, clear_history: bool
+    ) -> bool:
+        """Persist the user's message before the agent runs.
+
+        This makes a brand-new session (and the user's bubble) visible even if
+        the reply hasn't finished — switching away or refreshing no longer
+        loses the in-flight session. Returns True when the user turn was
+        stored, so the caller can skip it in the post-run persist.
+
+        Best-effort: any failure is swallowed and reported as not-persisted.
+        """
+        if not session_id or not query:
+            return False
+        # Only real user turns: skip scheduler-injected / scheduled-task runs.
+        if session_id.startswith("scheduler_") or (
+            context and context.get("is_scheduled_task")
+        ):
+            return False
+        try:
+            from config import conf
+            if not conf().get("conversation_persistence", True):
+                return False
+            from agent.memory import get_conversation_store
+            store = get_conversation_store()
+            # clear_history starts a fresh transcript: wipe the store first so
+            # the eager user turn becomes seq 0, matching in-memory state.
+            if clear_history:
+                store.clear_session(session_id)
+            channel_type = (context.get("channel_type") or "") if context else ""
+            user_msg = {
+                "role": "user",
+                "content": [{"type": "text", "text": query}],
+            }
+            store.append_messages(session_id, [user_msg], channel_type=channel_type)
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[AgentBridge] Failed to pre-persist user message for session={session_id}: {e}"
+            )
+            return False
+
     def _persist_messages(
         self, session_id: str, new_messages: list, channel_type: str = ""
     ) -> None:

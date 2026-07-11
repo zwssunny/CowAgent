@@ -9,13 +9,14 @@ CowAgent 2.0 は、シンプルなチャットボットから、自律的な思�
 
 CowAgent のアーキテクチャは以下のコアモジュールで構成されています：
 
-<img src="https://cdn.link-ai.tech/doc/cow-agent-arch-en.jpg.jpg" alt="CowAgent Architecture" />
+<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/architecture/en/architecture.png" alt="CowAgent Architecture" />
 
 | モジュール | 説明 |
 | --- | --- |
 | **Plan** | ユーザーの意図を理解し、複雑なタスクをマルチステップの計画に分解、目標達成までツールを反復的に呼び出す |
 | **Memory** | 重要な情報をコアメモリとデイリーメモリとして自動永続化し、キーワードとベクトルのハイブリッド検索でセッション間の連続性を実現 |
 | **Knowledge** | トピック別に構造化された知識を整理。Agent が価値ある情報を Markdown ページとして自律的に整理し、インデックスと相互参照で成長するナレッジネットワークを構築 |
+| **Evolution** | 会話がアイドルになった後、隔離環境で自動レビューを実行。Skill を改善し、未完了のタスクを引き継ぎ、記憶と知識を補完して、日々の利用を通じて Agent を成長させる |
 | **Tools** | Agent が OS リソースにアクセスするための中核能力。ファイル読み書き、ターミナル、ブラウザ、スケジューラ、記憶検索、Web 検索など 10 以上の組み込みツール |
 | **Skills** | Skill の読み込み・管理。Skill Hub や GitHub からのワンクリックインストール、または会話を通じたカスタム Skill の作成をサポート |
 | **Models** | モデル層。OpenAI、Claude、Gemini、DeepSeek、MiniMax、GLM、Qwen など主要 LLM への統一アクセスを提供 |
@@ -69,7 +70,8 @@ Agent のワークスペースはデフォルトで `~/cow` にあり、シス�
   "agent_workspace": "~/cow",
   "agent_max_context_tokens": 40000,
   "agent_max_context_turns": 30,
-  "agent_max_steps": 15
+  "agent_max_steps": 15,
+  "cow_lang": "auto"
 }
 ```
 
@@ -81,3 +83,5 @@ Agent のワークスペースはデフォルトで `~/cow` にあり、シス�
 | `agent_max_context_turns` | 最大コンテキストターン数 | `30` |
 | `agent_max_steps` | タスクあたりの最大判断ステップ数 | `15` |
 | `knowledge` | パーソナルナレッジベースの有効化 | `true` |
+| `self_evolution_enabled` | 自己進化の有効化（新規インストールではデフォルト有効） | `false` |
+| `cow_lang` | UI・コマンド文言・システムプロンプトなどの言語。`auto` で自動検出、`zh` / `en` も指定可 | `auto` |

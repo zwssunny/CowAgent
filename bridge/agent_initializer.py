@@ -17,10 +17,6 @@ from common.utils import expand_path
 # Module-level lock to serialize scheduler init across concurrent sessions
 _scheduler_init_lock = threading.Lock()
 
-# Track whether the embedding model log has been printed in this process,
-# so we avoid spamming it once per session.
-_embedding_logged: bool = False
-
 
 class AgentInitializer:
     """
@@ -306,186 +302,16 @@ class AgentInitializer:
         """
         Initialize the embedding provider for memory.
 
-        Two paths:
+        Delegates to the shared factory so agent init, knowledge sync and
+        index rebuild all select the same provider:
           A. Default (no `embedding_provider` in config.json):
-             Auto-init OpenAI -> LinkAI fallback. Existing 1536-dim indices
-             keep working.
+             Auto-init OpenAI -> LinkAI fallback.
           B. Explicit (`embedding_provider` is set):
-             Initialize the requested vendor with unified dim (default 1024).
-             If the index was built with a different dim, vector search will
-             quietly return no results (cosine returns 0) and keyword search
-             takes over until the user runs /memory rebuild-index.
+             Initialize the requested vendor.
         """
-        from agent.memory import create_embedding_provider
-        from config import conf
+        from agent.memory import create_default_embedding_provider
+        return create_default_embedding_provider()
 
-        explicit_provider = (conf().get("embedding_provider") or "").strip().lower()
-
-        if not explicit_provider:
-            return self._init_embedding_provider_legacy(session_id=session_id)
-
-        return self._init_embedding_provider_explicit(
-            memory_config, explicit_provider, session_id=session_id,
-        )
-
-    def _init_embedding_provider_legacy(self, session_id: Optional[str] = None):
-        """Legacy auto-init path: OpenAI -> LinkAI. Preserved verbatim for compat."""
-        from agent.memory import create_embedding_provider
-        from config import conf
-
-        embedding_provider = None
-        embedding_model = None
-
-        openai_api_key = conf().get("open_ai_api_key", "")
-        openai_api_base = conf().get("open_ai_api_base", "")
-        if openai_api_key and openai_api_key not in ["", "YOUR API KEY", "YOUR_API_KEY"]:
-            try:
-                model = "text-embedding-3-small"
-                embedding_provider = create_embedding_provider(
-                    provider="openai",
-                    model=model,
-                    api_key=openai_api_key,
-                    api_base=openai_api_base or "https://api.openai.com/v1"
-                )
-                embedding_model = f"openai/{model}"
-            except Exception as e:
-                logger.warning(f"[AgentInitializer] OpenAI embedding failed: {e}")
-
-        if embedding_provider is None:
-            linkai_api_key = conf().get("linkai_api_key", "") or os.environ.get("LINKAI_API_KEY", "")
-            linkai_api_base = conf().get("linkai_api_base", "https://api.link-ai.tech")
-            if linkai_api_key and linkai_api_key not in ["", "YOUR API KEY", "YOUR_API_KEY"]:
-                try:
-                    model = "text-embedding-3-small"
-                    embedding_provider = create_embedding_provider(
-                        provider="linkai",
-                        model=model,
-                        api_key=linkai_api_key,
-                        api_base=f"{linkai_api_base}/v1"
-                    )
-                    embedding_model = f"linkai/{model}"
-                except Exception as e:
-                    logger.warning(f"[AgentInitializer] LinkAI embedding failed: {e}")
-
-        if embedding_provider is not None and embedding_model:
-            global _embedding_logged
-            if not _embedding_logged:
-                logger.info(
-                    f"[AgentInitializer] Embedding model in use: {embedding_model} "
-                    f"(dim={embedding_provider.dimensions})"
-                )
-                _embedding_logged = True
-
-        return embedding_provider
-
-    def _init_embedding_provider_explicit(
-        self,
-        memory_config,
-        provider_key: str,
-        session_id: Optional[str] = None,
-    ):
-        """Explicit-provider path: build the configured vendor.
-
-        If the index was built with a different dim, vector search will
-        silently return no results (cosine returns 0 for mismatched dims)
-        and keyword search takes over. Users switch vendors by running
-        /memory rebuild-index — see docs.
-        """
-        from agent.memory import create_embedding_provider
-        from agent.memory.embedding import EMBEDDING_VENDORS
-        from config import conf
-
-        meta = EMBEDDING_VENDORS.get(provider_key)
-        if meta is None:
-            logger.error(
-                f"[AgentInitializer] Unknown embedding_provider '{provider_key}'. "
-                f"Supported: {sorted(EMBEDDING_VENDORS.keys())}. "
-                f"Memory will run in keyword-only mode."
-            )
-            return None
-
-        api_key = self._resolve_embedding_api_key(provider_key)
-        api_base = self._resolve_embedding_api_base(provider_key, meta["default_base_url"])
-
-        if not api_key:
-            logger.error(
-                f"[AgentInitializer] embedding_provider='{provider_key}' is set but its "
-                f"API key is missing. Memory will run in keyword-only mode."
-            )
-            return None
-
-        model = (conf().get("embedding_model") or "").strip() or meta["default_model"]
-        try:
-            cfg_dim = int(conf().get("embedding_dimensions") or 0)
-        except (TypeError, ValueError):
-            cfg_dim = 0
-        dim = cfg_dim if cfg_dim > 0 else meta["default_dimensions"]
-
-        try:
-            provider = create_embedding_provider(
-                provider=provider_key,
-                model=model,
-                api_key=api_key,
-                api_base=api_base,
-                dimensions=dim,
-            )
-        except Exception as e:
-            logger.error(
-                f"[AgentInitializer] Failed to init embedding provider "
-                f"'{provider_key}/{model}': {e}"
-            )
-            return None
-
-        global _embedding_logged
-        if not _embedding_logged:
-            logger.info(
-                f"[AgentInitializer] Embedding model in use: "
-                f"{provider_key}/{model} (dim={provider.dimensions})"
-            )
-            _embedding_logged = True
-        return provider
-
-    @staticmethod
-    def _resolve_embedding_api_key(provider_key: str) -> str:
-        """Pick the API key for an explicit embedding provider from config."""
-        from config import conf
-
-        key_map = {
-            "openai":    "open_ai_api_key",
-            "linkai":    "linkai_api_key",
-            "dashscope": "dashscope_api_key",
-            "doubao":    "ark_api_key",
-            "zhipu":     "zhipu_ai_api_key",
-        }
-        field = key_map.get(provider_key)
-        if not field:
-            return ""
-        value = conf().get(field, "") or ""
-        if value in ["", "YOUR API KEY", "YOUR_API_KEY"]:
-            return ""
-        return value
-
-    @staticmethod
-    def _resolve_embedding_api_base(provider_key: str, default_base: str) -> str:
-        """Pick the API base for an explicit embedding provider from config."""
-        from config import conf
-
-        base_map = {
-            "openai":    "open_ai_api_base",
-            "linkai":    "linkai_api_base",
-            "doubao":    "ark_base_url",
-            "zhipu":     "zhipu_ai_api_base",
-        }
-        field = base_map.get(provider_key)
-        if not field:
-            return default_base
-        value = (conf().get(field) or "").strip()
-        if not value:
-            return default_base
-        if provider_key == "linkai" and not value.rstrip("/").endswith("/v1"):
-            return f"{value.rstrip('/')}/v1"
-        return value
-    
     def _sync_memory(self, memory_manager, session_id: Optional[str] = None):
         """Sync memory database"""
         try:
@@ -521,7 +347,15 @@ class AgentInitializer:
                 if tool_name == "web_search":
                     from agent.tools.web_search.web_search import WebSearch
                     if not WebSearch.is_available():
-                        logger.debug("[AgentInitializer] WebSearch skipped - no BOCHA_API_KEY or LINKAI_API_KEY")
+                        logger.debug("[AgentInitializer] WebSearch skipped - no search provider configured")
+                        continue
+
+                # Skip evolution_undo when self-evolution is disabled: with no
+                # evolution there is nothing to roll back, so the tool is dead weight.
+                if tool_name == "evolution_undo":
+                    from agent.evolution.config import get_evolution_config
+                    if not get_evolution_config().enabled:
+                        logger.debug("[AgentInitializer] evolution_undo skipped - self-evolution disabled")
                         continue
 
                 # Special handling for EnvConfig tool
@@ -643,16 +477,25 @@ class AgentInitializer:
             except Exception:
                 timezone_name = "UTC"
             
-            # Chinese weekday mapping
-            weekday_map = {
-                'Monday': '星期一', 'Tuesday': '星期二', 'Wednesday': '星期三',
-                'Thursday': '星期四', 'Friday': '星期五', 'Saturday': '星期六', 'Sunday': '星期日'
-            }
-            weekday_zh = weekday_map.get(now.strftime("%A"), now.strftime("%A"))
-            
+            # Weekday: English name in en, Chinese mapping otherwise
+            weekday_en = now.strftime("%A")
+            try:
+                from common import i18n
+                is_en = i18n.get_language() == "en"
+            except Exception:
+                is_en = False
+            if is_en:
+                weekday = weekday_en
+            else:
+                weekday_map = {
+                    'Monday': '星期一', 'Tuesday': '星期二', 'Wednesday': '星期三',
+                    'Thursday': '星期四', 'Friday': '星期五', 'Saturday': '星期六', 'Sunday': '星期日'
+                }
+                weekday = weekday_map.get(weekday_en, weekday_en)
+
             return {
                 'time': now.strftime("%Y-%m-%d %H:%M:%S"),
-                'weekday': weekday_zh,
+                'weekday': weekday,
                 'timezone': timezone_name
             }
         

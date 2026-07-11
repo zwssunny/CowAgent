@@ -38,6 +38,16 @@ class BaseTool:
     description: str = "Base tool"
     params: dict = {}  # Store JSON Schema
     model: Optional[Any] = None  # LLM model instance, type depends on bot implementation
+    progress_callback = None
+
+    def report_progress(self, message: str):
+        callback = getattr(self, "progress_callback", None)
+        if not callback:
+            return
+        try:
+            callback(str(message))
+        except Exception as e:
+            logger.debug(f"[{self.name}] progress callback failed: {e}")
 
     @classmethod
     def get_json_schema(cls) -> dict:

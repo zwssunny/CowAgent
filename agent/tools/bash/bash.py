@@ -4,9 +4,12 @@ Bash tool - Execute bash commands
 
 import os
 import re
+import signal
 import sys
 import subprocess
 import tempfile
+import threading
+import time
 from typing import Dict, Any
 
 from agent.tools.base_tool import BaseTool, ToolResult
@@ -19,6 +22,10 @@ class Bash(BaseTool):
     """Tool for executing bash commands"""
 
     _IS_WIN = sys.platform == "win32"
+    _PROGRESS_MAX_BYTES = 4 * 1024
+    _PROGRESS_INTERVAL = 0.5
+    # cmd.exe command line limit is ~8191 chars; rewrite python -c above this.
+    _WIN_CMD_SAFE_LEN = 7000
 
     name: str = "bash"
     description: str = f"""Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last {DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file.
@@ -69,8 +76,8 @@ SAFETY:
         if not command:
             return ToolResult.fail("Error: command parameter is required")
 
-        # Security check: Prevent accessing sensitive config files
-        if "~/.cow/.env" in command or "~/.cow" in command:
+        # Security check: Prevent direct access to the credential file
+        if re.search(r'\.cow[/\\]\.env', command):
             return ToolResult.fail(
                 "Error: Access denied. API keys and credentials must be accessed through the env_config tool only."
             )
@@ -106,25 +113,35 @@ SAFETY:
             else:
                 logger.debug(f"[Bash] Process User: {os.environ.get('USERNAME', os.environ.get('USER', 'unknown'))}")
             
+            # Temp script written for long `python -c` commands (Windows only),
+            # cleaned up after execution.
+            temp_script_path = None
+
             # On Windows, convert $VAR references to %VAR% for cmd.exe
             if self._IS_WIN:
                 env["PYTHONIOENCODING"] = "utf-8"
                 command = self._convert_env_vars_for_windows(command, dotenv_vars)
+                # cmd.exe has an ~8191 char command line limit. Long
+                # `python -c "..."` commands silently fail, so spill the inline
+                # code into a temp .py file and run that instead.
+                if len(command) > self._WIN_CMD_SAFE_LEN:
+                    command, temp_script_path = self._rewrite_long_python_c(command)
                 if command and not command.strip().lower().startswith("chcp"):
                     command = f"chcp 65001 >nul 2>&1 && {command}"
 
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=self.cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                env=env,
-            )
+            try:
+                result = self._run_streaming(
+                    command,
+                    timeout,
+                    env,
+                    dotenv_vars,
+                )
+            finally:
+                if temp_script_path:
+                    try:
+                        os.remove(temp_script_path)
+                    except OSError:
+                        pass
             
             logger.debug(f"[Bash] Exit code: {result.returncode}")
             logger.debug(f"[Bash] Stdout length: {len(result.stdout)}")
@@ -185,8 +202,12 @@ SAFETY:
             total_bytes = len(output.encode('utf-8'))
 
             if total_bytes > DEFAULT_MAX_BYTES:
-                # Save full output to temp file
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.log', prefix='bash-') as f:
+                # Save full output to temp file. encoding='utf-8' is required:
+                # the default text-mode encoding is the platform locale (e.g.
+                # cp936/GBK on Chinese Windows), which raises UnicodeEncodeError
+                # for output containing emoji or other non-locale characters and
+                # would discard an otherwise successful command result.
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.log', prefix='bash-', encoding='utf-8') as f:
                     f.write(output)
                     temp_file_path = f.name
 
@@ -235,6 +256,105 @@ SAFETY:
             return ToolResult.fail(f"Error: Command timed out after {timeout} seconds")
         except Exception as e:
             return ToolResult.fail(f"Error executing command: {str(e)}")
+
+    def _run_streaming(self, command: str, timeout: int, env: dict, dotenv_vars: dict):
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=self.cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=not self._IS_WIN,
+        )
+        stdout_chunks, stderr_chunks = [], []
+        recent = bytearray()
+        recent_lock = threading.Lock()
+
+        def drain(stream, chunks):
+            while True:
+                chunk = os.read(stream.fileno(), 4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                with recent_lock:
+                    recent.extend(chunk)
+                    if len(recent) > self._PROGRESS_MAX_BYTES:
+                        del recent[:-self._PROGRESS_MAX_BYTES]
+
+        readers = [
+            threading.Thread(target=drain, args=(process.stdout, stdout_chunks), daemon=True),
+            threading.Thread(target=drain, args=(process.stderr, stderr_chunks), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+
+        started = time.monotonic()
+        last_reported_at = started
+        last_snapshot = None
+        try:
+            while process.poll() is None:
+                now = time.monotonic()
+                elapsed = now - started
+                if elapsed >= timeout:
+                    self._kill_process(process)
+                    raise subprocess.TimeoutExpired(command, timeout)
+                if elapsed >= self._PROGRESS_INTERVAL and now - last_reported_at >= self._PROGRESS_INTERVAL:
+                    with recent_lock:
+                        snapshot = bytes(recent).decode("utf-8", errors="replace")
+                    snapshot = self._redact_progress(snapshot, dotenv_vars)
+                    if snapshot and snapshot != last_snapshot:
+                        self.report_progress(snapshot)
+                        last_snapshot = snapshot
+                    last_reported_at = now
+                time.sleep(0.1)
+        finally:
+            if process.poll() is None:
+                self._kill_process(process)
+            process.wait()
+            join_deadline = time.monotonic() + 5
+            for reader in readers:
+                reader.join(timeout=max(0, join_deadline - time.monotonic()))
+
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            returncode=process.returncode,
+            stdout=b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+            stderr=b"".join(stderr_chunks).decode("utf-8", errors="replace"),
+        )
+
+    def _kill_process(self, process):
+        if self._IS_WIN:
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode != 0 and process.poll() is None:
+                    process.kill()
+            except (OSError, subprocess.SubprocessError):
+                if process.poll() is None:
+                    process.kill()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                if process.poll() is None:
+                    process.kill()
+
+    @staticmethod
+    def _redact_progress(text: str, dotenv_vars: dict) -> str:
+        text = re.sub(
+            r'(?i)\b(API_KEY|TOKEN|PASSWORD|AUTHORIZATION)\s*=\s*[^\s]+',
+            lambda match: f"{match.group(1)}=[REDACTED]",
+            text,
+        )
+        for value in dotenv_vars.values():
+            value = str(value or "")
+            if len(value) >= 6:
+                text = text.replace(value, "[REDACTED]")
+        return text
 
     def _get_safety_warning(self, command: str) -> str:
         """
@@ -293,3 +413,43 @@ SAFETY:
             return m.group(0)
 
         return re.sub(r'\$\{(\w+)\}|\$(\w+)', replace_match, command)
+
+    @staticmethod
+    def _rewrite_long_python_c(command: str):
+        """
+        Rewrite `python -c "<code>"` into `python <tempfile>` to bypass the
+        cmd.exe command line length limit on Windows.
+
+        Returns (new_command, temp_file_path). On any parse failure the original
+        command and None are returned, so behavior is unchanged when unmatched.
+        """
+        # Match: <python|python3|py> [flags] -c "<code>" (single or double quoted)
+        m = re.search(
+            r'^(?P<prefix>.*?\b(?:python3?|py)\b[^\n]*?\s-c\s+)'
+            r'(?P<quote>["\'])(?P<code>.*)(?P=quote)\s*(?P<suffix>.*)$',
+            command,
+            re.DOTALL,
+        )
+        if not m:
+            return command, None
+
+        quote = m.group("quote")
+        code = m.group("code")
+        # Reverse common shell-level escaping of the quote char inside the code.
+        code = code.replace("\\" + quote, quote)
+
+        try:
+            fd, path = tempfile.mkstemp(suffix=".py", prefix="bash-pyc-")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(code)
+        except OSError:
+            return command, None
+
+        prefix = m.group("prefix")
+        # Drop the trailing "-c " from the prefix, keep the interpreter + flags.
+        interp = re.sub(r'\s-c\s+$', ' ', prefix).rstrip()
+        suffix = m.group("suffix").strip()
+        new_command = f'{interp} "{path}"'
+        if suffix:
+            new_command += f' {suffix}'
+        return new_command, path

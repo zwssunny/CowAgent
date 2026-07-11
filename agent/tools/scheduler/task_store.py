@@ -182,8 +182,15 @@ class TaskStore:
         if enabled_only:
             task_list = [t for t in task_list if t.get("enabled", True)]
         
-        # Sort by next_run_at
-        task_list.sort(key=lambda t: t.get("next_run_at", float('inf')))
+        # Sort by enabled status (enabled first), then by next_run_at
+        def sort_key(t):
+            enabled = t.get("enabled", True)
+            next_run = t.get("next_run_at", "")
+            # Enabled tasks first (0), disabled tasks second (1)
+            # Then sort by next_run_at (empty string sorts last)
+            return (0 if enabled else 1, next_run if next_run else "9999-12-31")
+        
+        task_list.sort(key=sort_key)
         
         return task_list
     

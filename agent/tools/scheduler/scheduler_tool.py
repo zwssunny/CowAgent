@@ -364,9 +364,12 @@ class SchedulerTool(BaseTool):
                         logger.error(f"[SchedulerTool] Invalid relative time format: {schedule_value}")
                         return None
                 else:
-                    # Absolute time in ISO format
-                    datetime.fromisoformat(schedule_value)
-                    return {"type": "once", "run_at": schedule_value}
+                    # Absolute ISO time. Normalize to tz-naive local so it
+                    # stays comparable with the scheduler's datetime.now().
+                    parsed = datetime.fromisoformat(schedule_value)
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.astimezone().replace(tzinfo=None)
+                    return {"type": "once", "run_at": parsed.isoformat()}
             
         except Exception as e:
             logger.error(f"[SchedulerTool] Invalid schedule: {e}")

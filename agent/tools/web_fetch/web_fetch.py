@@ -16,11 +16,15 @@ import requests
 
 from agent.tools.base_tool import BaseTool, ToolResult
 from agent.tools.utils.truncate import truncate_head, format_size
+from agent.tools.utils.url_safety import validate_url_safe
 from common.log import logger
 
 
 DEFAULT_TIMEOUT = 30
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+# Cap on how many redirects we follow; each hop's target is re-validated
+# against the SSRF guard so a public URL cannot bounce us into an internal one.
+MAX_REDIRECTS = 10
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
@@ -107,10 +111,57 @@ class WebFetch(BaseTool):
         if parsed.scheme not in ("http", "https"):
             return ToolResult.fail("Error: Invalid URL (must start with http:// or https://)")
 
+        # SSRF guard: reject URLs that resolve to private/loopback/link-local/
+        # cloud-metadata addresses before any request is issued.
+        try:
+            validate_url_safe(url)
+        except ValueError as e:
+            return ToolResult.fail(f"Error: {e}")
+
         if _is_document_url(url):
             return self._fetch_document(url)
 
         return self._fetch_webpage(url)
+
+    # ---- Safe request helper ----
+
+    @staticmethod
+    def _safe_get(url: str, **kwargs) -> requests.Response:
+        """Issue a GET request while re-validating every redirect hop (SSRF guard).
+
+        Auto-redirect is disabled and each hop is followed manually so the
+        target of every redirect is re-resolved and checked against the SSRF
+        guard. This prevents a public URL from 3xx-bouncing into a private,
+        loopback, link-local or cloud-metadata address. ``kwargs`` are passed
+        through to ``requests.get`` (e.g. ``stream``).
+
+        Raises:
+            ValueError: if any hop resolves to a non-public address.
+        """
+        kwargs.pop("allow_redirects", None)
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            response = requests.get(
+                current,
+                headers=DEFAULT_HEADERS,
+                timeout=DEFAULT_TIMEOUT,
+                allow_redirects=False,
+                **kwargs,
+            )
+            if not response.is_redirect and not response.is_permanent_redirect:
+                return response
+
+            location = response.headers.get("Location")
+            if not location:
+                return response
+
+            # Resolve the redirect target relative to the current URL, then
+            # re-validate it before following.
+            current = requests.compat.urljoin(current, location)
+            validate_url_safe(current)
+            response.close()
+
+        raise ValueError(f"Too many redirects (>{MAX_REDIRECTS})")
 
     # ---- Web page fetching ----
 
@@ -118,12 +169,7 @@ class WebFetch(BaseTool):
         """Fetch and extract readable text from an HTML web page."""
         parsed = urlparse(url)
         try:
-            response = requests.get(
-                url,
-                headers=DEFAULT_HEADERS,
-                timeout=DEFAULT_TIMEOUT,
-                allow_redirects=True,
-            )
+            response = self._safe_get(url)
             response.raise_for_status()
         except requests.Timeout:
             return ToolResult.fail(f"Error: Request timed out after {DEFAULT_TIMEOUT}s")
@@ -131,6 +177,8 @@ class WebFetch(BaseTool):
             return ToolResult.fail(f"Error: Failed to connect to {parsed.netloc}")
         except requests.HTTPError as e:
             return ToolResult.fail(f"Error: HTTP {e.response.status_code} for URL: {url}")
+        except ValueError as e:
+            return ToolResult.fail(f"Error: {e}")
         except Exception as e:
             return ToolResult.fail(f"Error: Failed to fetch URL: {e}")
 
@@ -158,13 +206,7 @@ class WebFetch(BaseTool):
         logger.info(f"[WebFetch] Downloading document: {url} -> {local_path}")
 
         try:
-            response = requests.get(
-                url,
-                headers=DEFAULT_HEADERS,
-                timeout=DEFAULT_TIMEOUT,
-                stream=True,
-                allow_redirects=True,
-            )
+            response = self._safe_get(url, stream=True)
             response.raise_for_status()
 
             content_length = int(response.headers.get("Content-Length", 0))
@@ -191,6 +233,9 @@ class WebFetch(BaseTool):
             return ToolResult.fail(f"Error: Failed to connect to {parsed.netloc}")
         except requests.HTTPError as e:
             return ToolResult.fail(f"Error: HTTP {e.response.status_code} for URL: {url}")
+        except ValueError as e:
+            self._cleanup_file(local_path)
+            return ToolResult.fail(f"Error: {e}")
         except Exception as e:
             self._cleanup_file(local_path)
             return ToolResult.fail(f"Error: Failed to download file: {e}")

@@ -1,3 +1,4 @@
+# Requires: edge-tts  (pip install edge-tts)
 import time
 
 import edge_tts

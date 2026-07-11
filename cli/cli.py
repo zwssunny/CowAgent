@@ -3,7 +3,7 @@
 import click
 from cli import __version__
 from cli.commands.skill import skill
-from cli.commands.process import start, stop, restart, update, status, logs
+from cli.commands.process import start, stop, restart, self_restart, update, status, logs
 from cli.commands.context import context
 from cli.commands.install import install_browser
 from cli.commands.knowledge import knowledge
@@ -68,6 +68,7 @@ main.add_command(skill)
 main.add_command(start)
 main.add_command(stop)
 main.add_command(restart)
+main.add_command(self_restart)
 main.add_command(update)
 main.add_command(status)
 main.add_command(logs)

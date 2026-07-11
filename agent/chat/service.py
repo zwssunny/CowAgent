@@ -49,6 +49,16 @@ class ChatService:
             agent.model.channel_type = channel_type or ""
             agent.model.session_id = session_id or ""
 
+        # Build a context so context-aware tools (e.g. scheduler) can resolve the
+        # receiver/session. This streaming path bypasses agent_bridge.agent_reply,
+        # so the attach step that normally happens there must be done here too.
+        context = self._build_context(query, session_id, channel_type)
+        self._attach_context_aware_tools(agent, context)
+
+        # Mark this session as mid-run so the self-evolution idle scan does not
+        # fire concurrently when a single turn runs longer than idle_minutes.
+        self._mark_run_active(agent, True)
+
         # State shared between the event callback and this method
         state = _StreamState()
 
@@ -171,6 +181,12 @@ class ChatService:
 
         from agent.protocol.agent_stream import AgentStreamExecutor
 
+        # Register a cancel token so /cancel can abort this in-flight run.
+        # IM channels key on session_id (no per-turn request_id here).
+        from agent.protocol import get_cancel_registry
+        registry = get_cancel_registry()
+        cancel_event = registry.register(session_id, session_id=session_id) if session_id else None
+
         executor = AgentStreamExecutor(
             agent=agent,
             model=agent.model,
@@ -180,6 +196,7 @@ class ChatService:
             on_event=on_event,
             messages=messages_copy,
             max_context_turns=max_context_turns,
+            cancel_event=cancel_event,
         )
 
         try:
@@ -191,6 +208,15 @@ class ChatService:
                     agent.messages.clear()
                     logger.info("[ChatService] Cleared agent message history after executor recovery")
             raise
+        finally:
+            # Clear the mid-run flag so idle scans can review this session again.
+            self._mark_run_active(agent, False)
+            # Release cancel token to keep the registry bounded.
+            if session_id:
+                try:
+                    registry.unregister(session_id)
+                except Exception:
+                    pass
 
         # Sync executor messages back to agent (thread-safe).
         # The executor may have trimmed context, making its list shorter than
@@ -254,9 +280,67 @@ class ChatService:
         # Execute post-process tools
         agent._execute_post_process_tools()
 
+        # Record this user turn for the self-evolution idle trigger. This
+        # streaming path bypasses agent_bridge.agent_reply, so the activity must
+        # be noted here, otherwise idle scans never see any signal to evolve.
+        self._note_evolution_turn(agent, context)
+
         logger.info(f"[ChatService] Agent run completed: session={session_id}")
 
 
+
+    @staticmethod
+    def _build_context(query: str, session_id: str, channel_type: str):
+        """Build a Context for tool resolution on the streaming chat path.
+
+        receiver falls back to session_id; the scheduler's delivery keys on
+        session_id as the receiver.
+        """
+        from bridge.context import Context, ContextType
+        # Pass an explicit kwargs dict: Context's default kwargs is a shared
+        # mutable default, so omitting it would leak fields across sessions.
+        ctx = Context(ContextType.TEXT, query, kwargs={})
+        ctx["session_id"] = session_id
+        ctx["receiver"] = session_id
+        ctx["isgroup"] = False
+        ctx["channel_type"] = channel_type or ""
+        return ctx
+
+    @staticmethod
+    def _attach_context_aware_tools(agent, context):
+        """Attach the current context to tools that need it (scheduler)."""
+        try:
+            if not (context and getattr(agent, "tools", None)):
+                return
+            for tool in agent.tools:
+                if tool.name == "scheduler":
+                    from agent.tools.scheduler.integration import attach_scheduler_to_tool
+                    attach_scheduler_to_tool(tool, context)
+                    break
+        except Exception as e:
+            logger.warning(f"[ChatService] Failed to attach context to scheduler: {e}")
+
+    @staticmethod
+    def _mark_run_active(agent, active):
+        """Toggle the self-evolution mid-run flag for this session's agent."""
+        try:
+            from agent.evolution.trigger import mark_run_active
+            mark_run_active(agent, active)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _note_evolution_turn(agent, context):
+        """Record a user turn so the self-evolution idle trigger has signal."""
+        try:
+            from agent.evolution.trigger import note_user_turn
+            ch = (context.get("channel_type") or "") if context else ""
+            rcv = (context.get("receiver") or "") if context else ""
+            is_group = bool(context.get("isgroup")) if context else False
+            # Only single chats get a proactive push target; group push is noisy.
+            note_user_turn(agent, channel_type=ch, receiver=(rcv if not is_group else ""))
+        except Exception:
+            pass
 
     @staticmethod
     def _persist_messages(session_id: str, new_messages: list, channel_type: str = ""):

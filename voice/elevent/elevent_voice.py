@@ -1,3 +1,4 @@
+# Requires: elevenlabs==1.0.3  (pip install elevenlabs==1.0.3)
 import time
 
 from elevenlabs.client import ElevenLabs

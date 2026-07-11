@@ -31,7 +31,8 @@ class OpenaiVoice(Voice):
                 "file": file,
             }
             data = {
-                "model": "whisper-1",
+                # Override via `voice_to_text_model` (e.g. fall back to whisper-1).
+                "model": conf().get("voice_to_text_model") or "gpt-4o-mini-transcribe",
             }
             response = requests.post(url, headers=headers, files=files, data=data)
             response_data = response.json()

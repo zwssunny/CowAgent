@@ -27,10 +27,14 @@ def compress_imgfile(file, max_size):
     img = Image.open(file)
     rgb_image = img.convert("RGB")
     quality = 95
+    min_quality = 10
     while True:
         out_buf = io.BytesIO()
         rgb_image.save(out_buf, "JPEG", quality=quality)
-        if fsize(out_buf) <= max_size:
+        if fsize(out_buf) <= max_size or quality <= min_quality:
+            # Stop at min_quality: further decrements would pass an invalid
+            # quality (<1) to PIL and the loop would otherwise never terminate
+            # for images that cannot be compressed below max_size.
             return out_buf
         quality -= 5
 
@@ -115,6 +119,18 @@ def expand_path(path: str) -> str:
                 expanded = os.path.join(home, path[2:])
     
     return expanded
+
+
+def is_cloud_deployment() -> bool:
+    if os.environ.get("CLOUD_DEPLOYMENT_ID"):
+        return True
+    try:
+        from config import conf
+        if conf().get("cloud_deployment_id"):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def get_cloud_headers(api_key: str) -> dict:

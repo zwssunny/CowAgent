@@ -54,6 +54,11 @@ class Send(BaseTool):
         if not path:
             return ToolResult.fail("Error: path parameter is required")
         
+        # Pass through remote URLs directly (no local file check): the client
+        # renders the link inline, so no download is needed.
+        if path.lower().startswith(("http://", "https://")):
+            return self._build_url_result(path, message)
+        
         # Resolve path
         absolute_path = self._resolve_path(path)
         
@@ -112,6 +117,46 @@ class Send(BaseTool):
 
         return ToolResult.success(result)
     
+    def _build_url_result(self, url: str, message: str) -> ToolResult:
+        """Build a file_to_send result for a remote http(s) URL.
+
+        The URL is passed through as both ``path`` and ``url`` so downstream
+        channels render it inline without downloading it locally.
+        """
+        # Infer file type from the URL path extension (ignore query string).
+        from urllib.parse import urlparse
+        url_path = urlparse(url).path
+        file_ext = Path(url_path).suffix.lower()
+        file_name = Path(url_path).name or "file"
+
+        if file_ext in self.image_extensions:
+            file_type = "image"
+            mime_type = self._get_image_mime_type(file_ext)
+        elif file_ext in self.video_extensions:
+            file_type = "video"
+            mime_type = self._get_video_mime_type(file_ext)
+        elif file_ext in self.audio_extensions:
+            file_type = "audio"
+            mime_type = self._get_audio_mime_type(file_ext)
+        elif file_ext in self.document_extensions:
+            file_type = "document"
+            mime_type = self._get_document_mime_type(file_ext)
+        else:
+            # Default to image: most pass-through URLs are generated images.
+            file_type = "image"
+            mime_type = "image/jpeg"
+
+        result = {
+            "type": "file_to_send",
+            "file_type": file_type,
+            "path": url,
+            "url": url,
+            "file_name": file_name,
+            "mime_type": mime_type,
+            "message": message or f"正在发送 {file_name}",
+        }
+        return ToolResult.success(result)
+
     def _resolve_path(self, path: str) -> str:
         """Resolve path to absolute path"""
         path = expand_path(path)

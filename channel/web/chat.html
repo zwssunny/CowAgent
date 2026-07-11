@@ -47,11 +47,33 @@
          This runs synchronously in <head> so the correct class is on <html>
          before any CSS or body rendering occurs. -->
     <script>
+    // Map an arbitrary locale string (zh-CN, en-US, fr ...) to 'zh' / 'zh-Hant' / 'en',
+    // or '' when unrecognized so callers can fall through to the next source.
+    window.__cowNormalizeLang__ = function(raw) {
+        if (!raw) return '';
+        var v = String(raw).trim().toLowerCase().replace('_', '-');
+        if (v === 'auto') return '';
+        // Handle Traditional Chinese variants first (more specific)
+        if (v === 'zh-hant' || v.indexOf('zh-hant-') === 0 || v === 'zh-tw' || v === 'zh-hk') return 'zh-Hant';
+        // Then Simplified Chinese
+        if (v.indexOf('zh') === 0) return 'zh';
+        if (v.indexOf('en') === 0) return 'en';
+        return '';
+    };
+    // Resolve the console language by priority:
+    //   user choice (localStorage) -> backend-detected -> browser -> 'zh'.
+    window.__cowResolveLang__ = function() {
+        return window.__cowNormalizeLang__(localStorage.getItem('cow_lang'))
+            || window.__cowNormalizeLang__(window.__COW_DEFAULT_LANG__)
+            || window.__cowNormalizeLang__(navigator.language || (navigator.languages && navigator.languages[0]))
+            || 'zh';
+    };
     (function() {
+        // Backend-resolved default language (from cow_lang config / auto-detect).
+        window.__COW_DEFAULT_LANG__ = '{{COW_DEFAULT_LANG}}';
         var theme = localStorage.getItem('cow_theme') || 'dark';
         if (theme === 'dark') document.documentElement.classList.add('dark');
-        var lang = localStorage.getItem('cow_lang') || 'zh';
-        document.documentElement.setAttribute('lang', lang);
+        document.documentElement.setAttribute('lang', window.__cowResolveLang__());
     })();
     </script>
 </head>
@@ -136,6 +158,11 @@
                            data-view="config">
                             <i class="fas fa-sliders item-icon text-xs w-5 text-center"></i>
                             <span data-i18n="menu_config">配置</span>
+                        </a>
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="models">
+                            <i class="fas fa-microchip item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_models">模型</span>
                         </a>
                         <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
                            data-view="skills">
@@ -243,14 +270,29 @@
 
                 <div class="flex-1"></div>
 
-                <!-- Language Toggle -->
-                <button id="lang-toggle" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium
-                                                 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-white/10
-                                                 cursor-pointer transition-colors duration-150"
-                        onclick="toggleLanguage()">
-                    <i class="fas fa-globe text-xs"></i>
-                    <span id="lang-label">EN</span>
-                </button>
+                <!-- Language Selector (dropdown) -->
+                <div id="lang-selector" class="relative">
+                    <button id="lang-toggle" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium
+                                                     text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-white/10
+                                                     cursor-pointer transition-colors duration-150"
+                            onclick="toggleLangMenu(event)">
+                        <i class="fas fa-globe text-xs"></i>
+                        <span id="lang-label">EN</span>
+                        <i class="fas fa-chevron-down text-[10px] opacity-60"></i>
+                    </button>
+                    <div id="lang-menu" class="hidden absolute right-0 mt-1 min-w-[120px] py-1 rounded-lg z-50
+                                               bg-white dark:bg-slate-800 shadow-lg ring-1 ring-black/5 dark:ring-white/10">
+                        <button class="lang-menu-item w-full text-left px-3 py-1.5 text-sm text-slate-600 dark:text-slate-300
+                                       hover:bg-slate-100 dark:hover:bg-white/10 cursor-pointer" data-lang="zh"
+                                onclick="selectLanguage('zh')">简体中文</button>
+                        <button class="lang-menu-item w-full text-left px-3 py-1.5 text-sm text-slate-600 dark:text-slate-300
+                                       hover:bg-slate-100 dark:hover:bg-white/10 cursor-pointer" data-lang="zh-Hant"
+                                onclick="selectLanguage('zh-Hant')">繁體中文</button>
+                        <button class="lang-menu-item w-full text-left px-3 py-1.5 text-sm text-slate-600 dark:text-slate-300
+                                       hover:bg-slate-100 dark:hover:bg-white/10 cursor-pointer" data-lang="en"
+                                onclick="selectLanguage('en')">English</button>
+                    </div>
+                </div>
 
                 <!-- Theme Toggle -->
                 <button id="theme-toggle" class="p-2 rounded-lg text-slate-500 dark:text-slate-400
@@ -261,7 +303,7 @@
                 </button>
 
                 <!-- Docs Link -->
-                <a href="https://docs.cowagent.ai" target="_blank" rel="noopener noreferrer"
+                <a id="docs-link" href="https://docs.cowagent.ai" target="_blank" rel="noopener noreferrer"
                    class="p-2 rounded-lg text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-white/10
                           cursor-pointer transition-colors duration-150" title="Documentation">
                     <i class="fas fa-book text-base"></i>
@@ -280,6 +322,14 @@
                           cursor-pointer transition-colors duration-150" title="GitHub">
                     <i class="fab fa-github text-lg"></i>
                 </a>
+
+                <!-- Logout Button (hidden by default) -->
+                <button id="logout-btn-header" class="p-2 rounded-lg text-slate-500 dark:text-slate-400
+                                                       hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-500/10 dark:hover:text-red-400
+                                                       cursor-pointer transition-colors duration-150 hidden"
+                        onclick="handleLogout()" title="Logout" data-i18n-title="logout">
+                    <i class="fas fa-sign-out-alt text-base"></i>
+                </button>
             </header>
 
             <!-- Content Area -->
@@ -417,21 +467,30 @@
                                     </button>
                                 </div>
                                 <div id="slash-menu" class="slash-menu hidden"></div>
-                                <textarea id="chat-input"
-                                          class="flex-1 min-w-0 px-4 py-[10px] rounded-xl border border-slate-200 dark:border-slate-600
-                                                 bg-slate-50 dark:bg-white/5 text-slate-800 dark:text-slate-100
-                                                 placeholder:text-slate-400 dark:placeholder:text-slate-500
-                                                 focus:outline-none focus:ring-0 focus:border-primary-600
-                                                 text-sm leading-relaxed"
-                                          rows="1"
-                                          data-i18n-placeholder="input_placeholder"
-                                          placeholder="输入消息，或输入 / 使用指令"></textarea>
+                                <div class="flex-1 min-w-0 relative flex items-center">
+                                    <textarea id="chat-input"
+                                              class="w-full pl-4 pr-11 py-[10px] rounded-xl border border-slate-200 dark:border-slate-600
+                                                     bg-slate-50 dark:bg-white/5 text-slate-800 dark:text-slate-100
+                                                     placeholder:text-slate-400 dark:placeholder:text-slate-500
+                                                     focus:outline-none focus:ring-0 focus:border-primary-600
+                                                     text-sm leading-relaxed"
+                                              rows="1"
+                                              data-i18n-placeholder="input_placeholder"
+                                              placeholder="输入消息，或输入 / 使用指令"></textarea>
+                                    <button id="mic-btn" type="button"
+                                            class="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 flex items-center justify-center rounded-lg
+                                                   text-slate-400 hover:text-primary-500 hover:bg-primary-50 dark:hover:bg-primary-900/20
+                                                   cursor-pointer transition-colors duration-150"
+                                            data-i18n-title="mic_idle_title" title="点击录音 / 再按一次结束">
+                                        <i class="fas fa-microphone text-sm"></i>
+                                    </button>
+                                </div>
                                 <button id="send-btn"
                                         class="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-lg
                                                bg-primary-400 text-white hover:bg-primary-500
                                                disabled:bg-slate-300 dark:disabled:bg-slate-600
                                                disabled:cursor-not-allowed cursor-pointer transition-colors duration-150"
-                                        disabled onclick="sendMessage()">
+                                        disabled>
                                     <i class="fas fa-paper-plane text-sm"></i>
                                 </button>
                             </div>
@@ -460,6 +519,11 @@
                                             <i class="fas fa-microchip text-primary-500 text-sm"></i>
                                         </div>
                                         <h3 class="font-semibold text-slate-800 dark:text-slate-100" data-i18n="config_model">模型配置</h3>
+                                        <a class="ml-auto text-xs text-slate-500 dark:text-slate-400 hover:text-primary-500 dark:hover:text-primary-400 cursor-pointer transition-colors flex items-center gap-1"
+                                           onclick="navigateTo('models')">
+                                            <span data-i18n="config_model_advanced">高级配置</span>
+                                            <i class="fas fa-arrow-right text-[10px]"></i>
+                                        </a>
                                     </div>
                                     <div class="space-y-5">
                                         <!-- Provider -->
@@ -582,6 +646,18 @@
                                                             after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
                                             </label>
                                         </div>
+                                        <div class="flex items-center justify-between">
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400">
+                                                <span data-i18n="config_self_evolution">Self-Evolution</span>
+                                                <span class="cfg-tip" data-tip-key="config_self_evolution_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <label class="relative inline-flex items-center cursor-pointer">
+                                                <input id="cfg-self-evolution" type="checkbox" class="sr-only peer">
+                                                <div class="w-9 h-5 bg-slate-200 dark:bg-slate-700 peer-checked:bg-primary-400 rounded-full
+                                                            after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white
+                                                            after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
+                                            </label>
+                                        </div>
                                         <div class="flex items-center justify-end gap-3 pt-1">
                                             <span id="cfg-agent-status" class="text-xs text-primary-500 opacity-0 transition-opacity duration-300"></span>
                                             <button id="cfg-agent-save"
@@ -617,6 +693,31 @@
                                                     class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
                                                            cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
                                                     onclick="savePasswordConfig()" data-i18n="config_save">保存</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Language Config Card -->
+                                <div class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 p-6">
+                                    <div class="flex items-center gap-3 mb-5">
+                                        <div class="w-9 h-9 rounded-lg bg-sky-50 dark:bg-sky-900/30 flex items-center justify-center">
+                                            <i class="fas fa-language text-sky-500 text-sm"></i>
+                                        </div>
+                                        <h3 class="font-semibold text-slate-800 dark:text-slate-100" data-i18n="config_language">语言</h3>
+                                    </div>
+                                    <div class="space-y-4">
+                                        <div>
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                                <span data-i18n="config_language">语言</span>
+                                                <span class="cfg-tip" data-tip-key="config_language_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <div id="cfg-lang-select" class="cfg-dropdown" tabindex="0">
+                                                <div class="cfg-dropdown-selected">
+                                                    <span class="cfg-dropdown-text">--</span>
+                                                    <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                                                </div>
+                                                <div class="cfg-dropdown-menu"></div>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -697,7 +798,7 @@
                                         </button>
                                         <button id="memory-tab-dreams" onclick="switchMemoryTab('dreams')"
                                                 class="memory-tab px-3 py-1.5 rounded-md text-xs font-medium cursor-pointer transition-colors duration-150">
-                                            <i class="fas fa-moon mr-1.5"></i><span data-i18n="memory_tab_dreams">梦境日记</span>
+                                            <i class="fas fa-seedling mr-1.5"></i><span data-i18n="memory_tab_dreams">自主进化</span>
                                         </button>
                                     </div>
                                 </div>
@@ -754,17 +855,18 @@
                 <!-- VIEW: Knowledge                                         -->
                 <!-- ====================================================== -->
                 <div id="view-knowledge" class="view">
-                    <div class="flex-1 overflow-y-auto p-4 md:p-8 lg:p-10">
-                        <div class="w-full max-w-[1600px] mx-auto">
+                    <div class="flex-1 min-h-0 overflow-y-auto md:overflow-hidden p-4 md:p-8 lg:p-10 md:flex md:flex-col">
+                        <div class="w-full max-w-[1600px] mx-auto md:flex-1 md:min-h-0 md:flex md:flex-col">
 
                             <!-- Header -->
-                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 md:mb-6">
+                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 md:mb-6 md:flex-shrink-0">
                                 <div>
                                     <h2 class="text-xl font-bold text-slate-800 dark:text-slate-100" data-i18n="knowledge_title">知识库</h2>
                                     <p class="text-sm text-slate-500 dark:text-slate-400 mt-1" data-i18n="knowledge_desc">浏览和探索你的知识库</p>
                                 </div>
                                 <div class="flex items-center gap-2">
                                     <span id="knowledge-stats" class="text-xs text-slate-400 dark:text-slate-500 hidden sm:inline"></span>
+                                    <span id="knowledge-action-status" class="text-xs opacity-0 transition-opacity duration-200"></span>
                                     <div class="flex items-center bg-slate-100 dark:bg-white/10 rounded-lg p-0.5">
                                         <button id="knowledge-tab-docs" onclick="switchKnowledgeTab('docs')"
                                                 class="knowledge-tab px-3 py-1.5 rounded-md text-xs font-medium cursor-pointer transition-colors duration-150 active">
@@ -775,6 +877,28 @@
                                             <i class="fas fa-diagram-project mr-1.5"></i><span data-i18n="knowledge_tab_graph">图谱</span>
                                         </button>
                                     </div>
+                                    <div id="knowledge-new-menu" class="relative">
+                                        <button onclick="toggleKnowledgeNewMenu(event)"
+                                                class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-xs font-medium cursor-pointer transition-colors">
+                                            <i class="fas fa-plus"></i><span data-i18n="knowledge_new">新建</span><i class="fas fa-chevron-down text-[9px] ml-0.5"></i>
+                                        </button>
+                                        <div id="knowledge-new-menu-list"
+                                             class="hidden absolute right-0 mt-1.5 w-44 z-50 bg-white dark:bg-[#1A1A1A] border border-slate-200 dark:border-white/10 rounded-lg shadow-lg py-1">
+                                            <button onclick="createKnowledgeCategory(); closeKnowledgeNewMenu()"
+                                                    class="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-white/5 cursor-pointer transition-colors">
+                                                <i class="fas fa-folder-plus w-3.5 text-slate-400"></i><span data-i18n="knowledge_new_category">新建分类</span>
+                                            </button>
+                                            <button onclick="createKnowledgeDocument(); closeKnowledgeNewMenu()"
+                                                    class="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-white/5 cursor-pointer transition-colors">
+                                                <i class="fas fa-file-circle-plus w-3.5 text-slate-400"></i><span data-i18n="knowledge_new_document">新建文档</span>
+                                            </button>
+                                            <button onclick="selectKnowledgeImportFiles(); closeKnowledgeNewMenu()"
+                                                    class="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-white/5 cursor-pointer transition-colors">
+                                                <i class="fas fa-file-arrow-up w-3.5 text-slate-400"></i><span data-i18n="knowledge_import_documents">导入文档</span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <input id="knowledge-import-input" type="file" class="hidden" multiple accept=".md,.txt,text/markdown,text/plain">
                                 </div>
                             </div>
 
@@ -797,12 +921,12 @@
                             </div>
 
                             <!-- Documents panel -->
-                            <div id="knowledge-panel-docs" class="hidden">
-                                <div class="flex flex-col md:flex-row gap-4 md:gap-6" style="min-height: calc(100vh - 220px)">
+                            <div id="knowledge-panel-docs" class="hidden md:flex-1 md:min-h-0">
+                                <div class="flex flex-col md:flex-row gap-4 md:gap-6 md:h-full">
                                     <!-- File tree -->
-                                    <div id="knowledge-sidebar" class="w-full md:w-72 lg:w-80 flex-shrink-0">
-                                        <div class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 overflow-hidden">
-                                            <div class="px-4 py-3 border-b border-slate-200 dark:border-white/10">
+                                    <div id="knowledge-sidebar" class="w-full md:w-72 lg:w-80 flex-shrink-0 md:h-full">
+                                        <div class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 overflow-hidden flex flex-col md:h-full">
+                                            <div class="px-4 py-3 border-b border-slate-200 dark:border-white/10 flex-shrink-0">
                                                 <div class="relative">
                                                     <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs"></i>
                                                     <input id="knowledge-search" type="text" placeholder="Search..."
@@ -810,19 +934,19 @@
                                                            oninput="filterKnowledgeTree(this.value)">
                                                 </div>
                                             </div>
-                                            <div id="knowledge-tree" class="p-2 overflow-y-auto max-h-[50vh] md:max-h-[calc(100vh-300px)]"></div>
+                                            <div id="knowledge-tree" class="p-2 overflow-y-auto flex-1 max-h-[50vh] md:max-h-none"></div>
                                         </div>
                                     </div>
                                     <!-- Content viewer -->
-                                    <div class="flex-1 min-w-0">
+                                    <div class="flex-1 min-w-0 md:h-full">
                                         <div id="knowledge-content-placeholder"
-                                             class="flex flex-col items-center justify-center py-20 text-slate-400 dark:text-slate-500">
+                                             class="flex flex-col items-center justify-center py-20 md:h-full text-slate-400 dark:text-slate-500 bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10">
                                             <i class="fas fa-file-lines text-3xl mb-3 opacity-40"></i>
                                             <p class="text-sm" data-i18n="knowledge_select_hint">选择一个文档查看</p>
                                         </div>
-                                        <div id="knowledge-content-viewer" class="hidden">
-                                            <div class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 overflow-hidden">
-                                                <div class="flex items-center gap-3 px-4 md:px-5 py-3 border-b border-slate-200 dark:border-white/10">
+                                        <div id="knowledge-content-viewer" class="hidden md:h-full">
+                                            <div class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 overflow-hidden flex flex-col md:h-full">
+                                                <div class="flex items-center gap-3 px-4 md:px-5 py-3 border-b border-slate-200 dark:border-white/10 flex-shrink-0">
                                                     <button onclick="knowledgeMobileBack()" class="md:hidden p-1 -ml-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 cursor-pointer">
                                                         <i class="fas fa-arrow-left text-xs"></i>
                                                     </button>
@@ -831,8 +955,7 @@
                                                     <span id="knowledge-viewer-path" class="text-xs text-slate-400 dark:text-slate-500 ml-auto font-mono truncate hidden md:inline"></span>
                                                 </div>
                                                 <div id="knowledge-viewer-body"
-                                                     class="p-4 md:p-5 overflow-y-auto text-sm msg-content text-slate-700 dark:text-slate-200"
-                                                     style="max-height: calc(100vh - 280px)"></div>
+                                                     class="p-4 md:p-5 overflow-y-auto flex-1 max-h-[60vh] md:max-h-none text-sm msg-content text-slate-700 dark:text-slate-200"></div>
                                             </div>
                                         </div>
                                     </div>
@@ -846,6 +969,41 @@
                                 </div>
                             </div>
 
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ====================================================== -->
+                <!-- VIEW: Models                                            -->
+                <!-- ====================================================== -->
+                <div id="view-models" class="view">
+                    <!-- Tailwind JIT safelist: capability-card icon colors are
+                         emitted from JS template strings. Listing them here
+                         (display:none) guarantees the CDN-side compiler picks
+                         them up regardless of render timing. -->
+                    <div class="hidden bg-blue-50 dark:bg-blue-900/30 text-blue-500
+                                       bg-orange-50 dark:bg-orange-900/30 text-orange-500
+                                       bg-purple-50 dark:bg-purple-900/30 text-purple-500
+                                       bg-amber-50 dark:bg-amber-900/30 text-amber-500
+                                       bg-primary-50 dark:bg-primary-900/30 text-primary-500"></div>
+                    <div class="flex-1 overflow-y-auto p-6">
+                        <div class="max-w-4xl mx-auto">
+                            <div class="flex items-center justify-between mb-6">
+                                <div>
+                                    <h2 class="text-xl font-bold text-slate-800 dark:text-slate-100" data-i18n="models_title">模型管理</h2>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 mt-1" data-i18n="models_desc">统一管理对话、视觉、语音、向量、图像、搜索能力</p>
+                                </div>
+                                <button id="models-add-vendor-btn" onclick="openVendorModal('')"
+                                        class="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600
+                                               text-white text-sm font-medium cursor-pointer transition-colors duration-150">
+                                    <i class="fas fa-plus text-xs"></i>
+                                    <span data-i18n="models_add_vendor">添加厂商</span>
+                                </button>
+                            </div>
+                            <div id="models-loading" class="flex items-center gap-2 py-12 justify-center text-slate-400 dark:text-slate-500 text-sm">
+                                <i class="fas fa-spinner fa-spin text-xs"></i><span>Loading...</span>
+                            </div>
+                            <div id="models-content" class="grid gap-6 hidden"></div>
                         </div>
                     </div>
                 </div>
@@ -884,6 +1042,14 @@
                                 <div>
                                     <h2 class="text-xl font-bold text-slate-800 dark:text-slate-100" data-i18n="tasks_title">定时任务</h2>
                                     <p class="text-sm text-slate-500 dark:text-slate-400 mt-1" data-i18n="tasks_desc">查看和管理定时任务</p>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <button id="task-refresh-btn" onclick="refreshTasksView()"
+                                            class="px-3 py-2 rounded-lg border border-slate-200 dark:border-white/10
+                                                   text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-white/5
+                                                   text-sm font-medium cursor-pointer transition-colors duration-150">
+                                        <i class="fas fa-refresh text-xs"></i>
+                                    </button>
                                 </div>
                             </div>
                             <div id="tasks-empty" class="flex flex-col items-center justify-center py-20">
@@ -958,8 +1124,64 @@
         </div><!-- /main-content -->
     </div><!-- /app -->
 
+    <!-- Knowledge Action Dialog -->
+    <div id="knowledge-dialog-overlay" class="fixed inset-0 bg-black/50 z-[200] hidden flex items-center justify-center">
+        <div id="knowledge-dialog-card" class="bg-white dark:bg-[#1A1A1A] rounded-2xl border border-slate-200 dark:border-white/10 shadow-xl w-full max-w-md mx-4">
+            <div class="p-6">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-emerald-50 dark:bg-emerald-900/20 flex items-center justify-center">
+                        <i id="knowledge-dialog-icon" class="fas fa-folder text-emerald-500"></i>
+                    </div>
+                    <div>
+                        <h3 id="knowledge-dialog-title" class="font-semibold text-slate-800 dark:text-slate-100"></h3>
+                        <p id="knowledge-dialog-subtitle" class="text-xs text-slate-400 dark:text-slate-500 mt-0.5"></p>
+                    </div>
+                </div>
+                <label id="knowledge-dialog-label" class="block text-sm font-medium text-slate-600 dark:text-slate-300 mb-1.5"></label>
+                <input id="knowledge-dialog-input" type="text"
+                       class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:border-primary-500">
+                <div id="knowledge-dialog-select" class="cfg-dropdown hidden w-full" tabindex="0">
+                    <div class="cfg-dropdown-selected">
+                        <span class="cfg-dropdown-text">--</span>
+                        <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                    </div>
+                    <div class="cfg-dropdown-menu"></div>
+                </div>
+                <textarea id="knowledge-dialog-textarea" rows="8"
+                          class="hidden w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:border-primary-500 font-mono resize-y"></textarea>
+                <div id="knowledge-document-form" class="hidden space-y-3">
+                    <div class="rounded-lg bg-emerald-50 dark:bg-emerald-900/15 border border-emerald-100 dark:border-emerald-800/40 px-3 py-2">
+                        <div id="knowledge-document-category-label" class="text-[11px] text-emerald-600 dark:text-emerald-400 mb-0.5"></div>
+                        <div id="knowledge-document-path-preview" class="text-xs font-mono text-emerald-700 dark:text-emerald-300 break-all"></div>
+                    </div>
+                    <div>
+                        <label id="knowledge-document-filename-label" class="block text-sm font-medium text-slate-600 dark:text-slate-300 mb-1.5"></label>
+                        <input id="knowledge-document-filename" type="text"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:border-primary-500"
+                               placeholder="note.md">
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1.5">
+                            <label id="knowledge-document-content-label" class="block text-sm font-medium text-slate-600 dark:text-slate-300"></label>
+                            <button id="knowledge-document-template" type="button" class="text-xs text-primary-500 hover:text-primary-600"></button>
+                        </div>
+                        <textarea id="knowledge-document-content" rows="14"
+                                  class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:border-primary-500 font-mono resize-y"
+                                  placeholder="# Title&#10;&#10;Write your notes here..."></textarea>
+                    </div>
+                </div>
+                <p id="knowledge-dialog-hint" class="mt-2 text-xs text-slate-400 dark:text-slate-500"></p>
+                <p id="knowledge-dialog-error" class="mt-2 text-xs text-red-500 hidden"></p>
+            </div>
+            <div class="flex justify-end gap-3 px-6 py-4 border-t border-slate-100 dark:border-white/5">
+                <button id="knowledge-dialog-cancel" class="px-4 py-2 rounded-lg border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 text-sm hover:bg-slate-50 dark:hover:bg-white/5">取消</button>
+                <button id="knowledge-dialog-submit" class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium disabled:opacity-50">确定</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Confirm Dialog -->
-    <div id="confirm-dialog-overlay" class="fixed inset-0 bg-black/50 z-[100] hidden flex items-center justify-center">
+    <div id="confirm-dialog-overlay" class="fixed inset-0 bg-black/50 z-[200] hidden flex items-center justify-center">
         <div class="bg-white dark:bg-[#1A1A1A] rounded-2xl border border-slate-200 dark:border-white/10 shadow-xl
                     w-full max-w-sm mx-4 overflow-hidden">
             <div class="p-6">
@@ -980,6 +1202,311 @@
                 <button id="confirm-dialog-ok"
                         class="px-4 py-2 rounded-lg bg-red-500 hover:bg-red-600 text-white text-sm font-medium
                                cursor-pointer transition-colors duration-150"></button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Vendor Credentials Modal -->
+    <div id="vendor-modal-overlay" class="fixed inset-0 bg-black/50 z-[100] hidden flex items-center justify-center">
+        <div class="bg-white dark:bg-[#1A1A1A] rounded-2xl border border-slate-200 dark:border-white/10 shadow-xl
+                    w-full max-w-md mx-4">
+            <div class="p-6">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-primary-50 dark:bg-primary-900/20 flex items-center justify-center flex-shrink-0">
+                        <i class="fas fa-key text-primary-500"></i>
+                    </div>
+                    <div class="min-w-0 flex-1">
+                        <h3 id="vendor-modal-title" class="font-semibold text-slate-800 dark:text-slate-100 text-base"></h3>
+                        <p id="vendor-modal-subtitle" class="text-xs text-slate-500 dark:text-slate-400 mt-0.5 font-mono"></p>
+                    </div>
+                </div>
+
+                <!-- Provider selector (only visible when adding via top button) -->
+                <div id="vendor-modal-picker-wrap" class="mb-4 hidden">
+                    <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5" data-i18n="models_provider">厂商</label>
+                    <div id="vendor-modal-picker" class="cfg-dropdown" tabindex="0">
+                        <div class="cfg-dropdown-selected">
+                            <span class="cfg-dropdown-text">--</span>
+                            <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                        </div>
+                        <div class="cfg-dropdown-menu"></div>
+                    </div>
+                </div>
+
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">API Key</label>
+                        <input id="vendor-modal-key" type="text" autocomplete="off" data-1p-ignore data-lpignore="true"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                      bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                      focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                               placeholder="sk-...">
+                    </div>
+                    <div id="vendor-modal-base-wrap">
+                        <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">API Base</label>
+                        <input id="vendor-modal-base" type="text"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                      bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                      focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                               placeholder="https://...../v1">
+                        <p id="vendor-modal-base-hint" class="mt-1.5 text-xs text-slate-400 dark:text-slate-500 hidden">
+                            <i class="fas fa-info-circle mr-1"></i><span data-i18n="models_base_default_hint">留空将使用官方默认地址</span>
+                        </p>
+                    </div>
+                </div>
+            </div>
+            <div class="flex items-center justify-between gap-3 px-6 py-4 border-t border-slate-100 dark:border-white/5 rounded-b-2xl">
+                <button id="vendor-modal-clear"
+                        class="px-3 py-2 rounded-lg text-xs
+                               text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20
+                               cursor-pointer transition-colors duration-150 hidden"
+                        data-i18n="models_clear_credential">清除凭据</button>
+                <span id="vendor-modal-status"
+                      class="flex-1 text-xs text-primary-500 opacity-0 transition-opacity duration-300 text-center"></span>
+                <button id="vendor-modal-cancel"
+                        class="px-4 py-2 rounded-lg border border-slate-200 dark:border-white/10
+                               text-slate-600 dark:text-slate-300 text-sm font-medium
+                               hover:bg-slate-50 dark:hover:bg-white/5
+                               cursor-pointer transition-colors duration-150"
+                        data-i18n="cancel">取消</button>
+                <button id="vendor-modal-save"
+                        class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
+                               cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                        data-i18n="save">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Provider Modal (multiple OpenAI-compatible providers) -->
+    <div id="custom-provider-modal-overlay" class="fixed inset-0 bg-black/50 z-[100] hidden flex items-center justify-center">
+        <div class="bg-white dark:bg-[#1A1A1A] rounded-2xl border border-slate-200 dark:border-white/10 shadow-xl
+                    w-full max-w-md mx-4">
+            <div class="p-6">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-primary-50 dark:bg-primary-900/20 flex items-center justify-center flex-shrink-0">
+                        <i class="fas fa-sliders text-primary-500"></i>
+                    </div>
+                    <div class="min-w-0 flex-1">
+                        <h3 id="custom-provider-modal-title" class="font-semibold text-slate-800 dark:text-slate-100 text-base"></h3>
+                    </div>
+                </div>
+
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5" data-i18n="models_custom_name">名称</label>
+                        <input id="custom-provider-name" type="text" autocomplete="off" data-1p-ignore data-lpignore="true"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                      bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                      focus:outline-none focus:border-primary-500 transition-colors">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">API Base</label>
+                        <input id="custom-provider-base" type="text"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                      bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                      focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                               placeholder="https://...../v1">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">API Key</label>
+                        <input id="custom-provider-key" type="text" autocomplete="off" data-1p-ignore data-lpignore="true"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                      bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                      focus:outline-none focus:border-primary-500 font-mono transition-colors">
+                    </div>
+                </div>
+            </div>
+            <div class="flex items-center justify-between gap-3 px-6 py-4 border-t border-slate-100 dark:border-white/5 rounded-b-2xl">
+                <button id="custom-provider-modal-delete"
+                        class="px-3 py-2 rounded-lg text-sm font-medium text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20
+                               cursor-pointer transition-colors duration-150 hidden"
+                        data-i18n="models_custom_delete">删除</button>
+                <span id="custom-provider-modal-status"
+                      class="flex-1 text-xs text-primary-500 opacity-0 transition-opacity duration-300 text-left"></span>
+                <button id="custom-provider-modal-cancel"
+                        class="px-4 py-2 rounded-lg border border-slate-200 dark:border-white/10
+                               text-slate-600 dark:text-slate-300 text-sm font-medium
+                               hover:bg-slate-50 dark:hover:bg-white/5
+                               cursor-pointer transition-colors duration-150"
+                        data-i18n="cancel">取消</button>
+                <button id="custom-provider-modal-save"
+                        class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
+                               cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                        data-i18n="save">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Task Edit Modal -->
+    <div id="task-edit-modal-overlay" class="fixed inset-0 bg-black/50 z-[100] hidden flex items-center justify-center">
+        <div class="bg-white dark:bg-[#1A1A1A] rounded-2xl border border-slate-200 dark:border-white/10 shadow-xl
+                    w-full max-w-2xl mx-4 max-h-[90vh] overflow-y-auto">
+            <div class="p-6">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-primary-50 dark:bg-primary-900/20 flex items-center justify-center flex-shrink-0">
+                        <i class="fas fa-clock text-primary-500"></i>
+                    </div>
+                    <div class="min-w-0 flex-1">
+                        <h3 class="font-semibold text-slate-800 dark:text-slate-100 text-base" data-i18n="task_edit_title">编辑定时任务</h3>
+                        <p id="task-edit-modal-subtitle" class="text-xs text-slate-500 dark:text-slate-400 mt-0.5 font-mono"></p>
+                    </div>
+                </div>
+
+                <div class="space-y-4">
+                    <!-- 任务名称和启用状态 -->
+                    <div class="flex gap-4 items-end">
+                        <div class="flex-1">
+                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                <span data-i18n="task_name">任务名称</span>
+                            </label>
+                            <input id="task-edit-name" type="text"
+                                   class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                          bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                          focus:outline-none focus:border-primary-500 transition-colors"
+                                   placeholder="任务名称">
+                        </div>
+                        <div class="flex items-center gap-2 pb-[2px]">
+                            <label class="text-xs font-medium text-slate-600 dark:text-slate-400">
+                                <span data-i18n="task_enabled">启用</span>
+                            </label>
+                            <label class="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" id="task-edit-enabled" class="sr-only peer">
+                                <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500 dark:bg-slate-600 dark:peer-checked:bg-primary-500"></div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- 调度类型 + 调度值 -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                <span data-i18n="task_schedule_type">调度类型</span>
+                            </label>
+                            <select id="task-edit-schedule-type"
+                                    class="w-full px-3 py-2 pr-8 rounded-lg border border-slate-200 dark:border-slate-600
+                                           bg-slate-50 dark:bg-[#1A1A1A] text-sm text-slate-800 dark:text-slate-100
+                                           focus:outline-none focus:border-primary-500 transition-colors
+                                           appearance-none bg-no-repeat bg-right"
+                                    style="background-image: url('data:image/svg+xml;charset=UTF-8,%3csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 20 20%27 fill=%27none%27%3e%3cpath d=%27M7 7l3 3 3-3%27 stroke=%27%23888%27 stroke-width=%272%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3e%3c/svg%3e'); background-position: right 0.5rem center; background-size: 1.25rem;">
+                                <option value="cron" data-i18n="task_schedule_cron">Cron 表达式</option>
+                                <option value="interval" data-i18n="task_schedule_interval">固定间隔</option>
+                                <option value="once" data-i18n="task_schedule_once">一次性任务</option>
+                            </select>
+                        </div>
+
+                        <!-- Cron 表达式 -->
+                        <div id="task-edit-cron-wrap">
+                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                <span data-i18n="task_cron_expression">Cron 表达式</span>
+                            </label>
+                            <input id="task-edit-cron-expression" type="text"
+                                   class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                          bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                          focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                                   placeholder="0 9 * * *">
+                        </div>
+
+                        <!-- 固定间隔 -->
+                        <div id="task-edit-interval-wrap" class="hidden">
+                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                <span data-i18n="task_interval_seconds">间隔秒数</span>
+                            </label>
+                            <input id="task-edit-interval-seconds" type="number" min="60"
+                                   class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                          bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                          focus:outline-none focus:border-primary-500 transition-colors"
+                                   placeholder="3600">
+                        </div>
+
+                        <!-- 一次性任务时间 -->
+                        <div id="task-edit-once-wrap" class="hidden">
+                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                <span data-i18n="task_once_time">执行时间</span>
+                            </label>
+                            <input id="task-edit-once-time" type="datetime-local" step="1"
+                                   class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                          bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                          focus:outline-none focus:border-primary-500 transition-colors
+                                          cursor-pointer"
+                                   onclick="this.showPicker && this.showPicker()">
+                        </div>
+                    </div>
+
+                    <!-- Cron/Interval 提示 -->
+                    <p id="task-edit-cron-hint" class="text-xs text-slate-400 dark:text-slate-500">
+                        <span data-i18n="task_cron_hint">格式: 分 时 日 月 周，例如 "0 9 * * *" 表示每天 9:00</span>
+                    </p>
+                    <p id="task-edit-interval-hint" class="text-xs text-slate-400 dark:text-slate-500 hidden">
+                        <span data-i18n="task_interval_hint">最小 60 秒，例如 3600 表示每小时执行一次</span>
+                    </p>
+
+                    <!-- 动作类型 + 通道类型 -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                <span data-i18n="task_action_type">动作类型</span>
+                            </label>
+                            <select id="task-edit-action-type"
+                                    class="w-full px-3 py-2 pr-8 rounded-lg border border-slate-200 dark:border-slate-600
+                                           bg-slate-50 dark:bg-[#1A1A1A] text-sm text-slate-800 dark:text-slate-100
+                                           focus:outline-none focus:border-primary-500 transition-colors
+                                           appearance-none bg-no-repeat bg-right"
+                                    style="background-image: url('data:image/svg+xml;charset=UTF-8,%3csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 20 20%27 fill=%27none%27%3e%3cpath d=%27M7 7l3 3 3-3%27 stroke=%27%23888%27 stroke-width=%272%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3e%3c/svg%3e'); background-position: right 0.5rem center; background-size: 1.25rem;">
+                                <option value="send_message" data-i18n="task_action_send_message">发送消息</option>
+                                <option value="agent_task" data-i18n="task_action_agent_task">AI 任务</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                <span data-i18n="task_channel_type">通道类型</span>
+                            </label>
+                            <select id="task-edit-channel-type"
+                                    class="w-full px-3 py-2 pr-8 rounded-lg border border-slate-200 dark:border-slate-600
+                                           bg-slate-50 dark:bg-[#1A1A1A] text-sm text-slate-800 dark:text-slate-100
+                                           focus:outline-none focus:border-primary-500 transition-colors
+                                           appearance-none bg-no-repeat bg-right
+                                           disabled:opacity-100 disabled:text-slate-800 dark:disabled:text-slate-300 disabled:bg-slate-100 dark:disabled:bg-[#252525] disabled:cursor-not-allowed"
+                                    style="background-image: url('data:image/svg+xml;charset=UTF-8,%3csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 20 20%27 fill=%27none%27%3e%3cpath d=%27M7 7l3 3 3-3%27 stroke=%27%23888%27 stroke-width=%272%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3e%3c/svg%3e'); background-position: right 0.5rem center; background-size: 1.25rem;">
+                            </select>
+                            <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">
+                                <span data-i18n="task_channel_hint">选择定时消息发送的通道</span>
+                            </p>
+                        </div>
+                    </div>
+
+                    <!-- 隐藏的接收者ID字段（自动填充） -->
+                    <input id="task-edit-receiver" type="hidden" value="">
+
+                    <!-- 消息内容/任务描述 -->
+                    <div>
+                        <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                            <span id="task-edit-content-label" data-i18n="task_message_content">消息内容</span>
+                        </label>
+                        <textarea id="task-edit-content" rows="3"
+                                  class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                         bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                         focus:outline-none focus:border-primary-500 transition-colors resize-none"
+                                  placeholder="输入消息内容或任务描述"></textarea>
+                    </div>
+                </div>
+            </div>
+            <div class="flex items-center justify-between gap-3 px-6 py-4 border-t border-slate-100 dark:border-white/5 rounded-b-2xl">
+                <button id="task-edit-modal-delete"
+                        class="px-4 py-2 rounded-lg text-sm font-medium text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20
+                               cursor-pointer transition-colors duration-150 hidden"
+                        data-i18n="task_delete_btn">删除任务</button>
+                <span id="task-edit-modal-status"
+                      class="flex-1 text-xs text-primary-500 opacity-0 transition-opacity duration-300 text-left"></span>
+                <button id="task-edit-modal-cancel"
+                        class="px-4 py-2 rounded-lg border border-slate-200 dark:border-white/10
+                               text-slate-600 dark:text-slate-300 text-sm font-medium
+                               hover:bg-slate-50 dark:hover:bg-white/5
+                               cursor-pointer transition-colors duration-150"
+                        data-i18n="cancel">取消</button>
+                <button id="task-edit-modal-save"
+                        class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
+                               cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                        data-i18n="save">保存</button>
             </div>
         </div>
     </div>

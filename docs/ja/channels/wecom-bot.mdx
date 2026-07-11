@@ -52,6 +52,20 @@ WeCom AI Bot を介して CowAgent を接続し、ダイレクトメッセージ
 
 設定後、プログラムを起動します。ログに `[WecomBot] Subscribe success` と表示されれば接続成功です。
 
+<Note>
+  ロングコネクションのほかに、**Webhook（HTTP コールバック）モード**にも対応しています。Bot 作成時に **URL コールバックを使用**を選択し、受信メッセージ URL を `http(s)://<ドメインまたはIP>:9892/wecombot` に設定して、その画面の Token と EncodingAESKey をコピーします。このモードは外部からアクセス可能なアドレスが必要で、ファイル送信とスケジュール配信には対応していないため、通常はロングコネクションを推奨します。対応する `config.json`：
+
+```json
+{
+  "channel_type": "wecom_bot",
+  "wecom_bot_mode": "webhook",
+  "wecom_bot_token": "YOUR_TOKEN",
+  "wecom_bot_encoding_aes_key": "YOUR_ENCODING_AES_KEY",
+  "wecom_bot_port": 9892
+}
+```
+</Note>
+
 ## 3. 対応機能
 
 | 機能 | 状態 |

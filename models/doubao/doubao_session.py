@@ -1,9 +1,10 @@
 from models.session_manager import Session
+from common import const
 from common.log import logger
 
 
 class DoubaoSession(Session):
-    def __init__(self, session_id, system_prompt=None, model="doubao-seed-2-0-pro-260215"):
+    def __init__(self, session_id, system_prompt=None, model=const.DOUBAO_SEED_2_1_PRO):
         super().__init__(session_id, system_prompt)
         self.model = model
         self.reset()

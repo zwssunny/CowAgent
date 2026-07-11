@@ -14,7 +14,9 @@ class Bridge(object):
     def __init__(self):
         self.btype = {
             "chat": const.OPENAI,
-            "voice_to_text": conf().get("voice_to_text", "openai"),
+            # Empty `voice_to_text` (the default in new configs) triggers
+            # the auto-pick below — see _auto_pick_voice_to_text for order.
+            "voice_to_text": conf().get("voice_to_text") or self._auto_pick_voice_to_text(),
             "text_to_voice": conf().get("text_to_voice", "google"),
             "translate": conf().get("translate", "baidu"),
         }
@@ -61,6 +63,10 @@ class Bridge(object):
             if model_type and model_type.startswith("deepseek"):
                 self.btype["chat"] = const.DEEPSEEK
 
+            # 小米 MiMo 系列模型，全部以 mimo- 开头
+            if model_type and model_type.startswith("mimo-"):
+                self.btype["chat"] = const.MIMO
+
             if model_type and isinstance(model_type, str):
                 lowered_model_type = model_type.lower()
                 if lowered_model_type == const.QIANFAN or lowered_model_type.startswith("ernie"):
@@ -83,6 +89,46 @@ class Bridge(object):
         self.bots = {}
         self.chat_bots = {}
         self._agent_bridge = None
+
+    def refresh_voice(self):
+        """Re-read voice_to_text / text_to_voice from config and drop the
+        cached voice bots so the next call picks up the new provider.
+        Used by the web console after the user edits voice settings.
+        Does NOT touch the agent_bridge / agent state.
+        """
+        new_v2t = conf().get("voice_to_text") or self._auto_pick_voice_to_text()
+        new_t2v = conf().get("text_to_voice", "google")
+        if conf().get("use_linkai") and conf().get("linkai_api_key"):
+            if not conf().get("voice_to_text") or conf().get("voice_to_text") in ["openai"]:
+                new_v2t = const.LINKAI
+            if not conf().get("text_to_voice") or conf().get("text_to_voice") in ["openai", const.TTS_1, const.TTS_1_HD]:
+                new_t2v = const.LINKAI
+        self.btype["voice_to_text"] = new_v2t
+        self.btype["text_to_voice"] = new_t2v
+        self.bots.pop("voice_to_text", None)
+        self.bots.pop("text_to_voice", None)
+        logger.info(f"[Bridge] voice refreshed: voice_to_text={new_v2t}, text_to_voice={new_t2v}")
+
+    @staticmethod
+    def _auto_pick_voice_to_text() -> str:
+        """Pick an ASR provider by configured api keys when voice_to_text is
+        unset. Order matches the web console: openai → dashscope → zhipu →
+        linkai. Falls back to 'openai' when nothing is configured so the
+        original "missing key" error is preserved.
+        """
+        def has(k: str) -> bool:
+            v = (conf().get(k) or "").strip()
+            return v != "" and v not in ("YOUR API KEY", "YOUR_API_KEY")
+
+        for key, provider in (
+            ("open_ai_api_key", "openai"),
+            ("dashscope_api_key", "dashscope"),
+            ("zhipu_ai_api_key", "zhipu"),
+            ("linkai_api_key", "linkai"),
+        ):
+            if has(key):
+                return provider
+        return "openai"
 
     # 模型对应的接口
     def get_bot(self, typename):

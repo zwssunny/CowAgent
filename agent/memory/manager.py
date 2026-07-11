@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from agent.memory.config import MemoryConfig, get_default_memory_config
 from agent.memory.storage import MemoryStorage, MemoryChunk, SearchResult
 from agent.memory.chunker import TextChunker
-from agent.memory.embedding import EmbeddingProvider
+from agent.memory.embedding import EmbeddingProvider, EmbeddingCache
 from agent.memory.summarizer import MemoryFlushManager, create_memory_files_if_needed
 
 
@@ -61,7 +61,11 @@ class MemoryManager:
             logger.info(
                 "[MemoryManager] No embedding provider; memory will use keyword search only"
             )
-        
+
+        # Cache for query embeddings (avoids redundant API calls within a session)
+        self._embedding_cache = EmbeddingCache()
+
+
         # Initialize memory flush manager
         workspace_dir = self.config.get_workspace()
         self.flush_manager = MemoryFlushManager(
@@ -128,7 +132,14 @@ class MemoryManager:
         vector_results = []
         if self.embedding_provider:
             try:
-                query_embedding = self.embedding_provider.embed_query(query)
+                provider_name = type(self.embedding_provider).__name__
+                model_name = getattr(self.embedding_provider, 'model', '')
+                cached = self._embedding_cache.get(query, provider_name, model_name)
+                if cached is not None:
+                    query_embedding = cached
+                else:
+                    query_embedding = self.embedding_provider.embed_query(query)
+                    self._embedding_cache.put(query, provider_name, model_name, query_embedding)
                 vector_results = self.storage.search_vector(
                     query_embedding=query_embedding,
                     user_id=user_id,

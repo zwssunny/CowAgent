@@ -4,6 +4,7 @@ Supports text files, images (jpg, png, gif, webp), and PDF files
 """
 
 import os
+import re
 from typing import Dict, Any
 from pathlib import Path
 
@@ -12,11 +13,17 @@ from agent.tools.utils.truncate import truncate_head, format_size, DEFAULT_MAX_L
 from common.utils import expand_path
 
 
+# Paths whose CONTENT mirrors the process environment (and thus any secrets
+# loaded from ~/.cow/.env). Reading them bypasses the env_config boundary.
+# Matches /proc/self/environ, /proc/thread-self/environ and /proc/<pid>/environ.
+_PROC_ENVIRON_RE = re.compile(r"^/proc/(\d+|self|thread-self)/environ$")
+
+
 class Read(BaseTool):
     """Tool for reading file contents"""
     
     name: str = "read"
-    description: str = f"Read or inspect file contents. For text/PDF files, returns content (truncated to {DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB). For images/videos/audio, returns metadata only (file info, size, type). Use offset/limit for large text files."
+    description: str = f"Read or inspect file contents. For text/PDF/Word/Excel/PPT files, returns content (truncated to {DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB). For images/videos/audio, returns metadata only (file info, size, type). Use offset/limit for large text files."
     
     params: dict = {
         "type": "object",
@@ -79,9 +86,9 @@ class Read(BaseTool):
         # Resolve path
         absolute_path = self._resolve_path(path)
         
-        # Security check: Prevent reading sensitive config files
-        env_config_path = expand_path("~/.cow/.env")
-        if os.path.abspath(absolute_path) == os.path.abspath(env_config_path):
+        # Security check: block credential files and their aliases.
+        # See issue #2913 (/proc/self/environ bypass) and #2863 (scope).
+        if self._is_credential_path(absolute_path):
             return ToolResult.fail(
                 "Error: Access denied. API keys and credentials must be accessed through the env_config tool only."
             )
@@ -140,7 +147,39 @@ class Read(BaseTool):
         if os.path.isabs(path):
             return path
         return os.path.abspath(os.path.join(self.cwd, path))
-    
+
+    def _is_credential_path(self, absolute_path: str) -> bool:
+        """Return True if *absolute_path* points at protected credential data.
+
+        Beyond the literal ~/.cow/.env file, this also blocks two real bypass
+        surfaces reported in issue #2913:
+          1. /proc/<pid|self|thread-self>/environ — a second view of the
+             process environment that leaks secrets loaded from ~/.cow/.env.
+          2. Symlinks resolving to ~/.cow/.env; the previous exact abspath
+             match kept the link target and could be bypassed.
+
+        Scope is kept deliberately narrow (only the credential file and its
+        environ aliases) so this does NOT re-broaden the block that #2863
+        intentionally narrowed to ~/.cow/.env.
+        """
+        # Compare on both the normalized path and the symlink-resolved path,
+        # in POSIX form so the /proc regex matches regardless of os.sep.
+        candidates = set()
+        try:
+            candidates.add(os.path.normpath(absolute_path).replace(os.sep, "/"))
+            candidates.add(os.path.realpath(absolute_path).replace(os.sep, "/"))
+        except OSError:
+            candidates.add(absolute_path.replace(os.sep, "/"))
+
+        # 1. /proc environ aliases (checked on raw and symlink-resolved forms).
+        for candidate in candidates:
+            if _PROC_ENVIRON_RE.match(candidate):
+                return True
+
+        # 2. The credential file itself, following symlinks on both sides.
+        env_real = os.path.realpath(expand_path("~/.cow/.env")).replace(os.sep, "/")
+        return env_real in candidates
+
     def _return_file_metadata(self, absolute_path: str, file_type: str, file_size: int) -> ToolResult:
         """
         Return file metadata for non-readable files (video, audio, binary, etc.)
@@ -258,8 +297,15 @@ class Read(BaseTool):
             if offset is not None:
                 if offset < 0:
                     # Negative offset: read from end
-                    # -20 means "last 20 lines" → start from (total - 20)
-                    start_line = max(0, total_file_lines + offset)
+                    # -20 means "last 20 lines" → start from (total - 20).
+                    # A file ending in "\n" produces a trailing empty element
+                    # from split('\n'); exclude it so offset=-1 returns the
+                    # real last line instead of the empty string after the
+                    # final newline (and -N returns N real lines).
+                    effective_lines = total_file_lines
+                    if all_lines and all_lines[-1] == '':
+                        effective_lines -= 1
+                    start_line = max(0, effective_lines + offset)
                 else:
                     # Positive offset: read from start (1-indexed)
                     start_line = max(0, offset - 1)  # Convert to 0-indexed

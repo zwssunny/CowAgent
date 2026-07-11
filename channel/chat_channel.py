@@ -10,6 +10,7 @@ from bridge.reply import *
 from channel.channel import Channel
 from common.dequeue import Dequeue
 from common import memory
+from common.i18n import t as _t
 from plugins import *
 
 try:
@@ -171,7 +172,13 @@ class ChatChannel(Channel):
             if "desire_rtype" not in context and conf().get("always_reply_voice") and ReplyType.VOICE not in self.NOT_SUPPORT_REPLYTYPE:
                 context["desire_rtype"] = ReplyType.VOICE
         elif context.type == ContextType.VOICE:
-            if "desire_rtype" not in context and conf().get("voice_reply_voice") and ReplyType.VOICE not in self.NOT_SUPPORT_REPLYTYPE:
+            # Voice input replies with voice when either voice_reply_voice
+            # (mirror voice) or the global always_reply_voice toggle is on.
+            if (
+                "desire_rtype" not in context
+                and (conf().get("voice_reply_voice") or conf().get("always_reply_voice"))
+                and ReplyType.VOICE not in self.NOT_SUPPORT_REPLYTYPE
+            ):
                 context["desire_rtype"] = ReplyType.VOICE
         return context
 
@@ -259,11 +266,13 @@ class ChatChannel(Channel):
                 if reply.type in self.NOT_SUPPORT_REPLYTYPE:
                     logger.error("[chat_channel]reply type not support: " + str(reply.type))
                     reply.type = ReplyType.ERROR
-                    reply.content = "不支持发送的消息类型: " + str(reply.type)
+                    reply.content = _t("不支持发送的消息类型: ", "Unsupported message type: ") + str(reply.type)
 
                 if reply.type == ReplyType.TEXT:
                     reply_text = reply.content
                     if desire_rtype == ReplyType.VOICE and ReplyType.VOICE not in self.NOT_SUPPORT_REPLYTYPE:
+                        # Preserve original text for the "text-then-voice" pattern in _send_reply.
+                        context["voice_reply_text"] = reply.content
                         reply = super().build_text_to_voice(reply.content)
                         return self._decorate_reply(context, reply)
                     if context.get("isgroup", False):
@@ -309,6 +318,15 @@ class ChatChannel(Channel):
                     text_reply = Reply(ReplyType.TEXT, reply.text_content)
                     self._send(text_reply, context)
                     # 短暂延迟后发送图片
+                    time.sleep(0.3)
+                    self._send(reply, context)
+                # Send text bubble before voice, unless channel already streamed
+                # the text (feishu) or natively renders STT under the voice (wechatcom).
+                elif reply.type == ReplyType.VOICE and context.get("voice_reply_text") \
+                        and not context.get("feishu_streamed") \
+                        and context.get("channel_type") not in ("wechatcom_app",):
+                    text_reply = Reply(ReplyType.TEXT, context.get("voice_reply_text"))
+                    self._send(text_reply, context)
                     time.sleep(0.3)
                     self._send(reply, context)
                 else:
@@ -421,8 +439,21 @@ class ChatChannel(Channel):
 
         return func
 
+    # Chat commands that must bypass the per-session serial queue,
+    # otherwise /cancel would queue behind the task it tries to cancel.
+    # Use /cancel (not /stop) to avoid colliding with `cow stop` CLI.
+    _BYPASS_QUEUE_COMMANDS = ("/cancel",)
+
     def produce(self, context: Context):
         session_id = context["session_id"]
+
+        # Fast path: /cancel must not enter the queue.
+        if context.type == ContextType.TEXT and context.content:
+            stripped = context.content.strip().lower()
+            if stripped in self._BYPASS_QUEUE_COMMANDS:
+                self._handle_cancel_command(context, session_id)
+                return
+
         with self.lock:
             if session_id not in self.sessions:
                 self.sessions[session_id] = [
@@ -433,6 +464,29 @@ class ChatChannel(Channel):
                 self.sessions[session_id][0].putleft(context)  # 优先处理管理命令
             else:
                 self.sessions[session_id][0].put(context)
+
+    def _handle_cancel_command(self, context: Context, session_id: str) -> None:
+        """Cancel any in-flight agent run for *session_id* and reply inline.
+
+        Runs synchronously on the caller's thread. Reply is sent through
+        _send_reply so plugins (e.g. logging) still observe it.
+        """
+        try:
+            from agent.protocol import get_cancel_registry
+            from bridge.reply import Reply, ReplyType
+
+            cancelled = get_cancel_registry().cancel_session(session_id)
+            text = (
+                _t("🛑 已中止", "🛑 Cancelled")
+                if cancelled > 0
+                else _t("当前没有可中止的任务。", "Nothing to cancel.")
+            )
+            logger.info(
+                f"[chat_channel] /cancel fast-path: session={session_id}, cancelled={cancelled}"
+            )
+            self._send_reply(context, Reply(ReplyType.TEXT, text))
+        except Exception as e:
+            logger.warning(f"[chat_channel] /cancel fast-path failed: {e}")
 
     # 消费者函数，单独线程，用于从消息队列中取出消息并处理
     def consume(self):
@@ -465,7 +519,10 @@ class ChatChannel(Channel):
     def cancel_session(self, session_id):
         with self.lock:
             if session_id in self.sessions:
-                for future in self.futures[session_id]:
+                # futures[session_id] is only created in consume() when a task is
+                # dispatched, so it may be absent if cancel happens right after
+                # produce() but before the first dispatch. Default to [].
+                for future in self.futures.get(session_id, []):
                     future.cancel()
                 cnt = self.sessions[session_id][0].qsize()
                 if cnt > 0:
@@ -475,7 +532,7 @@ class ChatChannel(Channel):
     def cancel_all_session(self):
         with self.lock:
             for session_id in self.sessions:
-                for future in self.futures[session_id]:
+                for future in self.futures.get(session_id, []):
                     future.cancel()
                 cnt = self.sessions[session_id][0].qsize()
                 if cnt > 0:

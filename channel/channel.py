@@ -73,7 +73,7 @@ class Channel(object):
         Build reply content, using agent if enabled in config
         """
         # Check if agent mode is enabled
-        use_agent = conf().get("agent", False)
+        use_agent = conf().get("agent", True)
 
         if use_agent:
             try:

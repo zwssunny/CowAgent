@@ -15,13 +15,22 @@ Launch modes (configured under `tools.browser` in config.json):
   - fresh: Set `persistent` to false to fall back to a clean context every run.
 """
 
+import ipaddress
 import json
 import os
+import socket
 from typing import Dict, Any, Optional
+from urllib.parse import urlparse
 
 from agent.tools.base_tool import BaseTool, ToolResult
 from agent.tools.browser.browser_service import BrowserService
 from common.log import logger
+
+
+# Cloud-metadata endpoints worth blocking even though they are not link-local.
+# (169.254.169.254 — AWS/GCP/Azure IMDS — is already covered by is_link_local;
+# fd00:ec2::254 is the AWS IPv6 IMDS address.)
+_CLOUD_METADATA_IPS = frozenset({ipaddress.ip_address("fd00:ec2::254")})
 
 
 class BrowserTool(BaseTool):
@@ -121,6 +130,61 @@ class BrowserTool(BaseTool):
         BrowserTool._shared_service = self._service
         return self._service
 
+    def _allow_private_targets(self) -> bool:
+        """Whether the link-local / cloud-metadata guard is disabled.
+
+        Defaults to False (guard active). Loopback and RFC1918/LAN targets are
+        always reachable so local dev servers work out of the box; this opt-out
+        only lifts the remaining block on link-local / cloud-metadata targets,
+        for an operator who deliberately needs them, by setting
+        ``allow_private_targets: true`` under ``tools.browser`` in config.json.
+        """
+        return bool(self.config.get("allow_private_targets", False))
+
+    @staticmethod
+    def _validate_url_safe(url: str) -> None:
+        """Reject URLs that target link-local / cloud-metadata addresses (SSRF guard).
+
+        Resolves the hostname to its IP address(es) and blocks any that are
+        link-local (169.254.0.0/16 — which includes the 169.254.169.254
+        cloud-metadata endpoint — and IPv6 fe80::/10) or a known IPv6
+        cloud-metadata address. Also rejects URLs with no host, non-HTTP(S)
+        schemes, or hosts that fail DNS resolution.
+
+        Loopback and RFC1918/LAN targets are intentionally left reachable:
+        unlike the vision/web_fetch tools, the browser legitimately opens local
+        pages (a dev server on ``localhost`` / ``127.0.0.1`` / a LAN IP), so a
+        blanket "block all internal" policy would break that core workflow.
+
+        Raises:
+            ValueError: if the URL targets a disallowed address.
+        """
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
+
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("URL has no hostname")
+
+        try:
+            # Resolve all addresses for the hostname.
+            addr_infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror:
+            raise ValueError(f"Cannot resolve hostname: {hostname}")
+
+        for family, _, _, _, sockaddr in addr_infos:
+            ip_str = sockaddr[0]
+            ip = ipaddress.ip_address(ip_str)
+            # Block only the high-risk targets — link-local (incl. the
+            # 169.254.169.254 cloud-metadata endpoint) and the IPv6 metadata
+            # address. Loopback and RFC1918/LAN stay reachable for local dev.
+            if ip.is_link_local or ip in _CLOUD_METADATA_IPS:
+                raise ValueError(
+                    f"URL resolves to a link-local / cloud-metadata address "
+                    f"({ip_str}), request blocked for security"
+                )
+
     def execute(self, args: Dict[str, Any]) -> ToolResult:
         action = args.get("action", "").strip().lower()
         if not action:
@@ -145,8 +209,19 @@ class BrowserTool(BaseTool):
         url = args.get("url", "").strip()
         if not url:
             return ToolResult.fail("Error: 'url' is required for navigate action")
-        if not url.startswith(("http://", "https://")):
+        # Only auto-prepend https:// for bare hosts; preserve file://, about:, data:, etc.
+        if "://" not in url and not url.startswith(("about:", "data:")):
             url = "https://" + url
+        # SSRF guard: for http(s) targets, reject hosts that resolve to
+        # link-local / cloud-metadata addresses before the browser navigates
+        # (and then auto-snapshots the page back to the model). Loopback and
+        # RFC1918/LAN are allowed so local dev servers work. Non-HTTP schemes
+        # (about:/data:/file:/chrome:) are not network-egress targets here.
+        if url.split(":", 1)[0].lower() in ("http", "https") and not self._allow_private_targets():
+            try:
+                self._validate_url_safe(url)
+            except ValueError as e:
+                return ToolResult.fail(f"Error: {e}")
         timeout = args.get("timeout", 30000)
         service = self._get_service()
         result = service.navigate(url, timeout=timeout)

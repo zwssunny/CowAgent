@@ -57,6 +57,14 @@ class Role(Plugin):
                             logger.warning(f"[Role] unknown tag {tag} ")
                             self.tags[tag] = (tag, [])
                         self.tags[tag][1].append(role)
+
+                # 扫描 roles/ 目录，加载可选的扩展/覆盖角色文件
+                roles_dir = os.path.join(curdir, "roles")
+                if os.path.isdir(roles_dir):
+                    for fname in sorted(os.listdir(roles_dir)):
+                        if fname.endswith(".json"):
+                            self._load_role_file(os.path.join(roles_dir, fname))
+
                 for tag in list(self.tags.keys()):
                     if len(self.tags[tag][1]) == 0:
                         logger.debug(f"[Role] no role found for tag {tag} ")
@@ -73,6 +81,27 @@ class Role(Plugin):
             else:
                 logger.warn("[Role] init failed, ignore or see https://github.com/zhayujie/chatgpt-on-wechat/tree/master/plugins/role .")
             raise e
+
+    def _load_role_file(self, filepath):
+        """从roles/目录加载单个角色文件，同title则覆盖内置角色，否则追加"""
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                role = json.load(f)
+            title_lower = role["title"].lower()
+            if title_lower in self.roles:
+                old_tags = self.roles[title_lower].get("tags", [])
+                for tag in old_tags:
+                    if tag in self.tags:
+                        self.tags[tag][1] = [r for r in self.tags[tag][1] if r["title"].lower() != title_lower]
+                logger.info(f"[Role] overridden: {role['title']}")
+            self.roles[title_lower] = role
+            for tag in role.get("tags", []):
+                if tag not in self.tags:
+                    self.tags[tag] = (tag, [])
+                self.tags[tag][1].append(role)
+            logger.debug(f"[Role] loaded: {role['title']} from {os.path.basename(filepath)}")
+        except Exception as e:
+            logger.warn(f"[Role] failed to load {filepath}: {e}")
 
     def get_role(self, name, find_closest=True, min_sim=0.35):
         name = name.lower()
