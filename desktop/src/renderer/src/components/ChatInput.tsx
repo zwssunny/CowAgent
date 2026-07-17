@@ -53,6 +53,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     { cmd: '/memory dream ', desc: t('slash_memory_dream') },
     { cmd: '/knowledge', desc: t('slash_knowledge') },
     { cmd: '/knowledge list', desc: t('slash_knowledge_list') },
+    { cmd: '/install-browser', desc: t('slash_install_browser') },
     { cmd: '/config', desc: t('slash_config') },
     { cmd: '/cancel', desc: t('slash_cancel') },
     { cmd: '/logs', desc: t('slash_logs') },

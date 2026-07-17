@@ -49,6 +49,19 @@ const formatSize = (bytes: number): string => {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
 }
 
+// The viewer already shows the doc title above the body, so a leading `# H1`
+// that repeats it looks duplicated. Drop that first H1 (and any blank lines
+// right after it) when it matches the title; leave the body untouched otherwise.
+function stripDuplicateH1(content: string, title: string): string {
+  if (!content) return content
+  const norm = (s: string) => s.trim().toLowerCase()
+  // Skip a leading blank/whitespace region, then match the first `# heading`.
+  const m = content.match(/^\s*#\s+(.+?)\s*(?:\r?\n|$)/)
+  if (!m) return content
+  if (norm(m[1]) !== norm(title)) return content
+  return content.slice(m[0].length).replace(/^\s*\r?\n/, '')
+}
+
 // Flatten the tree into category paths (for destination selectors).
 function categoryPaths(dirs: KnowledgeDir[], parent = ''): string[] {
   const paths: string[] = []
@@ -103,6 +116,48 @@ function firstFile(list: KnowledgeList): { path: string; title: string } | null 
     if (hit) return hit
   }
   return null
+}
+
+// Find a document by its bare filename anywhere in the tree (root files first,
+// then a DFS). Used to resolve relative `../foo.md` links from index docs.
+function findFileByName(list: KnowledgeList, filename: string): { path: string; title: string } | null {
+  for (const f of list.root_files || []) {
+    if (f.name === filename) return { path: f.name, title: f.title || f.name }
+  }
+  const walk = (dir: KnowledgeDir, prefix: string): { path: string; title: string } | null => {
+    const dirPath = prefix ? `${prefix}/${dir.dir}` : dir.dir
+    for (const f of dir.files) {
+      if (f.name === filename) return { path: `${dirPath}/${f.name}`, title: f.title || f.name }
+    }
+    for (const c of dir.children) {
+      const hit = walk(c, dirPath)
+      if (hit) return hit
+    }
+    return null
+  }
+  for (const d of list.tree || []) {
+    const hit = walk(d, '')
+    if (hit) return hit
+  }
+  return null
+}
+
+// Resolve a relative `.md` link (from a document body) into a knowledge path.
+// Mirrors the web console's bindChatKnowledgeLinks logic: supports
+// `knowledge/…/x.md`, `category/x.md`, and bare/relative `../x.md` (by name).
+function resolveKnowledgeLink(list: KnowledgeList, href: string): { path: string; title: string } | null {
+  const clean = href.split('#')[0].split('?')[0]
+  if (!clean.endsWith('.md')) return null
+  if (clean.startsWith('knowledge/')) {
+    const path = clean.replace(/^knowledge\//, '')
+    return { path, title: findTitle(list, path) }
+  }
+  if (/^[a-z0-9_-]+\/[a-z0-9_.-]+\.md$/i.test(clean) && !clean.startsWith('/') && !clean.startsWith('.')) {
+    return { path: clean, title: findTitle(list, clean) }
+  }
+  // Relative/other path: fall back to matching by filename.
+  const filename = clean.split('/').pop() || clean
+  return findFileByName(list, filename)
 }
 
 // Resolve a document's display title from its path, falling back to the stem.
@@ -167,13 +222,24 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
     setContent('')
     try {
       const res = await apiClient.readKnowledge(path)
-      setContent(res.content || '')
+      setContent(stripDuplicateH1(res.content || '', title))
     } catch {
       setContent(`> ${t('knowledge_doc_load_error')}`)
     } finally {
       setDocLoading(false)
     }
   }, [])
+
+  // Open an internal knowledge link (relative `.md`) from within a doc body.
+  // Falls back silently when the target can't be resolved in the current tree.
+  const openInternalLink = useCallback(
+    (href: string) => {
+      if (!data) return
+      const hit = resolveKnowledgeLink(data, href)
+      if (hit) void openDoc(hit.path, hit.title)
+    },
+    [data, openDoc]
+  )
 
   // Reload the tree. When targetPath is given, open it; otherwise keep the
   // currently open doc (or open the first one on the initial load).
@@ -519,7 +585,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
                     <Loader2 size={16} className="animate-spin mr-2" />
                   </div>
                 ) : (
-                  <Markdown content={content} />
+                  <Markdown content={content} onInternalLink={openInternalLink} />
                 )}
               </div>
             )}

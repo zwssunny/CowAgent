@@ -105,6 +105,14 @@ hiddenimports += collect_submodules('docx')
 hiddenimports += collect_submodules('pptx')
 hiddenimports += collect_submodules('openpyxl')
 
+# Playwright powers the browser tool. Only the pure-Python package + its bundled
+# Node driver are shipped (~10-15MB); the ~150MB Chromium binary is NOT bundled
+# and is either satisfied by the user's system Chrome/Edge (preferred, zero
+# download) or downloaded on demand into ~/.cow/ms-playwright at first use.
+# Playwright imports its transport/driver lazily, so list submodules explicitly.
+hiddenimports += ['playwright', 'playwright.sync_api', 'playwright._impl']
+hiddenimports += collect_submodules('playwright')
+
 # --- Data files -----------------------------------------------------------
 # Runtime-read files/dirs that must travel with the executable. Paths are
 # (source, dest_dir_in_bundle).
@@ -134,6 +142,12 @@ datas += collect_data_files('tiktoken_ext', include_py_files=False)
 datas += collect_data_files('docx')
 datas += collect_data_files('pptx')
 
+# Playwright ships its Node.js driver + package.json under playwright/driver/.
+# These are NOT Python modules, so hiddenimports won't pull them in — collect
+# them as data or `playwright install` / launching fails in the frozen build.
+# include_py_files=True is required: the driver dir contains .py entrypoints.
+datas += collect_data_files('playwright', include_py_files=True)
+
 # --- Excludes -------------------------------------------------------------
 # Keep the bundle lean: drop Feishu's heavy SDK, plugins (disabled in desktop
 # mode), tests/docs, and dev-only packages.
@@ -143,7 +157,10 @@ excludes = [
     'pip',
     'wheel',
     'pytest',
-    'playwright',         # browser tool is opt-in, not bundled
+    # NOTE: playwright is now BUNDLED (pure-Python package + Node driver, ~10-15MB)
+    # so the browser tool works out of the box on desktop. The heavy Chromium
+    # binary is still NOT bundled: it comes from the user's system Chrome/Edge or
+    # is downloaded on demand into ~/.cow/ms-playwright. See browser_env.py.
 ]
 
 block_cipher = None

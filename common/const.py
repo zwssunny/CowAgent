@@ -30,7 +30,7 @@ CLAUDE_35_SONNET = "claude-3-5-sonnet-latest"  # "latest" tag always points to t
 CLAUDE_35_SONNET_1022 = "claude-3-5-sonnet-20241022"  # dated name pinned to a specific release
 CLAUDE_35_SONNET_0620 = "claude-3-5-sonnet-20240620"
 CLAUDE_4_OPUS = "claude-opus-4-0"
-CLAUDE_FABLE_5 = "claude-fable-5"        # Claude Fable 5 (often restricted by policy)
+CLAUDE_FABLE_5 = "claude-fable-5"        # Claude Fable 5 - alternative Claude 5 flagship
 CLAUDE_4_8_OPUS = "claude-opus-4-8"      # Claude Opus 4.8 - Agent recommended model
 CLAUDE_4_7_OPUS = "claude-opus-4-7"      # Claude Opus 4.7
 CLAUDE_4_6_OPUS = "claude-opus-4-6"      # Claude Opus 4.6
@@ -80,6 +80,9 @@ GPT_54 = "gpt-5.4"  # GPT-5.4 - Agent recommended model
 GPT_54_MINI = "gpt-5.4-mini"
 GPT_54_NANO = "gpt-5.4-nano"
 GPT_55 = "gpt-5.5"  # GPT-5.5 - top-tier (expensive), not default
+GPT_56_LUNA = "gpt-5.6-luna"    # GPT-5.6 Luna - default flagship model for GPT
+GPT_56_TERRA = "gpt-5.6-terra"  # GPT-5.6 Terra
+GPT_56_SOL = "gpt-5.6-sol"      # GPT-5.6 Sol - highest intelligence, higher latency
 O1 = "o1-preview"
 O1_MINI = "o1-mini"
 WHISPER_1 = "whisper-1"
@@ -200,7 +203,7 @@ MODEL_LIST = [
               MIMO, MIMO_V2_5_PRO, MIMO_V2_5, MIMO_V2_PRO, MIMO_V2_OMNI, MIMO_V2_FLASH,
 
               # Claude
-              CLAUDE_SONNET_5, CLAUDE3, CLAUDE_4_8_OPUS, CLAUDE_4_7_OPUS, CLAUDE_FABLE_5, CLAUDE_4_6_SONNET, CLAUDE_4_6_OPUS, CLAUDE_4_OPUS, CLAUDE_4_5_SONNET, CLAUDE_4_SONNET, CLAUDE_3_OPUS, CLAUDE_3_OPUS_0229,
+              CLAUDE_SONNET_5, CLAUDE_FABLE_5, CLAUDE3, CLAUDE_4_8_OPUS, CLAUDE_4_7_OPUS, CLAUDE_4_6_SONNET, CLAUDE_4_6_OPUS, CLAUDE_4_OPUS, CLAUDE_4_5_SONNET, CLAUDE_4_SONNET, CLAUDE_3_OPUS, CLAUDE_3_OPUS_0229,
               CLAUDE_35_SONNET, CLAUDE_35_SONNET_1022, CLAUDE_35_SONNET_0620, CLAUDE_3_SONNET, CLAUDE_3_HAIKU,
               "claude", "claude-3-haiku", "claude-3-sonnet", "claude-3-opus", "claude-3.5-sonnet",
 
@@ -214,6 +217,7 @@ MODEL_LIST = [
               GPT4_TURBO, GPT4_TURBO_PREVIEW, GPT4_TURBO_01_25, GPT4_TURBO_11_06, GPT4_TURBO_04_09,
               GPT_4o, GPT_4O_0806, GPT_4o_MINI,
               GPT_41, GPT_41_MINI, GPT_41_NANO,
+              GPT_56_LUNA, GPT_56_TERRA, GPT_56_SOL,
               GPT_5, GPT_5_MINI, GPT_5_NANO,
               GPT_54, GPT_55, GPT_54_MINI, GPT_54_NANO,
               O1, O1_MINI,

@@ -1,5 +1,6 @@
 import { app, BrowserWindow } from 'electron'
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
 // electron-updater is CommonJS: its members live on module.exports, with no
 // meaningful default export. Under module=commonjs + esModuleInterop, a named
@@ -19,12 +20,26 @@ export type UpdateStatus =
 
 let getWindow: () => BrowserWindow | null = () => null
 
+// Legacy Windows (7/8/8.1) runs the separate Electron-22 build, which must
+// update to OTHER legacy builds — never the standard build (Electron 33 won't
+// launch on Win7). The update Function serves that build under /update/legacy/.
+// We detect the old OS at runtime (os.release() reports the Windows NT version:
+// 6.1 = Win7, 6.2/6.3 = Win8/8.1, 10.x = Win10/11) rather than via a build
+// flag, so the same source serves the right feed on whatever it runs on.
+function isLegacyWindows(): boolean {
+  if (process.platform !== 'win32') return false
+  const major = Number((os.release() || '').split('.')[0])
+  // NT 6.x = Win7/8/8.1; NT 10.x = Win10/11. Old = major < 10.
+  return Number.isFinite(major) && major < 10
+}
+
 // The update feed. Both entries hit the same Pages Function
 // (https://cowagent.ai/update/); the ?lang=zh query tells it to 302 installer
 // downloads to the China CDN mirror instead of R2. The feed metadata is
 // identical either way, so we can freely switch the feed URL between attempts
-// to fall back from one download origin to the other.
-const FEED_BASE = 'https://cowagent.ai/update/'
+// to fall back from one download origin to the other. Legacy Windows appends a
+// /legacy/ segment so it gets the win-legacy release instead of the standard.
+const FEED_BASE = 'https://cowagent.ai/update/' + (isLegacyWindows() ? 'legacy/' : '')
 const feedUrlFor = (china: boolean) => (china ? `${FEED_BASE}?lang=zh` : FEED_BASE)
 
 // Which origin the current session prefers, derived from the app UI language

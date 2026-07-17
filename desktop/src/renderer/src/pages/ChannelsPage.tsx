@@ -13,6 +13,7 @@ import {
   Headset,
   Hash,
   AtSign,
+  RadioTower,
 } from 'lucide-react'
 import { t, localizedLabel } from '../i18n'
 import apiClient from '../api/client'
@@ -147,7 +148,25 @@ const ChannelsPage: React.FC<ChannelsPageProps> = ({ baseUrl }) => {
           ) : (
             <div className="space-y-3">
               {connected.length === 0 && !addOpen ? (
-                <p className="text-sm text-content-tertiary py-2">{t('channels_empty_connected')}</p>
+                <div className="flex flex-col items-center justify-center text-center py-16 px-6">
+                  <span className="w-16 h-16 rounded-2xl bg-info/10 flex items-center justify-center mb-4">
+                    <RadioTower size={26} className="text-info" />
+                  </span>
+                  <p className="text-content-secondary font-medium">{t('channels_empty')}</p>
+                  <p className="text-sm text-content-tertiary mt-1.5 max-w-sm leading-relaxed">
+                    {t('channels_empty_desc')}
+                  </p>
+                  {available.length > 0 && (
+                    <div className="mt-5">
+                      <Btn variant="primary" onClick={openAdd}>
+                        <span className="flex items-center gap-1.5">
+                          <Plus size={15} />
+                          {t('channels_add')}
+                        </span>
+                      </Btn>
+                    </div>
+                  )}
+                </div>
               ) : (
                 connected.map((ch) => <ChannelCard key={ch.name} channel={ch} onChanged={loadChannels} />)
               )}

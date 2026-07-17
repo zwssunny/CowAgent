@@ -37,6 +37,7 @@ Fully compatible with the MCP community standard, identical to Claude Desktop / 
 | `url` | SSE / Streamable HTTP | Remote endpoint URL (alternative to `command`) |
 | `type` | Remote | Remote transport type: `sse` or `streamable-http` (defaults to `sse`) |
 | `headers` | No | Extra HTTP headers for remote requests (e.g. `Authorization`); Streamable HTTP only |
+| `scope` | No | OAuth scope, only for remote servers that require OAuth authorization (optional) |
 | `disabled` | No | When `true`, this server is skipped — handy for temporary disabling |
 
 ### Full Example
@@ -78,6 +79,27 @@ The Agent will:
 
 1. Read the existing MCP config and merge the new server entry, preserving existing ones
 2. Hot-reload the new MCP server, so the corresponding tools become available on the next message
+
+## Web Authorization (OAuth)
+
+Some remote MCP servers require OAuth web authorization, and connecting to them directly returns `401`. CowAgent has a built-in standard OAuth flow, so **no manual token is needed** — just configure the server normally, for example:
+
+```json
+{
+  "mcpServers": {
+    "xmind": {
+      "type": "streamable-http",
+      "url": "https://app.xmind.com/api/mcp"
+    }
+  }
+}
+```
+
+When a server returns `401` on its first load, authorization starts automatically: running locally **opens the browser automatically**, while server deployments **print the authorization link to the log** for you to open in a browser. Once you approve, the server comes online immediately; tokens are refreshed automatically on expiry, so you never have to re-authorize.
+
+- **Requires the web service**: The authorization callback is received by the web console (default port `9899`), so the Web channel must be running.
+- **Credential storage**: Tokens are persisted in `~/.cow/mcp_oauth.json` and reused across restarts.
+- **Callback URL**: Defaults to `http://127.0.0.1:9899/mcp/oauth/callback`. If deployed on a server with the authorizing browser on another device, set `mcp_oauth_redirect_base` in `config.json` (e.g. `http://YOUR_IP:9899`).
 
 ## How It Works
 

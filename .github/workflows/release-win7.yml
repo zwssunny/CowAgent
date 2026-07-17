@@ -1,0 +1,230 @@
+name: Release Desktop (Win7 legacy)
+
+# One-off / on-demand build for legacy Windows 7 / 8 / 8.1 users.
+#
+# The main release pipeline (release.yml) ships Electron 33 (Chromium 130+) and
+# a PyInstaller backend built with Python 3.11 — NEITHER runs on Windows 7,
+# which is why those users hit "不是有效的 Win32 应用程序" when launching the exe.
+#
+# To support Win7 we must pin BOTH halves to the last versions that still
+# target it:
+#   - Electron 22.3.27  (Chromium 108, last major to support Win7/8/8.1)
+#   - Python  3.8        (last CPython to support Win7)
+#
+# This is a SEPARATE, manually-triggered workflow so it never disturbs the main
+# matrix. It produces a (signed, when SIGNTOOL_* secrets exist) NSIS installer,
+# then — exactly like the main pipeline — uploads it to R2 and registers a
+# release row in D1 as platform=win-legacy with is_latest=0 (UNPUBLISHED: it
+# stays invisible until promoted, so it can't accidentally get served to Win10
+# users). Because it's stamped with the SAME version as the standard release,
+# the download page shows both Windows builds under one version row, and the
+# /update feed serves each build to its own clients. Delete this file whenever
+# legacy Windows support is no longer worth maintaining — the main pipeline is
+# unaffected.
+#
+# IMPORTANT for end users: Win7 must have SP1 + update KB2533623 (or the rollup
+# KB4457144) installed, otherwise the Python 3.8 backend still fails to start.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp — MUST match the standard release (e.g. 2.1.3), so the download page merges both Windows builds into one version row."
+        type: string
+        default: "0.0.0"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64 (Win7 legacy)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Python 3.8 is the last CPython that supports Windows 7. A backend built
+      # with it (via PyInstaller) still runs on Win7 even though the CI host is
+      # Server 2022 — PyInstaller's bootloader targets the interpreter's minimum
+      # OS, not the build machine's.
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build Python backend (PyInstaller, Python 3.8)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Most deps are unpinned, so pip auto-picks the newest Python-3.8 wheel.
+          # But a few are pinned to versions with NO 3.8 wheel and must be relaxed
+          # for this legacy build. We rewrite them into a throwaway requirements
+          # file so the repo's source stays untouched (main pipeline keeps its
+          # pins). playwright 1.48.0 is the last release with a cp38 wheel.
+          sed 's/^playwright==.*/playwright==1.48.0/' \
+            desktop/build/requirements-desktop.txt > /tmp/requirements-win7.txt
+          pip install -r /tmp/requirements-win7.txt
+          pip install pyinstaller
+          # Run from repo root so the spec's relative datas resolve correctly.
+          pyinstaller desktop/build/cowagent-backend.spec \
+            --noconfirm \
+            --distpath desktop/build/dist \
+            --workpath desktop/build/build-work
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: Write version into package.json
+        working-directory: desktop
+        shell: bash
+        run: npm version "${{ github.event.inputs.version }}" --no-git-tag-version --allow-same-version
+
+      # Downgrade Electron to the last Win7-capable major (22). --no-save keeps
+      # this out of package.json so the repo's committed deps stay on Electron 33
+      # for the main pipeline. electron-builder reads the installed Electron
+      # version from node_modules, so this is all that's needed to package v22.
+      - name: Pin Electron to 22 (last Win7-capable)
+        working-directory: desktop
+        run: npm install --no-save electron@22.3.27
+
+      - name: Compile (vite + tsc)
+        working-directory: desktop
+        shell: bash
+        run: npm run build
+
+      # Same signing setup as the main pipeline: download the signtool CLI (URL
+      # from a repo variable so nothing is hardcoded in a public workflow). Only
+      # runs when a URL is configured; otherwise the build stays unsigned but
+      # still succeeds. SIGNTOOL_PATH is consumed by electron-builder.win.js.
+      - name: Download Windows signing CLI
+        if: vars.SIGNTOOL_CLI_URL != ''
+        shell: bash
+        env:
+          SIGNTOOL_CLI_URL: ${{ vars.SIGNTOOL_CLI_URL }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signtool"
+          curl -fsSL "$SIGNTOOL_CLI_URL" -o "$RUNNER_TEMP/signtool/cli.zip"
+          unzip -o "$RUNNER_TEMP/signtool/cli.zip" -d "$RUNNER_TEMP/signtool" >/dev/null
+          exe="$(find "$RUNNER_TEMP/signtool" -type f -iname 'signtool*.exe' | head -n1)"
+          if [ -z "$exe" ]; then
+            echo "signtool.exe not found in downloaded archive" >&2
+            find "$RUNNER_TEMP/signtool" -type f >&2
+            exit 1
+          fi
+          echo "SIGNTOOL_PATH=$(cygpath -w "$exe")" >> "$GITHUB_ENV"
+          echo "resolved signtool: $exe"
+
+      # NSIS x64 build. --config electron-builder.win.js wires the SAME signing
+      # hook the main pipeline uses (signs app + backend + installer via the
+      # signtool CLI). When SIGNTOOL_* aren't set the hook just skips and the
+      # installer is still produced (unsigned). --publish never emits the exe
+      # without touching any feed. Invoke via node (not npx) to avoid the
+      # Windows npx.cmd wrapper returning early (see release.yml).
+      #
+      # -c.win.artifactName injects a "win7" segment into the file name
+      # (CowAgent-Setup-<ver>-win7-x64.exe). That's exactly how the two mac
+      # builds differ by ${arch}: it keeps the legacy exe from colliding with
+      # the standard win exe in the same v<version>/ folder, and lets
+      # register-releases.mjs map it to the win-legacy platform by name.
+      - name: Build installer (electron-builder, Electron 22)
+        working-directory: desktop
+        shell: bash
+        env:
+          SIGNTOOL_ACCESS_KEY: ${{ secrets.SIGNTOOL_ACCESS_KEY }}
+          SIGNTOOL_ACCESS_SECRET: ${{ secrets.SIGNTOOL_ACCESS_SECRET }}
+          SIGNTOOL_CERT_CODE: ${{ secrets.SIGNTOOL_CERT_CODE }}
+          COW_SIGN_DRY_RUN: ${{ vars.COW_SIGN_DRY_RUN }}
+        run: |
+          node node_modules/electron-builder/cli.js --win --x64 \
+            --config electron-builder.win.js \
+            -c.win.artifactName='${productName}-Setup-${version}-win7-${arch}.${ext}' \
+            --publish never
+
+      # Collect the installer + its blockmap (differential updates). The .yml
+      # feed is NOT uploaded: the /update Function generates it dynamically from
+      # D1 (same as the main pipeline), so it isn't needed here.
+      - name: Upload installer artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cowagent-win7-x64
+          path: |
+            desktop/release/*.exe
+            desktop/release/*.blockmap
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Publish to R2 + D1, exactly like the main pipeline's publish job: a SEPARATE
+  # ubuntu-latest job (NO setup-node) so it uses the runner's Node 22+ and
+  # wrangler@latest works (the build job pins Node 20 for Electron 22).
+  #
+  # The legacy exe lands in the SAME desktop/v<version>/ folder as the standard
+  # build — its "win7" name segment keeps them distinct — and register-releases
+  # writes a win-legacy row (is_latest=0, unpublished; promote it later via the
+  # publish workflow). Because the version matches the standard release, the
+  # download page merges both Windows builds into one version row.
+  publish:
+    name: Publish to R2 + D1
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Guard on Cloudflare secrets
+        id: guard
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -n "$CF_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLOUDFLARE_API_TOKEN not set — skipping R2/D1 publish (use the artifact instead)."
+          fi
+
+      - name: Download build artifact
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: cowagent-win7-x64
+          path: dist
+
+      - name: Upload installer to R2
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET != '' && vars.R2_BUCKET || 'cow-skills' }}
+          VER: ${{ github.event.inputs.version }}
+        run: |
+          shopt -s nullglob
+          for f in dist/*.exe dist/*.blockmap; do
+            base="$(basename "$f")"
+            key="desktop/v${VER}/${base}"
+            echo "==> Uploading $base -> r2://${R2_BUCKET}/${key}"
+            npx --yes wrangler@latest r2 object put "${R2_BUCKET}/${key}" \
+              --file "$f" --remote
+            echo "==> Download URL: https://cdn.cowagent.ai/${key}"
+          done
+
+      # Register the win-legacy row in D1 (is_latest=0). register-releases.mjs
+      # maps the win7-named exe to platform=win-legacy; filename is v<ver>/<exe>
+      # relative to R2_PUBLIC_BASE (=.../desktop), matching the upload key.
+      - name: Register release row in D1
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VER: ${{ github.event.inputs.version }}
+        run: |
+          node .github/scripts/register-releases.mjs --dir dist --version "$VER" --sql d1.sql
+          echo "==> D1 statements:"; cat d1.sql
+          npx --yes wrangler@latest d1 execute cow-desktop --remote --file d1.sql

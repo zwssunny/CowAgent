@@ -42,6 +42,12 @@ python-docx
 openpyxl
 python-pptx
 
+# ---- browser tool ----
+# Only the pure-Python package + Node driver are bundled by PyInstaller (~10-15MB).
+# The Chromium binary is NOT bundled: the browser tool drives the user's system
+# Chrome/Edge, or downloads Chromium on demand into ~/.cow at first use.
+playwright==1.52.0
+
 # ---- IM channels (kept; lightweight). Feishu/lark-oapi intentionally excluded. ----
 wechatpy
 pycryptodome

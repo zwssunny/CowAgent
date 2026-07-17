@@ -1,10 +1,10 @@
 <p align="center"><img src="https://github.com/user-attachments/assets/eca9a9ec-8534-4615-9e0f-96c5ac1d10a3" alt="CowAgent" width="420" /></p>
 
 <p align="center">
-  <a href="https://github.com/zhayujie/CowAgent/releases/latest"><img src="https://img.shields.io/github/v/release/zhayujie/CowAgent?cacheSeconds=3600" alt="Latest release"></a>
-  <a href="https://github.com/zhayujie/CowAgent/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
-  <a href="https://github.com/zhayujie/CowAgent"><img src="https://img.shields.io/github/stars/zhayujie/CowAgent?style=flat-square&cacheSeconds=3600" alt="Stars"></a>
-  <a href="https://docs.cowagent.ai/ja"><img src="https://img.shields.io/badge/%E3%83%89%E3%82%AD%E3%83%A5%E3%83%A1%E3%83%B3%E3%83%88-cowagent.ai-blue?style=flat&logo=readthedocs&logoColor=white" alt="ドキュメント"></a>
+  <a href="https://github.com/zhayujie/CowAgent/releases/latest"><img src="https://img.shields.io/github/v/release/zhayujie/CowAgent?cacheSeconds=3600" alt="Latest release" /></a>
+  <a href="https://github.com/zhayujie/CowAgent/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT" /></a>
+  <a href="https://github.com/zhayujie/CowAgent"><img src="https://img.shields.io/github/stars/zhayujie/CowAgent?style=flat-square&cacheSeconds=3600" alt="Stars" /></a>
+  <a href="https://docs.cowagent.ai/ja"><img src="https://img.shields.io/badge/%E3%83%89%E3%82%AD%E3%83%A5%E3%83%A1%E3%83%B3%E3%83%88-cowagent.ai-blue?style=flat&logo=readthedocs&logoColor=white" alt="ドキュメント" /></a>
 </p>
 
 <p align="center">
@@ -106,8 +106,8 @@ CowAgent は主要な LLM プロバイダーすべてに対応しています。
 
 | プロバイダー | 代表的なモデル | チャット | 画像認識 | 画像生成 | ASR | TTS | Embedding |
 | --- | --- | :-: | :-: | :-: | :-: | :-: | :-: |
-| [Claude](https://docs.cowagent.ai/ja/models/claude) | claude-sonnet-5 | ✅ | ✅ | | | | |
-| [OpenAI](https://docs.cowagent.ai/ja/models/openai) | gpt-5.5、o シリーズ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [Claude](https://docs.cowagent.ai/ja/models/claude) | claude-sonnet-5 / fable-5 | ✅ | ✅ | | | | |
+| [OpenAI](https://docs.cowagent.ai/ja/models/openai) | gpt-5.6 シリーズ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | [Gemini](https://docs.cowagent.ai/ja/models/gemini) | gemini-3.5-flash | ✅ | ✅ | ✅ | | | |
 | [DeepSeek](https://docs.cowagent.ai/ja/models/deepseek) | deepseek-v4-flash / pro | ✅ | | | | | |
 | [Qwen](https://docs.cowagent.ai/ja/models/qwen) | qwen3.7-plus | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -230,7 +230,7 @@ CowAgent は主要な LLM プロバイダーすべてに対応しています。
 
 GitHub で [Issue を報告](https://github.com/zhayujie/CowAgent/issues) するか、下記 QR コードをスキャンして WeChat コミュニティに参加してください：
 
-<img width="130" src="https://img-1317903499.cos.ap-guangzhou.myqcloud.com/docs/open-community.png">
+<img width="130" src="https://img-1317903499.cos.ap-guangzhou.myqcloud.com/docs/open-community.png" />
 
 <br/>
 

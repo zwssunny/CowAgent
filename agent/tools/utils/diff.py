@@ -93,6 +93,40 @@ class FuzzyMatchResult:
         self.content_for_replacement = content_for_replacement
 
 
+def _build_fuzzy_pattern(old_text: str) -> Optional[str]:
+    """
+    Build the whitespace-flexible regex used to locate ``old_text`` fuzzily.
+
+    Returns ``None`` when ``old_text`` has no non-whitespace content to match.
+    This is the single source of truth for fuzzy matching, so that *finding* a
+    match (:func:`fuzzy_find_text`) and *counting* occurrences
+    (:func:`count_matches`) always use the exact same rules.
+    """
+    stripped = old_text.strip('\n')
+    if not stripped.strip():
+        return None
+
+    source_lines = stripped.split('\n')
+    line_patterns = []
+    for i, line in enumerate(source_lines):
+        tokens = line.split()
+        if not tokens:
+            line_patterns.append(r'[ \t]*')
+            continue
+        # Tolerate any run of blanks between tokens.
+        core = r'[ \t]+'.join(re.escape(tok) for tok in tokens)
+        # First-line leading whitespace is folded into the match only when
+        # old_text itself was indented here; otherwise it stays OUTSIDE the
+        # match so a no-indent old_text preserves (does not swallow and drop)
+        # the file's existing indentation -- mirroring an exact substring
+        # match. Inner lines always tolerate indentation: it sits inside the
+        # matched region and is re-supplied by new_text.
+        if i > 0 or line[:1] in (' ', '\t'):
+            core = r'[ \t]*' + core
+        line_patterns.append(core + r'[ \t]*')
+    return '\n'.join(line_patterns)
+
+
 def fuzzy_find_text(content: str, old_text: str) -> FuzzyMatchResult:
     """
     Find text in content, try exact match first, then fuzzy match
@@ -110,7 +144,7 @@ def fuzzy_find_text(content: str, old_text: str) -> FuzzyMatchResult:
             match_length=len(old_text),
             content_for_replacement=content
         )
-    
+
     # Fuzzy match: the exact substring was not found, most likely because the
     # whitespace differs (indentation, spaces around operators, trailing
     # spaces). Locate the region in the ORIGINAL content using a
@@ -121,27 +155,8 @@ def fuzzy_find_text(content: str, old_text: str) -> FuzzyMatchResult:
     # doing so previously returned the normalized copy as
     # content_for_replacement, which caused the whole file to be rewritten
     # with collapsed indentation (every untouched line got reformatted).
-    stripped = old_text.strip('\n')
-    if stripped.strip():
-        source_lines = stripped.split('\n')
-        line_patterns = []
-        for i, line in enumerate(source_lines):
-            tokens = line.split()
-            if not tokens:
-                line_patterns.append(r'[ \t]*')
-                continue
-            # Tolerate any run of blanks between tokens.
-            core = r'[ \t]+'.join(re.escape(tok) for tok in tokens)
-            # First-line leading whitespace is folded into the match only when
-            # old_text itself was indented here; otherwise it stays OUTSIDE the
-            # match so a no-indent old_text preserves (does not swallow and drop)
-            # the file's existing indentation -- mirroring an exact substring
-            # match. Inner lines always tolerate indentation: it sits inside the
-            # matched region and is re-supplied by new_text.
-            if i > 0 or line[:1] in (' ', '\t'):
-                core = r'[ \t]*' + core
-            line_patterns.append(core + r'[ \t]*')
-        pattern = '\n'.join(line_patterns)
+    pattern = _build_fuzzy_pattern(old_text)
+    if pattern is not None:
         match = re.search(pattern, content)
         if match:
             return FuzzyMatchResult(
@@ -153,6 +168,28 @@ def fuzzy_find_text(content: str, old_text: str) -> FuzzyMatchResult:
 
     # Not found
     return FuzzyMatchResult(found=False)
+
+
+def count_matches(content: str, old_text: str) -> int:
+    """
+    Count occurrences of ``old_text`` using the SAME strategy as
+    :func:`fuzzy_find_text`: an exact substring when one is present, otherwise
+    the whitespace-flexible fuzzy regex.
+
+    The edit tool's uniqueness guard must agree with the matcher that actually
+    performs the replacement. Counting through a separate normalization pass
+    (the previous approach) could disagree with the regex used to locate and
+    replace, so both paths now share :func:`_build_fuzzy_pattern`.
+    """
+    if not old_text:
+        return 0
+    # Mirror fuzzy_find_text: prefer exact matching when it applies.
+    if content.find(old_text) != -1:
+        return content.count(old_text)
+    pattern = _build_fuzzy_pattern(old_text)
+    if pattern is None:
+        return 0
+    return len(re.findall(pattern, content))
 
 
 def generate_diff_string(old_content: str, new_content: str) -> dict:

@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
-import { ChevronRight, Loader2, Check, X, Brain } from 'lucide-react'
+import { ChevronRight, Loader2, Check, X, Lightbulb } from 'lucide-react'
 import type { MessageStep } from '../types'
+import { t } from '../i18n'
 import Markdown from './Markdown'
 
 /**
@@ -16,8 +17,8 @@ const ThinkingStep: React.FC<{ content: string; streaming?: boolean }> = ({ cont
         className="flex items-center gap-1.5 cursor-pointer hover:text-content-secondary select-none transition-colors"
         onClick={() => setExpanded((v) => !v)}
       >
-        <Brain size={12} className="flex-shrink-0" />
-        <span className="flex-1">{streaming ? 'Thinking…' : 'Thought for a moment'}</span>
+        <Lightbulb size={13} className={`flex-shrink-0 text-amber-400 ${streaming ? 'animate-pulse' : ''}`} />
+        <span className="flex-1">{streaming ? t('thinking_in_progress') : t('thinking_done')}</span>
         <ChevronRight size={11} className={`transition-transform opacity-50 ${expanded ? 'rotate-90' : ''}`} />
       </div>
       {expanded && (

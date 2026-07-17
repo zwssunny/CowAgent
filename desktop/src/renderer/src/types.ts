@@ -50,7 +50,7 @@ export interface BackendStatusEvent {
 // Chat / messages / streaming
 // ============================================================
 
-export type Role = 'user' | 'assistant'
+export type Role = 'user' | 'assistant' | 'system'
 
 /** A single ordered step inside an assistant turn (matches backend history). */
 export interface MessageStep {
@@ -83,8 +83,8 @@ export interface ChatMessage {
   /** Sequence numbers from backend (for delete/regenerate). */
   userSeq?: number
   botSeq?: number
-  /** Self-evolution bubble flag. */
-  kind?: 'evolution'
+  /** Self-evolution bubble flag; 'divider' renders a context-cleared separator. */
+  kind?: 'evolution' | 'divider'
   extras?: Record<string, unknown>
   isStreaming?: boolean
   isCancelled?: boolean

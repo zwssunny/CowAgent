@@ -37,6 +37,7 @@ MCP コミュニティ標準に完全準拠しており、Claude Desktop / Curso
 | `url` | SSE / Streamable HTTP | リモートエンドポイントの URL（`command` と二者択一） |
 | `type` | リモート | リモートトランスポート種別：`sse` または `streamable-http`（既定は `sse`） |
 | `headers` | 任意 | リモートリクエストの追加 HTTP ヘッダ（`Authorization` など）。Streamable HTTP のみ |
+| `scope` | 任意 | OAuth スコープ。OAuth 認可が必要なリモート server のみ使用（任意） |
 | `disabled` | 任意 | `true` のとき該当サーバーをスキップ。一時的に無効化したいときに便利 |
 
 ### 完全な例
@@ -78,6 +79,27 @@ Agent は次のように動作します：
 
 1. 既存の MCP 設定ファイルを読み込み、新しい server エントリをマージ（既存の項目は保持）
 2. 増分の MCP Server を自動でリロードし、次のメッセージから対応する Tool が利用可能に
+
+## Web 認可（OAuth）
+
+一部のリモート MCP は OAuth の Web 認可が必要で、そのまま設定すると `401` が返ります。CowAgent は標準的な OAuth フローを内蔵しているため、**token を手動で入力する必要はなく**、通常どおり設定するだけです。例：
+
+```json
+{
+  "mcpServers": {
+    "xmind": {
+      "type": "streamable-http",
+      "url": "https://app.xmind.com/api/mcp"
+    }
+  }
+}
+```
+
+server の初回ロードで `401` が返ると、認可が自動的に開始されます。ローカル実行では**自動的にブラウザが開き**、サーバー環境では**認可リンクがログに出力**されるので、ブラウザで開いてください。承認すると server はすぐにオンラインになり、token は期限切れ時に自動更新されるため、再認可は不要です。
+
+- **Web サービスが必要**：認可コールバックは Web コンソール（既定ポート `9899`）で受け取るため、Web channel が起動している必要があります。
+- **認証情報の保存**：token は `~/.cow/mcp_oauth.json` に永続化され、再起動後も再利用されます。
+- **コールバック URL**：既定は `http://127.0.0.1:9899/mcp/oauth/callback`。サーバーに配置し認可用ブラウザが別の端末にある場合は、`config.json` に `mcp_oauth_redirect_base`（例：`http://あなたのIP:9899`）を設定してください。
 
 ## 動作の仕組み
 

@@ -12,6 +12,7 @@ interface UIState {
   /** Session list panel collapsed (hidden) vs expanded. */
   sessionsCollapsed: boolean
   toggleSessions: () => void
+  setSessionsCollapsed: (v: boolean) => void
 
   /** Currently active session id (Chat page). */
   activeSessionId: string | null
@@ -42,6 +43,10 @@ export const useUIStore = create<UIState>((set) => ({
       localStorage.setItem(SESSIONS_KEY, next ? '1' : '0')
       return { sessionsCollapsed: next }
     }),
+  setSessionsCollapsed: (v) => {
+    localStorage.setItem(SESSIONS_KEY, v ? '1' : '0')
+    set({ sessionsCollapsed: v })
+  },
 
   activeSessionId: null,
   setActiveSessionId: (id) => set({ activeSessionId: id }),

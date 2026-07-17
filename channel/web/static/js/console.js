@@ -1139,6 +1139,33 @@ function createMd() {
             return hljsLib.highlightAuto(str).value;
         }
     });
+    // Fix greedy linkify: markdown-it's linkify swallows markdown emphasis (*)
+    // and CJK full-width punctuation glued to a URL (common in LLM output like
+    // "**https://x**，中文"), turning the whole tail into one broken link. Cut
+    // the URL at the first such char and spill the remainder back as text.
+    var GREEDY_LINK_CUT = /[*\u3000-\u303F\uFF00-\uFFEF]/;
+    md.core.ruler.after('linkify', 'fix_greedy_linkify', function(state) {
+        for (var b = 0; b < state.tokens.length; b++) {
+            var blk = state.tokens[b];
+            if (blk.type !== 'inline' || !blk.children) continue;
+            var ch = blk.children;
+            for (var i = 0; i < ch.length; i++) {
+                var open = ch[i];
+                if (open.type !== 'link_open' || open.markup !== 'linkify') continue;
+                var textTok = ch[i + 1], close = ch[i + 2];
+                if (!textTok || textTok.type !== 'text' || !close || close.type !== 'link_close') continue;
+                var idx = textTok.content.search(GREEDY_LINK_CUT);
+                if (idx < 0) continue;
+                var keep = textTok.content.slice(0, idx);
+                var spill = textTok.content.slice(idx);
+                textTok.content = keep;
+                open.attrSet('href', keep);
+                var spillTok = new state.Token('text', '', 0);
+                spillTok.content = spill;
+                ch.splice(i + 3, 0, spillTok);
+            }
+        }
+    });
     const defaultLinkOpen = md.renderer.rules.link_open || function(tokens, idx, options, env, self) {
         return self.renderToken(tokens, idx, options);
     };

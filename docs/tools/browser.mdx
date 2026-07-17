@@ -49,6 +49,12 @@ Control a Chromium browser for web navigation, element interaction and content e
   2. The browser tool has heavy dependencies (~300MB) and is optional. For lightweight web content retrieval, use the `web_fetch` tool.
 </Note>
 
+<Note>
+  **Desktop client users**: playwright is bundled in the installer, no separate install needed. On first use of the browser tool:
+  - If **Google Chrome / Edge** is installed, it drives the system browser directly with **no download** (recommended);
+  - Otherwise, send `/install-browser` in chat to download a lightweight browser engine into `~/.cow`.
+</Note>
+
 ## Workflow
 
 A typical browser workflow for the Agent:
@@ -104,6 +110,15 @@ You can override it in `config.json`:
   }
 }
 ```
+
+## Browser Engine
+
+The browser engine is selected automatically, no configuration needed:
+
+1. If **Google Chrome / Edge** is detected on the machine, it drives the system browser directly, with **no Chromium download**, using real browser fingerprints;
+2. Otherwise it falls back to the Chromium engine downloaded into `~/.cow` via `install-browser`.
+
+Both use the persistent login below and behave identically.
 
 ## Persistent Login
 

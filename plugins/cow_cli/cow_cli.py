@@ -813,8 +813,8 @@ class CowCliPlugin(Plugin):
                 "you can also run `cow install-browser` in a terminal.",
             )
         return _t(
-            "✅ 安装流程已结束。请重启 CowAgent 后使用 browser 工具（进度见上方消息）。",
-            "✅ Installation finished. Restart CowAgent to use the browser tool (see messages above for progress).",
+            "✅ 安装流程已结束。请重启 CowAgent 后使用 browser 工具。",
+            "✅ Installation finished. Restart CowAgent to use the browser tool.",
         )
 
     # ------------------------------------------------------------------

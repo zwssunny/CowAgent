@@ -456,7 +456,7 @@ $ModelChoices = @{
     1  = @{ Provider = "DeepSeek";                Default = "deepseek-v4-flash";                   Field = "deepseek_api_key" }
     2  = @{ Provider = "Claude";                  Default = "claude-opus-4-8";                     Field = "claude_api_key";    BaseField = "claude_api_base" }
     3  = @{ Provider = "Gemini";                  Default = "gemini-3.1-pro-preview";              Field = "gemini_api_key";    BaseField = "gemini_api_base" }
-    4  = @{ Provider = "OpenAI";                  Default = "gpt-5.5";                             Field = "open_ai_api_key";   BaseField = "open_ai_api_base" }
+    4  = @{ Provider = "OpenAI";                  Default = "gpt-5.6-luna";                        Field = "open_ai_api_key";   BaseField = "open_ai_api_base" }
     5  = @{ Provider = "MiniMax";                 Default = "MiniMax-M3";                          Field = "minimax_api_key" }
     6  = @{ Provider = "GLM";                     Default = "glm-5.2";                             Field = "zhipu_ai_api_key" }
     7  = @{ Provider = "Qwen (DashScope)";        Default = "qwen3.7-plus";                        Field = "dashscope_api_key" }
@@ -473,7 +473,7 @@ function Select-Model {
         "DeepSeek (deepseek-v4-flash, deepseek-v4-pro, etc.)",
         "Claude (claude-opus-4-8, claude-fable-5, etc.)",
         "Gemini (gemini-3.5-flash, gemini-3.1-pro-preview, etc.)",
-        "OpenAI (gpt-5.5, etc.)",
+        "OpenAI (gpt-5.6-luna, etc.)",
         "MiniMax (MiniMax-M3, etc.)",
         "GLM (glm-5.2, etc.)",
         "Qwen (qwen3.7-plus, qwen3.7-max, etc.)",

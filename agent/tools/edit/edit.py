@@ -13,7 +13,7 @@ from agent.tools.utils.diff import (
     detect_line_ending,
     normalize_to_lf,
     restore_line_endings,
-    normalize_for_fuzzy_match,
+    count_matches,
     fuzzy_find_text,
     generate_diff_string
 )
@@ -110,10 +110,10 @@ class Edit(BaseTool):
                         "The old text must match exactly including all whitespace and newlines."
                     )
                 
-                # Calculate occurrence count (use fuzzy normalized content for consistency)
-                fuzzy_content = normalize_for_fuzzy_match(normalized_content)
-                fuzzy_old_text = normalize_for_fuzzy_match(normalized_old_text)
-                occurrences = fuzzy_content.count(fuzzy_old_text)
+                # Count occurrences with the same matcher used to locate and
+                # replace (fuzzy_find_text), so the uniqueness guard cannot
+                # disagree with what actually gets replaced.
+                occurrences = count_matches(normalized_content, normalized_old_text)
                 
                 if occurrences > 1:
                     return ToolResult.fail(

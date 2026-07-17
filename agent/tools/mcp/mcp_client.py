@@ -21,6 +21,48 @@ from common.log import logger
 _STREAMABLE_HTTP_ALIASES = {"streamable-http", "streamable_http", "streamablehttp", "http"}
 
 
+# Optional callback invoked after an OAuth authorization completes, so the
+# tool manager can bring the newly-authorized server online. Signature:
+# reload_fn(server_name: str) -> None. Installed by the tool manager.
+_reload_callback = None
+
+
+def set_reload_callback(fn) -> None:
+    """Register a callback fired after a server's OAuth flow succeeds."""
+    global _reload_callback
+    _reload_callback = fn
+
+
+def notify_server_authorized(server_name: str) -> None:
+    """Called by the web callback once tokens are stored for a server."""
+    fn = _reload_callback
+    if fn is None:
+        logger.debug(f"[MCP:{server_name}] Authorized but no reload callback registered")
+        return
+    try:
+        fn(server_name)
+    except Exception as e:
+        logger.warning(f"[MCP:{server_name}] reload callback failed: {e}")
+
+
+def _oauth_redirect_uri() -> str:
+    """Build the OAuth redirect URI served by the web console callback.
+
+    Priority: explicit mcp_oauth_redirect_base config, otherwise the local
+    web console address (127.0.0.1:<web_port>). Both point at the shared
+    /mcp/oauth/callback route.
+    """
+    try:
+        from config import conf
+        base = (conf().get("mcp_oauth_redirect_base") or "").strip().rstrip("/")
+        if not base:
+            port = int(os.environ.get("COW_WEB_PORT") or conf().get("web_port", 9899))
+            base = f"http://127.0.0.1:{port}"
+    except Exception:
+        base = "http://127.0.0.1:9899"
+    return f"{base}/mcp/oauth/callback"
+
+
 class McpClient:
     """Single MCP Server client supporting stdio, SSE and Streamable HTTP transports."""
 
@@ -55,6 +97,13 @@ class McpClient:
         self._http_url: Optional[str] = None
         self._http_headers: dict = {}  # extra headers from user config (e.g. Authorization)
         self._http_session_id: Optional[str] = None  # Mcp-Session-Id assigned by the server
+
+        # OAuth state (streamable-http only). Lazily created when the server
+        # responds with 401 and the user has not supplied a static token.
+        self._oauth = None  # OAuthHandler instance
+        # Set to True once a 401 could not be satisfied and the user must
+        # complete the browser authorization. Callers can surface this state.
+        self.needs_auth: bool = False
 
         # Shared state
         self._next_id = 1
@@ -325,13 +374,118 @@ class McpClient:
         if isinstance(extra_headers, dict):
             self._http_headers = {str(k): str(v) for k, v in extra_headers.items()}
 
+        # Restore any previously stored OAuth credentials for this server so a
+        # restart reuses the token instead of forcing re-authorization.
+        self._maybe_load_oauth()
+
         return self._handshake()
+
+    # ------------------------------------------------------------------
+    # OAuth helpers (streamable-http only)
+    # ------------------------------------------------------------------
+
+    def _has_static_auth(self) -> bool:
+        """True when the user supplied their own Authorization header."""
+        return any(k.lower() == "authorization" for k in self._http_headers)
+
+    def _maybe_load_oauth(self) -> None:
+        """Attach an OAuthHandler when stored credentials exist for this server."""
+        if self._has_static_auth():
+            return
+        try:
+            from agent.tools.mcp.mcp_oauth import OAuthHandler, load_server_record
+        except Exception:
+            return
+        rec = load_server_record(self.name)
+        # Only create a handler when we have something to reuse; otherwise it
+        # is created lazily on the first 401.
+        if rec.get("access_token") or rec.get("client_id"):
+            self._oauth = OAuthHandler(
+                server_name=self.name,
+                resource_url=self._http_url,
+                redirect_uri=_oauth_redirect_uri(),
+                scope=self.config.get("scope", ""),
+            )
+
+    def _current_bearer(self) -> Optional[str]:
+        """Return a valid access token, refreshing if needed."""
+        if self._oauth is None:
+            return None
+        return self._oauth.get_valid_access_token()
+
+    def _begin_oauth(self, www_authenticate: str = "") -> None:
+        """Kick off the OAuth flow after a 401: discover, register, prompt user."""
+        if self._has_static_auth():
+            return
+        try:
+            from agent.tools.mcp.mcp_oauth import OAuthHandler
+        except Exception as e:
+            logger.warning(f"[MCP:{self.name}] OAuth module unavailable: {e}")
+            return
+
+        if self._oauth is None:
+            self._oauth = OAuthHandler(
+                server_name=self.name,
+                resource_url=self._http_url,
+                redirect_uri=_oauth_redirect_uri(),
+                scope=self.config.get("scope", ""),
+            )
+
+        if not self._oauth.ensure_registered(www_authenticate):
+            logger.warning(
+                f"[MCP:{self.name}] OAuth discovery/registration failed; "
+                f"cannot authorize automatically"
+            )
+            return
+
+        auth_url = self._oauth.build_authorization_url()
+        if not auth_url:
+            logger.warning(f"[MCP:{self.name}] Failed to build authorization URL")
+            return
+
+        self.needs_auth = True
+        logger.warning(
+            f"[MCP:{self.name}] ⚠️  Authorization required. Open this URL in a "
+            f"browser to authorize, then this server will come online automatically:\n"
+            f"    {auth_url}"
+        )
+        # On a machine with a local browser (desktop/dev), open it directly.
+        if os.environ.get("COW_DESKTOP") == "1" or not os.environ.get("COW_HEADLESS"):
+            try:
+                import webbrowser
+                webbrowser.open(auth_url)
+            except Exception:
+                pass
 
     def _streamable_http_send(self, message: dict) -> dict:
         """POST a JSON-RPC request and return the response (JSON or SSE-wrapped)."""
         return self._streamable_http_post(message, expect_response=True)
 
-    def _streamable_http_post(self, message: dict, expect_response: bool) -> dict:
+    def _handle_401(self, err, message: dict, expect_response: bool, retried: bool) -> dict:
+        """Handle a 401: refresh the token and retry once, else begin OAuth."""
+        www_auth = ""
+        try:
+            www_auth = err.headers.get("WWW-Authenticate", "") or ""
+        except Exception:
+            pass
+        try:
+            err.read()
+        except Exception:
+            pass
+
+        # First try a silent refresh with the stored refresh token.
+        if not retried and self._oauth is not None and self._oauth.refresh():
+            logger.info(f"[MCP:{self.name}] Token refreshed after 401, retrying")
+            return self._streamable_http_post(message, expect_response, _retried=True)
+
+        # No usable token — start (or restart) the interactive OAuth flow.
+        self._begin_oauth(www_auth)
+        raise IOError(
+            f"[MCP:{self.name}] streamable-http HTTP 401: authorization required "
+            f"(complete the OAuth flow to enable this server)"
+        )
+
+    def _streamable_http_post(self, message: dict, expect_response: bool, _retried: bool = False) -> dict:
         """
         POST a JSON-RPC message over Streamable HTTP.
 
@@ -351,6 +505,12 @@ class McpClient:
         if sid:
             headers["Mcp-Session-Id"] = sid
         headers.update(self._http_headers)
+        # Inject OAuth bearer token when we have one (unless the user set a
+        # static Authorization header, which takes precedence).
+        if not self._has_static_auth():
+            token = self._current_bearer()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
 
         req = urllib.request.Request(
             self._http_url,
@@ -362,6 +522,9 @@ class McpClient:
         try:
             resp = urllib.request.urlopen(req, timeout=30)
         except urllib.error.HTTPError as e:
+            # 401 is the spec-compliant "needs authorization" signal.
+            if e.code == 401 and not self._has_static_auth():
+                return self._handle_401(e, message, expect_response, _retried)
             # Surface the server-provided error body for easier debugging
             detail = ""
             try:

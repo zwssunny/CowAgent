@@ -37,6 +37,7 @@ Docker 部署时，官方 `docker-compose.yml` 已经把宿主机 `./cow` 挂载
 | `url` | SSE / Streamable HTTP | 远程端点 URL（与 `command` 二选一） |
 | `type` | 远程 | 远程传输类型，可选 `sse` 或 `streamable-http`，默认 `sse` |
 | `headers` | 否 | 远程请求附加 HTTP 头（如 `Authorization`），仅 Streamable HTTP 使用 |
+| `scope` | 否 | OAuth 授权范围，仅需要 OAuth 授权的远程 server 使用（可选） |
 | `disabled` | 否 | `true` 时跳过该 server，便于临时关闭 |
 
 ### 完整示例
@@ -78,6 +79,27 @@ Agent 会：
 
 1. 访问 MCP 配置文件，合并新 server 配置，保留已有项
 2. 自动重载增量的 MCP Server，下一次对话即可使用相应 Tools
+
+## 网页授权（OAuth）
+
+部分远程 MCP需要 OAuth 网页授权，直接配置会返回 `401`。CowAgent 内置标准 OAuth 流程，**无需手填 token**，正常配置即可，例如：
+
+```json
+{
+  "mcpServers": {
+    "xmind": {
+      "type": "streamable-http",
+      "url": "https://app.xmind.com/api/mcp"
+    }
+  }
+}
+```
+
+server 首次加载遇到 `401` 时会自动发起授权：本机运行会**自动打开浏览器**，服务器部署则把**授权链接打印到日志**，复制到浏览器打开。授权同意后即完成，该 server 随即上线，令牌过期自动刷新，无需重复授权。
+
+- **依赖 Web 服务**：授权回调由 Web 控制台（默认端口 `9899`）接收，需保证 Web channel 正在运行。
+- **凭证存储**：令牌持久化在 `~/.cow/mcp_oauth.json`，重启后复用。
+- **回调地址**：默认 `http://127.0.0.1:9899/mcp/oauth/callback`；若部署在服务器、授权浏览器在另一台设备，在 `config.json` 设置 `mcp_oauth_redirect_base`（如 `http://你的IP:9899`）即可。
 
 ## 工作方式
 

@@ -17,6 +17,7 @@ import apiClient from '../api/client'
 import type { Attachment, ChatMessage } from '../types'
 import { useChatStore } from '../store/chatStore'
 import { useSessionStore } from '../store/sessionStore'
+import { useUIStore } from '../store/uiStore'
 
 interface ChatPageProps {
   baseUrl: string
@@ -54,6 +55,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ baseUrl }) => {
   const deleteMessage = useChatStore((s) => s.deleteMessage)
   const loadHistory = useChatStore((s) => s.loadHistory)
   const ensureSession = useChatStore((s) => s.ensureSession)
+  const clearContext = useChatStore((s) => s.clearContext)
+  const setSessionsCollapsed = useUIStore((s) => s.setSessionsCollapsed)
 
   const messages = session?.messages ?? []
   const isStreaming = session?.isStreaming ?? false
@@ -170,15 +173,14 @@ const ChatPage: React.FC<ChatPageProps> = ({ baseUrl }) => {
     const id = newSession()
     ensureSession(id)
     loadHistory(id, 1)
-  }, [newSession, ensureSession, loadHistory])
+    // Auto-expand the session list so the user sees the new/switched session.
+    setSessionsCollapsed(false)
+  }, [newSession, ensureSession, loadHistory, setSessionsCollapsed])
 
   const handleClearContext = useCallback(async () => {
-    try {
-      await apiClient.clearContext(activeId)
-    } catch {
-      /* ignore */
-    }
-  }, [activeId])
+    await clearContext(activeId)
+    scrollToBottom(true)
+  }, [clearContext, activeId, scrollToBottom])
 
   const handleStop = useCallback(() => cancel(activeId), [cancel, activeId])
 
@@ -242,7 +244,9 @@ const ChatPage: React.FC<ChatPageProps> = ({ baseUrl }) => {
           <div className="flex flex-col items-center justify-center h-full px-6 py-12">
             <img src="./logo.jpg" alt="CowAgent" className="w-16 h-16 rounded-2xl mb-5 shadow-md" />
             <h1 className="text-xl font-semibold text-content mb-2">{t('chat_welcome')}</h1>
-            <p className="text-content-tertiary text-sm text-center max-w-md mb-8">{t('chat_empty_hint')}</p>
+            <p className="text-content-tertiary text-sm text-center max-w-md mb-8 leading-relaxed whitespace-pre-line">
+              {t('welcome_subtitle')}
+            </p>
 
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 w-full max-w-2xl">
               {SUGGESTIONS.map(({ key, send, icon: Icon, iconClass, bgClass }) => (
@@ -274,16 +278,30 @@ const ChatPage: React.FC<ChatPageProps> = ({ baseUrl }) => {
           </div>
         ) : (
           <div className="py-3 max-w-3xl mx-auto">
-            {messages.map((msg) => (
-              <MessageBubble
-                key={msg.id}
-                message={msg}
-                onRegenerate={handleRegenerate}
-                onEdit={handleEdit}
-                onDelete={handleDelete}
-                onMediaLoad={handleMediaLoad}
-              />
-            ))}
+            {messages.map((msg) =>
+              msg.kind === 'divider' ? (
+                <div key={msg.id} className="flex items-center gap-3 px-6 py-3 text-content-tertiary">
+                  <span
+                    className="flex-1 h-px"
+                    style={{ background: 'linear-gradient(to right, transparent, var(--border-strong), transparent)' }}
+                  />
+                  <span className="text-xs whitespace-nowrap">{t('context_cleared')}</span>
+                  <span
+                    className="flex-1 h-px"
+                    style={{ background: 'linear-gradient(to right, transparent, var(--border-strong), transparent)' }}
+                  />
+                </div>
+              ) : (
+                <MessageBubble
+                  key={msg.id}
+                  message={msg}
+                  onRegenerate={handleRegenerate}
+                  onEdit={handleEdit}
+                  onDelete={handleDelete}
+                  onMediaLoad={handleMediaLoad}
+                />
+              )
+            )}
             <div ref={bottomRef} />
           </div>
         )}

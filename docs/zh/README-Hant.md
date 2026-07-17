@@ -1,10 +1,10 @@
 <p align="center"><img src= "https://github.com/user-attachments/assets/eca9a9ec-8534-4615-9e0f-96c5ac1d10a3" alt="CowAgent" width="420" /></p>
 
 <p align="center">
-  <a href="https://github.com/zhayujie/CowAgent/releases/latest"><img src="https://img.shields.io/github/v/release/zhayujie/CowAgent?cacheSeconds=3600" alt="Latest release"></a>
-  <a href="https://github.com/zhayujie/CowAgent/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
-  <a href="https://github.com/zhayujie/CowAgent"><img src="https://img.shields.io/github/stars/zhayujie/CowAgent?style=flat-square&cacheSeconds=3600" alt="Stars"></a>
-  <a href="https://docs.cowagent.ai/zh"><img src="https://img.shields.io/badge/%E6%96%87%E6%A1%A3-cowagent.ai-blue?style=flat&logo=readthedocs&logoColor=white" alt="文件"></a>
+  <a href="https://github.com/zhayujie/CowAgent/releases/latest"><img src="https://img.shields.io/github/v/release/zhayujie/CowAgent?cacheSeconds=3600" alt="Latest release" /></a>
+  <a href="https://github.com/zhayujie/CowAgent/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT" /></a>
+  <a href="https://github.com/zhayujie/CowAgent"><img src="https://img.shields.io/github/stars/zhayujie/CowAgent?style=flat-square&cacheSeconds=3600" alt="Stars" /></a>
+  <a href="https://docs.cowagent.ai/zh"><img src="https://img.shields.io/badge/%E6%96%87%E6%A1%A3-cowagent.ai-blue?style=flat&logo=readthedocs&logoColor=white" alt="文件" /></a>
 </p>
 
 <p align="center">
@@ -108,9 +108,9 @@ CowAgent 支援國內外主流廠商的大語言模型。**文字對話、影像
 | --- | --- | :-: | :-: | :-: | :-: | :-: | :-: |
 | [DeepSeek](https://docs.cowagent.ai/zh/models/deepseek) | deepseek-v4-flash / pro | ✅ | | | | | |
 | [MiniMax](https://docs.cowagent.ai/zh/models/minimax) | MiniMax-M3 | ✅ | ✅ | ✅ | | ✅ | |
-| [Claude](https://docs.cowagent.ai/zh/models/claude) | claude-sonnet-5 | ✅ | ✅ | | | | |
+| [Claude](https://docs.cowagent.ai/zh/models/claude) | claude-sonnet-5 / fable-5 | ✅ | ✅ | | | | |
 | [Gemini](https://docs.cowagent.ai/zh/models/gemini) | gemini-3.5-flash | ✅ | ✅ | ✅ | | | |
-| [OpenAI](https://docs.cowagent.ai/zh/models/openai) | gpt-5.5、o 系列 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [OpenAI](https://docs.cowagent.ai/zh/models/openai) | gpt-5.6 系列 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | [智譜 GLM](https://docs.cowagent.ai/zh/models/glm) | glm-5.2、glm-5v-turbo | ✅ | ✅ | | ✅ | | ✅ |
 | [通義千問](https://docs.cowagent.ai/zh/models/qwen) | qwen3.7-plus | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | [豆包 Doubao](https://docs.cowagent.ai/zh/models/doubao) | doubao-seed-2.1 系列 | ✅ | ✅ | ✅ | | | ✅ |
@@ -233,7 +233,7 @@ CowAgent 支援國內外主流廠商的大語言模型。**文字對話、影像
 
 掃碼加入微信開源交流群：
 
-<img width="130" src="https://img-1317903499.cos.ap-guangzhou.myqcloud.com/docs/open-community.png">
+<img width="130" src="https://img-1317903499.cos.ap-guangzhou.myqcloud.com/docs/open-community.png" />
 
 也可透過以下方式獲取支援：
 
@@ -252,7 +252,7 @@ CowAgent 支援國內外主流廠商的大語言模型。**文字對話、影像
 
 ## 🏢 企業服務
 
-<a href="https://link-ai.tech" target="_blank"><img width="650" src="https://cdn.link-ai.tech/image/link-ai-intro.jpg"></a>
+<a href="https://link-ai.tech" target="_blank"><img width="650" src="https://cdn.link-ai.tech/image/link-ai-intro.jpg" /></a>
 
 > [LinkAI](https://link-ai.tech/) 是面向企業和個人的一站式 AI 智慧體平臺，為 CowAgent 提供雲端託管和企業級支援：
 >
@@ -262,7 +262,7 @@ CowAgent 支援國內外主流廠商的大語言模型。**文字對話、影像
 
 **產品諮詢和企業服務** 可聯絡產品客服：
 
-<img width="130" src="https://cdn.link-ai.tech/portal/linkai-customer-service.png">
+<img width="130" src="https://cdn.link-ai.tech/portal/linkai-customer-service.png" />
 
 <br/>
 

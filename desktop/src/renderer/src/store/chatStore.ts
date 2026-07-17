@@ -31,6 +31,7 @@ interface ChatState {
   deleteMessage: (sid: string, userSeq: number, cascade: boolean) => Promise<void>
 
   loadHistory: (sid: string, page?: number) => Promise<void>
+  clearContext: (sid: string) => Promise<boolean>
   clearLocal: (sid: string) => void
 }
 
@@ -397,6 +398,25 @@ export const useChatStore = create<ChatState>((set, get) => {
     cancel: async (sid) => {
       const s = get().sessions[sid]
       if (!s?.requestId) return
+      // Optimistically stop the UI right away: mark the last assistant bubble
+      // cancelled, free the input, and tear down the local SSE stream so no
+      // further deltas render after the user hit stop. The backend still gets
+      // the cancel request to abort the running agent task.
+      patchMessages(sid, (msgs) => {
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role === 'assistant') {
+            msgs[i] = { ...msgs[i], isCancelled: true, isStreaming: false }
+            break
+          }
+        }
+        return [...msgs]
+      })
+      patchSession(sid, { isStreaming: false, requestId: null })
+      const es = streams[sid]
+      if (es) {
+        es.close()
+        delete streams[sid]
+      }
       try {
         await apiClient.cancel({ requestId: s.requestId, sessionId: sid })
       } catch {
@@ -473,6 +493,28 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
       } catch {
         patchSession(sid, { historyLoaded: true })
+      }
+    },
+
+    clearContext: async (sid) => {
+      try {
+        const res = await apiClient.clearContext(sid)
+        if (res.status !== 'success') return false
+        // Append a visual divider so the user sees the context was cleared
+        // (mirrors the web console's context-divider).
+        patchMessages(sid, (msgs) => [
+          ...msgs,
+          {
+            id: uid('divider'),
+            role: 'system',
+            kind: 'divider',
+            content: '',
+            timestamp: Date.now() / 1000,
+          },
+        ])
+        return true
+      } catch {
+        return false
       }
     },
 

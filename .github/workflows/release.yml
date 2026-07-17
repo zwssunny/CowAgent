@@ -113,6 +113,31 @@ jobs:
         shell: bash
         run: npm run build
 
+      # Download the Windows signing CLI. The URL comes from a repo variable, so
+      # nothing about the signing setup is hardcoded in a public workflow. Only
+      # runs on the Windows leg and only when a URL is set; otherwise the build
+      # stays unsigned. SIGNTOOL_PATH is exported for the next step's
+      # electron-builder.win.js to invoke.
+      - name: Download Windows signing CLI
+        if: matrix.platform == 'win' && vars.SIGNTOOL_CLI_URL != ''
+        shell: bash
+        env:
+          SIGNTOOL_CLI_URL: ${{ vars.SIGNTOOL_CLI_URL }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signtool"
+          curl -fsSL "$SIGNTOOL_CLI_URL" -o "$RUNNER_TEMP/signtool/cli.zip"
+          # Unzip and locate the signtool executable regardless of nesting.
+          unzip -o "$RUNNER_TEMP/signtool/cli.zip" -d "$RUNNER_TEMP/signtool" >/dev/null
+          exe="$(find "$RUNNER_TEMP/signtool" -type f -iname 'signtool*.exe' | head -n1)"
+          if [ -z "$exe" ]; then
+            echo "signtool.exe not found in downloaded archive" >&2
+            find "$RUNNER_TEMP/signtool" -type f >&2
+            exit 1
+          fi
+          # Normalize to a Windows-style path for execFileSync in Node.
+          echo "SIGNTOOL_PATH=$(cygpath -w "$exe")" >> "$GITHUB_ENV"
+          echo "resolved signtool: $exe"
+
       - name: Build & publish (electron-builder)
         working-directory: desktop
         shell: bash
@@ -124,8 +149,14 @@ jobs:
           # is the correct state for unsigned builds.
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
-          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
-          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          # Windows code signing via the signing CLI. Credentials are
+          # secrets; SIGNTOOL_PATH was exported by the download step above.
+          # COW_SIGN_DRY_RUN (repo variable) lets us validate the whole pipeline
+          # with a self-signed cert before buying a real one — no quota used.
+          SIGNTOOL_ACCESS_KEY: ${{ secrets.SIGNTOOL_ACCESS_KEY }}
+          SIGNTOOL_ACCESS_SECRET: ${{ secrets.SIGNTOOL_ACCESS_SECRET }}
+          SIGNTOOL_CERT_CODE: ${{ secrets.SIGNTOOL_CERT_CODE }}
+          COW_SIGN_DRY_RUN: ${{ vars.COW_SIGN_DRY_RUN }}
         run: |
           # Pick the signing cert for THIS platform only. The mac and win secrets
           # are both present in the job env, but a mac cert must never leak into a
@@ -137,17 +168,15 @@ jobs:
           #
           # NOTE: we only ever `export`, never `unset`, GitHub-injected env vars
           # (an `unset` can return non-zero and abort under errexit).
+          # macOS keeps the classic CSC_LINK (.p12) flow. Windows no longer uses
+          # a local .pfx (EV private keys can't be exported since 2023); it signs
+          # via the CLI wired into electron-builder.win.js instead, using the
+          # SIGNTOOL_* env already set above — nothing to export here.
           case "${{ matrix.platform }}" in
             mac)
               if [ -n "$MAC_CSC_LINK" ]; then
                 export CSC_LINK="$MAC_CSC_LINK"
                 export CSC_KEY_PASSWORD="$MAC_CSC_KEY_PASSWORD"
-              fi
-              ;;
-            win)
-              if [ -n "$WIN_CSC_LINK" ]; then
-                export CSC_LINK="$WIN_CSC_LINK"
-                export CSC_KEY_PASSWORD="$WIN_CSC_KEY_PASSWORD"
               fi
               ;;
           esac
@@ -157,19 +186,25 @@ jobs:
           # installers to R2 and register them in D1 ourselves (publish-r2 job).
           # `--publish never` still emits the latest*.yml files.
           #
-          # CONFIG PER PLATFORM: the dynamic electron-builder.js only exists to
-          # inject mac.binaries (the backend Mach-O files to hardened-sign for
-          # notarization) — it's a pure no-op on Windows. Passing --config on
-          # Windows was what silently broke the Windows build (it produced no
-          # installer while the job still reported success; Windows worked fine
-          # before --config was introduced). So Windows uses the plain
-          # package.json build config and only mac uses the dynamic one.
+          # CONFIG PER PLATFORM: each platform loads its OWN dynamic config.
+          #   mac -> electron-builder.js     (injects mac.binaries for signing)
+          #   win -> electron-builder.win.js (wires the sign hook; electron-builder
+          #                                   signs the app, backend and installer)
+          # HISTORY: passing --config on Windows previously broke the build (no
+          # installer, job still green). That happened because the MAC config
+          # (electron-builder.js) was a no-op on Windows yet still disturbed the
+          # run. The fix is a DEDICATED win config that correctly extends
+          # config.win — not sharing the mac one. If a build ever runs WITHOUT
+          # signing configured, electron-builder.win.js still returns the base
+          # config unchanged (sign hook just skips), so the installer is still
+          # produced.
           #
           # Invoke via `node <cli.js>` rather than `npx`: on Windows `npx` is
           # npx.cmd (a batch wrapper) and running it from this Git Bash step can
           # make bash return before the wrapped process finishes. node skips it.
           case "${{ matrix.platform }}" in
             mac) config_arg="--config electron-builder.js" ;;
+            win) config_arg="--config electron-builder.win.js" ;;
             *)   config_arg="" ;;
           esac
           node node_modules/electron-builder/cli.js ${{ matrix.eb_flags }} $config_arg --publish never

@@ -90,20 +90,14 @@ FileSave = _optional_tools.get('FileSave')
 Terminal = _optional_tools.get('Terminal')
 
 
-# BrowserTool (requires playwright)
+# BrowserTool: playwright is soft-imported inside browser_service, so this
+# import always succeeds even without playwright. Readiness (playwright pkg /
+# system Chrome / downloaded Chromium) is checked at call time in BrowserTool.
 def _import_browser_tool():
     from common.log import logger
     try:
         from agent.tools.browser.browser_tool import BrowserTool
         return BrowserTool
-    except ImportError as e:
-        logger.info(
-            f"[Tools] BrowserTool not loaded - missing dependency: {e}\n"
-            f"  To enable browser tool, run:\n"
-            f"    pip install playwright\n"
-            f"    playwright install chromium"
-        )
-        return None
     except Exception as e:
         logger.error(f"[Tools] BrowserTool failed to load: {e}")
         return None

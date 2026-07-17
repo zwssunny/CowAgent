@@ -185,6 +185,40 @@ class BrowserTool(BaseTool):
                     f"({ip_str}), request blocked for security"
                 )
 
+    def _check_engine_ready(self) -> Optional[ToolResult]:
+        """Return an actionable onboarding message if no browser engine is ready.
+
+        Returns None when a system Chrome/Edge or a downloaded Chromium is
+        available (so the tool can proceed). Otherwise returns a ToolResult with
+        clear guidance so the agent asks the user to enable the browser instead
+        of surfacing a raw Playwright launch error. CDP mode is exempt (the
+        endpoint is external and validated at connect time).
+        """
+        if self.config.get("cdp_endpoint"):
+            return None
+        try:
+            from agent.tools.browser.browser_env import capability_summary
+            summary = capability_summary(self.config)
+        except Exception as e:
+            logger.debug(f"[Browser] capability probe failed: {e}")
+            return None
+
+        if summary.get("ready"):
+            return None
+
+        # Desktop clients (dev or packaged) have no `cow` CLI — onboard via the
+        # in-chat `/install-browser` command. Source / web / server installs use
+        # the `cow install-browser` terminal command.
+        install_hint = (
+            "reply `/install-browser`" if summary.get("is_desktop")
+            else "run `cow install-browser` in a terminal"
+        )
+        return ToolResult.fail(
+            f"Browser tool not ready. Ask the user to {install_hint} (installs a browser engine; "
+            "skipped automatically if Google Chrome is already installed). "
+            "Do not retry until the user confirms."
+        )
+
     def execute(self, args: Dict[str, Any]) -> ToolResult:
         action = args.get("action", "").strip().lower()
         if not action:
@@ -194,6 +228,13 @@ class BrowserTool(BaseTool):
         if not handler:
             valid = ", ".join(sorted(self._ACTION_MAP.keys()))
             return ToolResult.fail(f"Unknown action '{action}'. Valid actions: {valid}")
+
+        # Preflight: on desktop the playwright package is bundled but the browser
+        # binary may be missing; return actionable onboarding instead of a cryptic
+        # launch failure.
+        not_ready = self._check_engine_ready()
+        if not_ready is not None:
+            return not_ready
 
         try:
             return handler(self, args)

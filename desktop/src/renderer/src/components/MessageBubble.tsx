@@ -121,8 +121,15 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
               muted, separated from the final answer by a dashed divider. */}
           {(hasSteps || hasLiveReasoning) && (
             <div className="mb-2.5 pb-2 border-b border-dashed border-default">
-              {hasLiveReasoning && <ThinkingStep content={message.reasoning!} streaming />}
               {hasSteps && <MessageSteps steps={message.steps!} />}
+              {/* Live reasoning is the current, not-yet-committed thinking, so it
+                  must render after all committed steps (tools/thinking), not at
+                  the very top of the bubble. */}
+              {hasLiveReasoning && (
+                <div className={hasSteps ? 'mt-1' : ''}>
+                  <ThinkingStep content={message.reasoning!} streaming />
+                </div>
+              )}
             </div>
           )}
 

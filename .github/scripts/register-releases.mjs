@@ -74,6 +74,12 @@ for (const base of fs.readdirSync(dir)) {
   } else if (/x64\.zip$/.test(base)) {
     platform = 'mac-x64'
     slot = 'upd'
+  } else if (/win7.*\.exe$/i.test(base)) {
+    // Legacy Win7/8 build (Electron 22). Its artifactName carries a "win7"
+    // segment so it never collides with the standard win exe in the same
+    // v<version>/ folder — just like arm64/x64 distinguish the two mac builds.
+    platform = 'win-legacy'
+    slot = 'main'
   } else if (/\.exe$/.test(base)) {
     platform = 'win'
     slot = 'main'

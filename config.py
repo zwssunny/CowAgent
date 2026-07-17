@@ -253,6 +253,7 @@ available_setting = {
     "web_password": "",  # Web console password; empty means no authentication required
     "web_session_expire_days": 30,  # Auth session expiry in days
     "web_file_serve_root": "~",  # Root dir the /api/file endpoint may serve; "/" allows the whole filesystem
+    "mcp_oauth_redirect_base": "",  # Base URL for MCP OAuth callback (e.g. http://your-ip:9899); empty uses local web console
     "agent": True,  # whether to enable Agent mode
     "agent_workspace": "~/cow",  # agent workspace path, used to store skills, memory, etc.
     "agent_max_context_tokens": 50000,  # max context tokens in Agent mode

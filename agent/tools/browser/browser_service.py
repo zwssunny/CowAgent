@@ -326,12 +326,19 @@ class BrowserService:
         # - persistent: launch with launch_persistent_context using a user_data_dir
         #   so cookies / login state survive across runs (default).
         # - fresh: classic launch + new_context, clean state every run.
+        #
+        # Within persistent/fresh, the actual Chromium binary is resolved by
+        # browser_env.resolve_engine(): a system Chrome/Edge (channel-based, zero
+        # download) is preferred, falling back to Playwright's own downloaded
+        # Chromium. `self._channel` is the Playwright channel ("chrome"/"msedge")
+        # when driving a system browser, else None (bundled Chromium).
         cdp_endpoint = self._config.get("cdp_endpoint") or ""
         persistent_flag = self._config.get("persistent", True)
         user_data_dir_cfg = self._config.get("user_data_dir")
         if user_data_dir_cfg is None:
             user_data_dir_cfg = _DEFAULT_USER_DATA_DIR
 
+        self._channel: Optional[str] = None
         self._cdp_endpoint: str = cdp_endpoint.strip() if isinstance(cdp_endpoint, str) else ""
         if self._cdp_endpoint:
             self._launch_mode = "cdp"
@@ -342,6 +349,22 @@ class BrowserService:
         else:
             self._launch_mode = "fresh"
             self._user_data_dir = ""
+
+        # Resolve which browser engine to drive (system Chrome vs downloaded
+        # Chromium). Deferred detection failures are surfaced at launch time.
+        if self._launch_mode != "cdp":
+            try:
+                from agent.tools.browser.browser_env import resolve_engine
+                engine = resolve_engine(self._config)
+                if engine["mode"] == "system-chrome":
+                    self._channel = engine["channel"]
+                    logger.info(f"[Browser] Engine resolved: {engine['reason']}")
+                elif engine["mode"] == "playwright-chromium":
+                    logger.info(f"[Browser] Engine resolved: {engine['reason']}")
+                else:
+                    logger.info(f"[Browser] No ready engine yet: {engine['reason']}")
+            except Exception as e:
+                logger.debug(f"[Browser] Engine resolution skipped: {e}")
 
         # Idle auto-release
         idle_cfg = self._config.get("idle_timeout")
@@ -428,11 +451,30 @@ class BrowserService:
 
     def _launch_browser(self):
         """Launch / connect Chromium on the background thread."""
+        # Point Playwright at our pinned download dir before any launch so a
+        # bundled-Chromium fallback finds the browser downloaded to ~/.cow.
+        try:
+            from agent.tools.browser.browser_env import apply_browsers_path_env
+            apply_browsers_path_env()
+        except Exception as e:
+            logger.debug(f"[Browser] apply_browsers_path_env skipped: {e}")
+
         if self._headless is None:
             headless_cfg = self._config.get("headless")
             self._headless = headless_cfg if headless_cfg is not None else _should_use_headless()
 
-        launch_args = ["--disable-dev-shm-usage"]
+        launch_args = [
+            "--disable-dev-shm-usage",
+            # Trim first-launch overhead: skip the first-run wizard, the default
+            # browser prompt, and Chrome's background/component network chatter.
+            # These have no effect on page interaction but noticeably speed up
+            # cold starts and each navigation.
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-features=Translate,OptimizationHints",
+        ]
         if self._headless:
             launch_args.append("--no-sandbox")
 
@@ -475,12 +517,20 @@ class BrowserService:
         logger.info("[Browser] Browser ready")
 
     def _launch_fresh(self, launch_args: List[str], viewport: Dict[str, int], user_agent: str):
-        """Classic launch: brand new Chromium with an empty context."""
-        logger.info(f"[Browser] Launching Chromium (fresh, headless={self._headless})")
-        self._browser = self._playwright.chromium.launch(
-            headless=self._headless,
-            args=launch_args,
-        )
+        """Classic launch: brand new Chromium with an empty context.
+
+        When `self._channel` is set (e.g. "chrome"/"msedge"), Playwright drives
+        the user's installed system browser instead of its own Chromium.
+        """
+        engine_label = f"system:{self._channel}" if self._channel else "chromium"
+        logger.info(f"[Browser] Launching {engine_label} (fresh, headless={self._headless})")
+        launch_kwargs: Dict[str, Any] = {
+            "headless": self._headless,
+            "args": launch_args,
+        }
+        if self._channel:
+            launch_kwargs["channel"] = self._channel
+        self._browser = self._playwright.chromium.launch(**launch_kwargs)
         self._context = self._browser.new_context(
             viewport=viewport,
             user_agent=user_agent,
@@ -491,18 +541,25 @@ class BrowserService:
     def _launch_persistent(self, launch_args: List[str], viewport: Dict[str, int], user_agent: str):
         """Launch Chromium with a persistent user_data_dir so login state survives."""
         os.makedirs(self._user_data_dir, exist_ok=True)
+        engine_label = f"system:{self._channel}" if self._channel else "chromium"
         logger.info(
-            f"[Browser] Launching Chromium (persistent, headless={self._headless}, "
+            f"[Browser] Launching {engine_label} (persistent, headless={self._headless}, "
             f"profile={self._user_data_dir})"
         )
+        persistent_kwargs: Dict[str, Any] = {
+            "user_data_dir": self._user_data_dir,
+            "headless": self._headless,
+            "args": launch_args,
+            "viewport": viewport,
+            "user_agent": user_agent,
+        }
+        # When driving a system browser, let it use its real UA instead of the
+        # spoofed Chromium one (avoids UA/engine mismatch on real Chrome/Edge).
+        if self._channel:
+            persistent_kwargs["channel"] = self._channel
+            persistent_kwargs.pop("user_agent", None)
         try:
-            self._context = self._playwright.chromium.launch_persistent_context(
-                user_data_dir=self._user_data_dir,
-                headless=self._headless,
-                args=launch_args,
-                viewport=viewport,
-                user_agent=user_agent,
-            )
+            self._context = self._playwright.chromium.launch_persistent_context(**persistent_kwargs)
         except Exception as e:
             # Profile is locked when another Chromium instance already holds it.
             msg = str(e).lower()
@@ -687,11 +744,15 @@ class BrowserService:
         except Exception as e:
             return {"error": f"Navigation failed: {e}"}
 
+        # SPAs keep long-lived connections (websockets, polling, analytics) and
+        # rarely reach true "networkidle", so waiting the full timeout is wasted
+        # time. domcontentloaded already gives a usable DOM; give the page a
+        # short grace period for initial render/XHR, then proceed.
         try:
-            page.wait_for_load_state("networkidle", timeout=8000)
+            page.wait_for_load_state("networkidle", timeout=1500)
         except Exception:
             pass
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(300)
 
         try:
             title = page.title()

@@ -1320,6 +1320,7 @@ class WebChannel(ChatChannel):
             '/api/messages/delete', 'MessageDeleteHandler',
             '/api/logs', 'LogsHandler',
             '/api/version', 'VersionHandler',
+            '/mcp/oauth/callback', 'McpOAuthCallbackHandler',
             '/assets/(.*)', 'AssetsHandler',
         )
         app = web.application(urls, globals(), autoreload=False)
@@ -1381,6 +1382,64 @@ class HealthHandler:
         web.header('Content-Type', 'application/json; charset=utf-8')
         web.header('Cache-Control', 'no-store')
         return json.dumps({"status": "ok"})
+
+
+class McpOAuthCallbackHandler:
+    """OAuth redirect target for MCP servers requiring authorization.
+
+    The browser lands here after the user authorizes a remote MCP server.
+    We exchange the authorization code for tokens and bring the server
+    online. Unauthenticated by design: the OAuth `state` param is the
+    single-use secret that binds this request to a pending authorization.
+    """
+
+    def GET(self):
+        web.header('Content-Type', 'text/html; charset=utf-8')
+        params = web.input(code="", state="", error="", error_description="")
+
+        def _page(title: str, message: str) -> str:
+            return (
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                f"<title>{title}</title></head>"
+                "<body style='font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
+                "max-width:520px;margin:64px auto;padding:0 20px;text-align:center;color:#1f2328'>"
+                f"<h2>{title}</h2><p style='color:#57606a'>{message}</p></body></html>"
+            )
+
+        if params.error:
+            logger.warning(f"[MCP-OAuth] callback error: {params.error} {params.error_description}")
+            return _page("授权失败", f"{params.error}: {params.error_description or ''}")
+
+        if not params.code or not params.state:
+            return _page("参数缺失", "回调缺少 code 或 state 参数。")
+
+        try:
+            from agent.tools.mcp.mcp_oauth import pop_pending
+            from agent.tools.mcp.mcp_client import notify_server_authorized
+        except Exception as e:
+            logger.warning(f"[MCP-OAuth] callback import failed: {e}")
+            return _page("内部错误", "OAuth 模块不可用。")
+
+        handler = pop_pending(params.state)
+        if handler is None:
+            return _page("会话已过期", "授权请求不存在或已过期，请重新触发授权。")
+
+        try:
+            ok = handler.finish_authorization(params.code)
+        except Exception as e:
+            logger.warning(f"[MCP-OAuth] token exchange crashed: {e}")
+            ok = False
+
+        if not ok:
+            return _page("授权失败", "换取令牌失败，请重试。")
+
+        notify_server_authorized(handler.server_name)
+        logger.info(f"[MCP-OAuth] Server '{handler.server_name}' authorized via web callback")
+        return _page(
+            "授权成功",
+            f"MCP 服务 “{handler.server_name}” 已授权，可以返回聊天继续使用了。",
+        )
 
 
 class AuthCheckHandler:
@@ -1641,11 +1700,10 @@ class ConfigHandler:
     _RECOMMENDED_MODELS = [
         const.DEEPSEEK_V4_FLASH, const.DEEPSEEK_V4_PRO,
         const.MINIMAX_M3, const.MINIMAX_M2_7_HIGHSPEED, const.MINIMAX_M2_7,
-        # claude-sonnet-5 is the Claude default; claude-fable-5 is dropped
-        # from this web console list for now.
-        const.CLAUDE_SONNET_5, const.CLAUDE_4_8_OPUS, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_SONNET, const.CLAUDE_4_6_OPUS,
+        # claude-sonnet-5 is the Claude default; claude-fable-5 follows right after it.
+        const.CLAUDE_SONNET_5, const.CLAUDE_FABLE_5, const.CLAUDE_4_8_OPUS, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_SONNET, const.CLAUDE_4_6_OPUS,
         const.GEMINI_35_FLASH, const.GEMINI_31_FLASH_LITE_PRE, const.GEMINI_31_PRO_PRE, const.GEMINI_3_FLASH_PRE,
-        const.GPT_55, const.GPT_54, const.GPT_54_MINI, const.GPT_54_NANO, const.GPT_5, const.GPT_41, const.GPT_4o,
+        const.GPT_56_LUNA, const.GPT_56_TERRA, const.GPT_56_SOL, const.GPT_55, const.GPT_54, const.GPT_54_MINI, const.GPT_54_NANO, const.GPT_5, const.GPT_41, const.GPT_4o,
         const.GLM_5_2, const.GLM_5_1, const.GLM_5_TURBO, const.GLM_5, const.GLM_4_7,
         const.QWEN37_PLUS, const.QWEN37_MAX, const.QWEN36_PLUS,
         const.DOUBAO_SEED_2_1_PRO, const.DOUBAO_SEED_2_1_TURBO, const.DOUBAO_SEED_2_CODE,
@@ -1688,7 +1746,7 @@ class ConfigHandler:
             "api_base_key": "claude_api_base",
             "api_base_default": "https://api.anthropic.com/v1",
             "api_base_placeholder": _PLACEHOLDER_V1,
-            "models": [const.CLAUDE_SONNET_5, const.CLAUDE_4_8_OPUS, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_SONNET, const.CLAUDE_4_6_OPUS],
+            "models": [const.CLAUDE_SONNET_5, const.CLAUDE_FABLE_5, const.CLAUDE_4_8_OPUS, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_SONNET, const.CLAUDE_4_6_OPUS],
         }),
         ("gemini", {
             "label": "Gemini",
@@ -1704,7 +1762,7 @@ class ConfigHandler:
             "api_base_key": "open_ai_api_base",
             "api_base_default": "https://api.openai.com/v1",
             "api_base_placeholder": _PLACEHOLDER_V1,
-            "models": [const.GPT_55, const.GPT_54, const.GPT_54_MINI, const.GPT_54_NANO, const.GPT_5, const.GPT_41, const.GPT_4o],
+            "models": [const.GPT_56_LUNA, const.GPT_56_TERRA, const.GPT_56_SOL, const.GPT_55, const.GPT_54, const.GPT_54_MINI, const.GPT_54_NANO, const.GPT_5, const.GPT_41, const.GPT_4o],
         }),
         ("zhipu", {
             "label": {"zh": "智谱AI", "en": "GLM"},
@@ -2280,9 +2338,12 @@ class ModelsHandler:
     # Anything not listed here intentionally hides the model dropdown so
     # users cannot pin a chat-only model and silently get a 4xx at runtime.
     _VISION_PROVIDER_MODELS = {
-        # OpenAI ordering matches the recommended GPT-5.4 family first, then
+        # OpenAI ordering puts the GPT-5.6 family first, then GPT-5.5/5.4,
         # GPT-5 and the GPT-4.1/4o backstops.
         "openai":    [
+            const.GPT_56_LUNA,
+            const.GPT_56_TERRA,
+            const.GPT_56_SOL,
             const.GPT_55,
             const.GPT_54,
             const.GPT_54_MINI,
@@ -2295,7 +2356,7 @@ class ModelsHandler:
         "doubao":    [const.DOUBAO_SEED_2_1_PRO, const.DOUBAO_SEED_2_1_TURBO, const.DOUBAO_SEED_2_PRO],
         "moonshot":  [const.KIMI_K2_6],
         "dashscope": [const.QWEN37_PLUS, const.QWEN36_PLUS],
-        "claudeAPI": [const.CLAUDE_SONNET_5, const.CLAUDE_4_8_OPUS, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_SONNET, const.CLAUDE_4_6_OPUS],
+        "claudeAPI": [const.CLAUDE_SONNET_5, const.CLAUDE_FABLE_5, const.CLAUDE_4_8_OPUS, const.CLAUDE_4_7_OPUS, const.CLAUDE_4_6_SONNET, const.CLAUDE_4_6_OPUS],
         "gemini":    [const.GEMINI_35_FLASH, const.GEMINI_31_FLASH_LITE_PRE, const.GEMINI_31_PRO_PRE, const.GEMINI_3_FLASH_PRE],
         "qianfan":   [const.ERNIE_45_TURBO_VL],
         # Zhipu's bot hard-codes the call to glm-5v-turbo regardless of what
@@ -2319,6 +2380,7 @@ class ModelsHandler:
             const.DOUBAO_SEED_2_1_PRO,
             const.KIMI_K2_6,
             const.CLAUDE_SONNET_5,
+            const.CLAUDE_FABLE_5,
             const.GEMINI_31_FLASH_LITE_PRE,
         ],
         # Custom OpenAI-compatible providers have no preset list — model

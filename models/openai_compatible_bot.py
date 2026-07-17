@@ -29,6 +29,24 @@ class OpenAICompatibleBot:
     Subclasses only need to override get_api_config() to provide their specific API settings.
     """
     
+    @staticmethod
+    def _is_gpt5_reasoning_model(model_name: str) -> bool:
+        """Whether the model is a GPT-5.x / o-series reasoning model.
+
+        Covers gpt-5, gpt-5.4/5.5/5.6 (including suffixed variants like
+        gpt-5.6-sol / gpt-5.6-luna) and the o1/o3/o4 families. These models
+        only accept default sampling params and, on /v1/chat/completions,
+        reject reasoning_effort together with function tools.
+        """
+        if not model_name or not isinstance(model_name, str):
+            return False
+        name = model_name.lower()
+        if name.startswith("gpt-5"):
+            return True
+        if name.startswith(("o1", "o3", "o4")):
+            return True
+        return False
+
     def get_api_config(self):
         """
         Get API configuration for this bot.
@@ -99,8 +117,10 @@ class OpenAICompatibleBot:
                 "presence_penalty": kwargs.get("presence_penalty", api_config.get('default_presence_penalty', 0.0)),
                 "stream": stream
             }
-            # GPT-5 / GPT-5.5 / o1 series only accept default temperature/top_p and reject penalty params
-            if model_name in ("gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.5", "o1", "o1-mini"):
+            # GPT-5.x / o-series reasoning models only accept default
+            # temperature/top_p and reject penalty params.
+            is_gpt5_reasoning = self._is_gpt5_reasoning_model(model_name)
+            if is_gpt5_reasoning:
                 for key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
                     request_params.pop(key, None)
             
@@ -112,6 +132,12 @@ class OpenAICompatibleBot:
             if tools:
                 request_params["tools"] = tools
                 request_params["tool_choice"] = kwargs.get("tool_choice", "auto")
+                # GPT-5.x reasoning models reject function tools combined with
+                # reasoning_effort on /v1/chat/completions unless it is "none".
+                # Force "none" so agent tool calling works without migrating to
+                # the Responses API.
+                if is_gpt5_reasoning:
+                    request_params["reasoning_effort"] = "none"
             
             # Make API call with proper configuration
             api_key = api_config.get('api_key')
