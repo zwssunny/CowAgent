@@ -9,12 +9,12 @@ logger = logging.getLogger(__name__)
 
 
 class FileCache:
-    """文件缓存管理器，按 session_id 缓存文件，TTL=2分钟"""
+    """文件缓存管理器，按 session_id 缓存文件，TTL=5分钟"""
     
-    def __init__(self, ttl=120):
+    def __init__(self, ttl=300):
         """
         Args:
-            ttl: 缓存过期时间（秒），默认2分钟
+            ttl: 缓存过期时间（秒），默认5分钟
         """
         self.cache = {}
         self.ttl = ttl

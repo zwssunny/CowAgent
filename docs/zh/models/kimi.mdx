@@ -3,7 +3,7 @@ title: Kimi
 description: Kimi（Moonshot）模型配置（文本对话 + 图像理解）
 ---
 
-Kimi 由 Moonshot 提供，支持文本对话与图像理解，`kimi-k2.x` 系列原生支持视觉。
+Kimi 由 Moonshot 提供，支持文本对话与图像理解，`kimi-k3` 与 `kimi-k2.x` 系列原生支持视觉。
 
 <Tip>
   通过 Web 控制台的「模型管理」页面可一站式配置以下全部能力，无需手动改配置文件。
@@ -13,15 +13,15 @@ Kimi 由 Moonshot 提供，支持文本对话与图像理解，`kimi-k2.x` 系�
 
 ```json
 {
-  "model": "kimi-k2.7-code",
+  "model": "kimi-k3",
   "moonshot_api_key": "YOUR_API_KEY"
 }
 ```
 
 | 参数 | 说明 |
 | --- | --- |
-| `model` | 可填 `kimi-k2.7-code`、`kimi-k2.7-code-highspeed`、`kimi-k2.6`、`kimi-k2.5`、`kimi-k2`、`moonshot-v1-8k`、`moonshot-v1-32k`、`moonshot-v1-128k` |
-| `moonshot_api_key` | 在 [Moonshot 控制台](https://platform.moonshot.cn/console/api-keys) 创建 |
+| `model` | 可填 `kimi-k3`、`kimi-k2.7-code`、`kimi-k2.7-code-highspeed`、`kimi-k2.6`、`kimi-k2.5`、`kimi-k2`、`moonshot-v1-8k`、`moonshot-v1-32k`、`moonshot-v1-128k` |
+| `moonshot_api_key` | 在 [Moonshot 控制台](https://platform.kimi.com?aff=cowagent) 创建 |
 | `moonshot_base_url` | 可选，默认为 `https://api.moonshot.cn/v1` |
 
 ## 图像理解

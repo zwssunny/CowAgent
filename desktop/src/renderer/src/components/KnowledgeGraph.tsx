@@ -58,7 +58,17 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
       degree.set(l.source, (degree.get(l.source) || 0) + 1)
       degree.set(l.target, (degree.get(l.target) || 0) + 1)
     })
-    const categories = Array.from(new Set(data.nodes.map((n) => n.category || 'default')))
+    // Order categories by node count so the dominant cluster gets the most
+    // salient palette entry instead of whichever colour insertion order landed
+    // on. Ties break by name to keep the mapping stable across reloads.
+    const catCount = new Map<string, number>()
+    data.nodes.forEach((n) => {
+      const c = n.category || 'default'
+      catCount.set(c, (catCount.get(c) || 0) + 1)
+    })
+    const categories = Array.from(catCount.keys()).sort(
+      (a, b) => catCount.get(b)! - catCount.get(a)! || a.localeCompare(b)
+    )
     const colorOf = (cat: string) => TABLEAU10[categories.indexOf(cat) % TABLEAU10.length]
 
     const n = data.nodes.length || 1
@@ -253,17 +263,26 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
   }
 
   // Wheel zoom centered on the cursor (matches d3.zoom scaleExtent [0.2, 5]).
-  const onWheel = (e: React.WheelEvent) => {
-    e.preventDefault()
-    const v = viewRef.current
-    const rect = svgRef.current!.getBoundingClientRect()
-    const px = e.clientX - rect.left
-    const py = e.clientY - rect.top
-    const factor = Math.exp(-e.deltaY * 0.0015)
-    const k = Math.min(5, Math.max(0.2, v.k * factor))
-    viewRef.current = { k, x: px - ((px - v.x) / v.k) * k, y: py - ((py - v.y) / v.k) * k }
-    applyView()
-  }
+  // React attaches `wheel` passively at the root, where preventDefault is a
+  // no-op that only logs a warning — bind natively with `passive: false` so the
+  // page does not scroll while zooming.
+  useEffect(() => {
+    const svg = svgRef.current
+    if (!svg) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const v = viewRef.current
+      const rect = svg.getBoundingClientRect()
+      const px = e.clientX - rect.left
+      const py = e.clientY - rect.top
+      const factor = Math.exp(-e.deltaY * 0.0015)
+      const k = Math.min(5, Math.max(0.2, v.k * factor))
+      viewRef.current = { k, x: px - ((px - v.x) / v.k) * k, y: py - ((py - v.y) / v.k) * k }
+      applyView()
+    }
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    return () => svg.removeEventListener('wheel', onWheel)
+  }, [])
 
   // Drag: on a node moves the node, on background pans the canvas.
   const dragRef = useRef<
@@ -334,7 +353,6 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
         width={w}
         height={h}
         className="select-none block cursor-grab active:cursor-grabbing"
-        onWheel={onWheel}
         onPointerDown={onPointerDownBg}
         onPointerMove={onPointerMove}
         onPointerUp={(e) => onPointerUp(e)}

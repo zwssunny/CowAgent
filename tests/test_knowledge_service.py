@@ -296,3 +296,25 @@ def test_import_documents_rejects_large_files_and_batches(tmp_path):
     assert too_many["code"] == 403
     assert "too many files" in too_many["message"]
     assert manager.synced == 0
+
+
+def test_build_graph_resolves_encoded_and_anchored_links(tmp_path):
+    svc, _ = service(tmp_path)
+    root = tmp_path / "knowledge"
+    (root / "concepts").mkdir()
+    (root / "sources").mkdir()
+    (root / "sources/训练记录 07.md").write_text("# 训练记录", encoding="utf-8")
+    (root / "concepts/rag.md").write_text("# RAG", encoding="utf-8")
+    (root / "concepts/health.md").write_text(
+        "# Health\n"
+        "- [记录](../sources/%E8%AE%AD%E7%BB%83%E8%AE%B0%E5%BD%95%2007.md)\n"
+        "- [RAG](./rag.md#chunking)\n"
+        "- [外部](https://example.com/a.md)\n",
+        encoding="utf-8",
+    )
+
+    graph = svc.build_graph()
+    edges = {(l["source"], l["target"]) for l in graph["links"]}
+    assert ("concepts/health.md", "sources/训练记录 07.md") in edges
+    assert ("concepts/health.md", "concepts/rag.md") in edges
+    assert len(edges) == 2

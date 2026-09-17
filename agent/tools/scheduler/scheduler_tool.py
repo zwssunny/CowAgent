@@ -30,14 +30,16 @@ class SchedulerTool(BaseTool):
         "- once: 一次性任务，支持相对时间(+5s,+10m,+1h,+1d)或ISO时间\n"
         "- interval: 固定间隔(秒)，如3600表示每小时\n"
         "- cron: cron表达式，如'0 8 * * *'表示每天8点\n\n"
-        "注意：'X秒后'用once+相对时间，'每X秒'用interval"
+        "注意：'X秒后'用once+相对时间，'每X秒'用interval\n"
+        "For Web cross-channel delivery, call action='list_recipients' first, "
+        "then create a task (fixed message or ai_task) using the returned channel_type and receiver."
     )
     params: dict = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "list", "get", "delete", "enable", "disable"],
+                "enum": ["create", "list", "list_recipients", "get", "delete", "enable", "disable"],
                 "description": "操作类型: create(创建), list(列表), get(查询), delete(删除), enable(启用), disable(禁用)"
             },
             "task_id": {
@@ -54,7 +56,10 @@ class SchedulerTool(BaseTool):
             },
             "ai_task": {
                 "type": "string",
-                "description": "AI任务描述 (与message二选一)，用于定时让AI执行的任务"
+                "description": (
+                    "任务描述 (与message二选一)，描述到点时需要 Agent 执行的任务，例如执行什么操作、交付什么内容，"
+                    "无需重复声明调度时间（由 schedule 决定）。"
+                )
             },
             "schedule_type": {
                 "type": "string",
@@ -64,7 +69,24 @@ class SchedulerTool(BaseTool):
             "schedule_value": {
                 "type": "string",
                 "description": "调度值: cron表达式/间隔秒数/时间(+5s,+10m,+1h或ISO格式)"
-            }
+            },
+            "silent": {
+                "type": "boolean",
+                "default": False,
+                "description": "Silent mode (default false): when true, the task runs normally but its result is not pushed. Set true only when the user explicitly says they don't need the result; reminder, notification and broadcast tasks must keep it false"
+            },
+            "channel_type": {
+                "type": "string",
+                "description": "Target channel type for a Web-created cross-channel task. Use list_recipients first."
+            },
+            "instance_id": {
+                "type": "string",
+                "description": "The specific channel instance the recipient belongs to, as returned by list_recipients. Required when a channel type runs more than one instance; the same receiver on two instances is two different targets. Omit for a single-instance channel."
+            },
+            "receiver": {
+                "type": "string",
+                "description": "Trusted target receiver returned by list_recipients. It cannot be an arbitrary user ID."
+            },
         },
         "required": ["action"]
     }
@@ -75,6 +97,7 @@ class SchedulerTool(BaseTool):
         
         # Will be set by agent bridge
         self.task_store = None
+        self.recipient_store = None
         self.current_context = None
     
     def execute(self, params: dict) -> ToolResult:
@@ -102,6 +125,9 @@ class SchedulerTool(BaseTool):
                 return ToolResult.success(result)
             elif action == "list":
                 result = self._list_tasks(**kwargs)
+                return ToolResult.success(result)
+            elif action == "list_recipients":
+                result = self._list_recipients(**kwargs)
                 return ToolResult.success(result)
             elif action == "get":
                 result = self._get_task(**kwargs)
@@ -154,6 +180,24 @@ class SchedulerTool(BaseTool):
             return "错误: 无法获取当前对话上下文"
         
         context = self.current_context
+
+        target_channel = kwargs.get("channel_type")
+        target_receiver = kwargs.get("receiver")
+        # A channel type can run several instances; delivery must go back through
+        # the exact one that saw the contact. When the caller does not name an
+        # instance (legacy single-instance channel), it equals the channel type.
+        target_instance = kwargs.get("instance_id") or target_channel
+        target = None
+        if target_channel or target_receiver:
+            if context.get("channel_type") != "web":
+                return "Error: cross-channel recipients can only be selected from the Web console"
+            if not target_channel or not target_receiver:
+                return "Error: channel_type and receiver must be provided together"
+            if not self.recipient_store:
+                return "Error: trusted recipient directory is unavailable"
+            target = self.recipient_store.get(target_instance, target_receiver)
+            if not target:
+                return "Error: target is not in the trusted recipient directory; use list_recipients"
         
         # Create task
         task_id = str(uuid.uuid4())[:8]
@@ -161,38 +205,59 @@ class SchedulerTool(BaseTool):
         # Capture the real chat session_id at task creation time so that scheduler
         # can later inject the delivered output into the user's actual conversation
         # (in group chats, session_id != receiver, e.g. "user_id:group_id" on feishu).
-        notify_session_id = context.get("session_id")
+        notify_session_id = target["session_id"] if target else context.get("session_id")
+        receiver = target["receiver"] if target else context.get("receiver")
+        receiver_name = target["name"] if target else self._get_receiver_name(context)
+        is_group = target["is_group"] if target else context.get("isgroup", False)
+        channel_type = target["channel_type"] if target else self.config.get("channel_type", "unknown")
+        # The instance to deliver back through: the target's own for a
+        # cross-channel task, else this conversation's. Defaults to the channel
+        # type so a legacy single-instance channel keeps resolving as before.
+        instance_id = (
+            target.get("instance_id") if target else context.get("instance_id")
+        ) or channel_type
 
         # Build action based on message or ai_task
         if message:
             action = {
                 "type": "send_message",
                 "content": message,
-                "receiver": context.get("receiver"),
-                "receiver_name": self._get_receiver_name(context),
-                "is_group": context.get("isgroup", False),
-                "channel_type": self.config.get("channel_type", "unknown"),
+                "receiver": receiver,
+                "receiver_name": receiver_name,
+                "is_group": is_group,
+                "channel_type": channel_type,
+                "instance_id": instance_id,
                 "notify_session_id": notify_session_id,
             }
         else:  # ai_task
             action = {
                 "type": "agent_task",
                 "task_description": ai_task,
-                "receiver": context.get("receiver"),
-                "receiver_name": self._get_receiver_name(context),
-                "is_group": context.get("isgroup", False),
-                "channel_type": self.config.get("channel_type", "unknown"),
+                "receiver": receiver,
+                "receiver_name": receiver_name,
+                "is_group": is_group,
+                "channel_type": channel_type,
+                "instance_id": instance_id,
                 "notify_session_id": notify_session_id,
             }
+            # silent only applies to ai_task; fixed messages always deliver
+            if kwargs.get("silent", False):
+                action["silent"] = True
         
         # 针对钉钉单聊，额外存储 sender_staff_id
         msg = context.kwargs.get("msg")
         if msg and hasattr(msg, 'sender_staff_id') and not context.get("isgroup", False):
             action["dingtalk_sender_staff_id"] = msg.sender_staff_id
         
+        # The Agent this task runs as. Stored on the task (not implied by which
+        # file it lives in) so the global scheduler can scope execution to it and
+        # so re-binding a channel instance to a different Agent never moves data.
+        owner_agent_id = self._resolve_owner_agent_id(context, target)
+
         task_data = {
             "id": task_id,
             "name": name,
+            "agent_id": owner_agent_id,
             "enabled": True,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
@@ -216,14 +281,17 @@ class SchedulerTool(BaseTool):
             content_desc = f"💬 固定消息: {message}"
         else:
             content_desc = f"🤖 AI任务: {ai_task}"
-        
+
+        # Warn the user at creation time so a mistaken silent flag is easy to spot
+        silent_desc = "\n🔇 静默模式: 执行后不会推送结果" if action.get("silent") else ""
+
         return (
             f"✅ 定时任务创建成功\n\n"
             f"📋 任务ID: {task_id}\n"
             f"📝 名称: {name}\n"
             f"⏰ 调度: {schedule_desc}\n"
             f"👤 接收者: {receiver_desc}\n"
-            f"{content_desc}\n"
+            f"{content_desc}{silent_desc}\n"
             f"🕐 下次执行: {next_run.strftime('%Y-%m-%d %H:%M:%S') if next_run else '未知'}"
         )
     
@@ -247,6 +315,25 @@ class SchedulerTool(BaseTool):
                 f"   ⏰ {schedule_desc} | 下次: {next_run_str}"
             )
         
+        return "\n".join(lines)
+
+    def _list_recipients(self, **kwargs) -> str:
+        """List trusted targets available to the Web scheduler."""
+        if not self.current_context or self.current_context.get("channel_type") != "web":
+            return "Error: trusted recipients can only be listed from the Web console"
+        if not self.recipient_store:
+            return "Error: trusted recipient directory is unavailable"
+        recipients = self.recipient_store.list()
+        if not recipients:
+            return "No trusted recipients yet. A recipient must contact CowAgent first."
+        lines = ["Trusted scheduler recipients:"]
+        for item in recipients:
+            kind = "group" if item["is_group"] else "user"
+            instance_id = item.get("instance_id") or item["channel_type"]
+            lines.append(
+                f"- {item['name']} ({kind}): channel_type={item['channel_type']}, "
+                f"instance_id={instance_id}, receiver={item['receiver']}"
+            )
         return "\n".join(lines)
     
     def _get_task(self, **kwargs) -> str:
@@ -451,3 +538,43 @@ class SchedulerTool(BaseTool):
         except Exception:
             pass
         return "未知"
+
+    def _resolve_owner_agent_id(self, context: Context, target: Optional[dict]) -> str:
+        """Which Agent the new task runs as.
+
+        For a cross-channel task the owner is the Agent the target's channel
+        instance is bound to (delivery and identity should match how an inbound
+        message from that instance would route). For a normal conversation task
+        it is simply the Agent handling this conversation. Falls back to the
+        ambient runtime identity, then the default Agent.
+        """
+        # Cross-channel: derive from the target instance's binding.
+        if target:
+            iid = (target.get("instance_id") or "").strip()
+            if iid:
+                try:
+                    from channel.channel_instances import get_instance
+                    from config import conf as _conf
+
+                    inst = get_instance(_conf(), iid)
+                    if inst and getattr(inst, "agent_id", ""):
+                        return inst.agent_id
+                except Exception:
+                    pass
+        # Conversation task: the Agent on the context, else ambient identity.
+        agent_id = (context.get("agent_id") if context else "") or ""
+        if not agent_id:
+            try:
+                from common.runtime_identity import current_identity
+
+                agent_id = current_identity().agent_id or ""
+            except Exception:
+                agent_id = ""
+        if agent_id:
+            return agent_id
+        try:
+            from agent.registry import get_agent_registry
+
+            return get_agent_registry().default_agent_id
+        except Exception:
+            return ""

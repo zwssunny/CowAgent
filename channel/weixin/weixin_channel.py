@@ -31,6 +31,10 @@ BACKOFF_DELAY = 30
 RETRY_DELAY = 2
 SESSION_EXPIRED_ERRCODE = -14
 TEXT_CHUNK_LIMIT = 4000
+# How long a text message will wait for a concurrently-sent image/file to
+# finish downloading into the cache before being handled without it.
+PENDING_MEDIA_WAIT_S = 3.0
+PENDING_MEDIA_POLL_S = 0.1
 QR_LOGIN_TIMEOUT_S = 480
 QR_MAX_REFRESHES = 10
 
@@ -80,6 +84,12 @@ class WeixinChannel(ChatChannel):
         self._context_tokens = {}
         self._context_tokens_lock = threading.Lock()
         self._received_msgs = ExpiredDict(60 * 60 * 7.1)
+        # session_id -> deadline(ts) until which an inbound image/file is
+        # expected to finish downloading into the file cache. Lets a text
+        # message that arrives together with (but slightly ahead of) an image
+        # wait for the media path instead of reaching the agent without it.
+        self._pending_media = {}
+        self._pending_media_lock = threading.Lock()
         self._get_updates_buf = ""
         self._credentials_path = ""
         self.login_status = self.LOGIN_STATUS_IDLE
@@ -92,11 +102,16 @@ class WeixinChannel(ChatChannel):
     def startup(self):
         self._stop_event.clear()
 
-        base_url = conf().get("weixin_base_url", DEFAULT_BASE_URL)
+        base_url = self.cfg("weixin_base_url", DEFAULT_BASE_URL)
         cdn_base_url = conf().get("weixin_cdn_base_url", CDN_BASE_URL)
-        token = conf().get("weixin_token", "")
+        token = self.cfg("weixin_token", "")
 
-        self._credentials_path = get_weixin_credentials_path()
+        # Isolate the token file per instance so two Weixin accounts running in
+        # one process don't overwrite each other's credentials. instance_id is
+        # empty for a single-instance (legacy) channel -> the legacy path.
+        self._credentials_path = get_weixin_credentials_path(
+            getattr(self, "instance_id", "") or ""
+        )
 
         # Always load credentials so we can restore context_tokens even when
         # the bot token itself comes from config.
@@ -105,6 +120,22 @@ class WeixinChannel(ChatChannel):
             token = creds.get("token", "")
             if creds.get("base_url"):
                 base_url = creds["base_url"]
+
+        # Fallback for an instance whose token was scanned via the QR flow: that
+        # flow writes to the default (id-less) credentials file, so the first
+        # instance to start inherits it here rather than being pushed back into
+        # a fresh scan. Claimed once — copied into this instance's own file — so
+        # a later restart reads it from the per-instance path directly.
+        if not token and getattr(self, "instance_id", ""):
+            legacy = _load_credentials(get_weixin_credentials_path())
+            if legacy.get("token"):
+                token = legacy["token"]
+                if legacy.get("base_url"):
+                    base_url = legacy["base_url"]
+                logger.info(
+                    f"[Weixin] instance '{self.instance_id}' inherited its token "
+                    f"from the QR-login default file"
+                )
 
         # Restore persisted context_tokens so scheduler can deliver pushes
         # immediately after restart, without waiting for the user to ping
@@ -422,9 +453,13 @@ class WeixinChannel(ChatChannel):
                 if new_buf:
                     self._get_updates_buf = new_buf
 
-                # Process messages
+                # Process messages. Media (image/file/video) messages are
+                # handled before text ones within the same batch so that a
+                # text message sent together with an image finds the image
+                # already in the cache (the media download would otherwise let
+                # the text win the race and reach the agent without the media).
                 msgs = resp.get("msgs", [])
-                for raw_msg in msgs:
+                for raw_msg in self._order_msgs(msgs):
                     try:
                         self._process_message(raw_msg)
                     except Exception as e:
@@ -444,6 +479,57 @@ class WeixinChannel(ChatChannel):
 
         logger.info("[Weixin] Long-poll loop ended")
 
+    @staticmethod
+    def _raw_msg_has_media(raw_msg: dict) -> bool:
+        """Whether a raw message carries a media item (image/voice/file/video)."""
+        from channel.weixin.weixin_message import (
+            ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO,
+        )
+        media_types = {ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO}
+        for item in raw_msg.get("item_list", []):
+            if item.get("type") in media_types:
+                return True
+            ref_mi = item.get("ref_msg", {}).get("message_item", {})
+            if ref_mi.get("type") in media_types:
+                return True
+        return False
+
+    def _order_msgs(self, msgs: list) -> list:
+        """Stable-sort a batch so media-bearing messages come before pure text.
+
+        Only USER messages (message_type == 1) are considered media candidates;
+        ordering is otherwise stable to preserve the original sequence.
+        """
+        def is_media(m):
+            return m.get("message_type", 0) == 1 and self._raw_msg_has_media(m)
+        media = [m for m in msgs if is_media(m)]
+        rest = [m for m in msgs if not is_media(m)]
+        return media + rest
+
+    def _mark_pending_media(self, session_id: str):
+        with self._pending_media_lock:
+            self._pending_media[session_id] = time.time() + PENDING_MEDIA_WAIT_S
+
+    def _clear_pending_media(self, session_id: str):
+        with self._pending_media_lock:
+            self._pending_media.pop(session_id, None)
+
+    def _wait_for_pending_media(self, session_id: str, file_cache):
+        """Block briefly if a media download for this session is in flight.
+
+        Handles the case where an image and a text message are delivered in
+        separate poll batches and the text is processed first: give the media
+        a short window to land in the cache before the text reaches the agent.
+        """
+        with self._pending_media_lock:
+            deadline = self._pending_media.get(session_id)
+        if not deadline:
+            return
+        while time.time() < deadline:
+            if file_cache.get(session_id):
+                return
+            time.sleep(PENDING_MEDIA_POLL_S)
+
     def _process_message(self, raw_msg: dict):
         """Parse a single inbound message and produce to the handling queue."""
         msg_type = raw_msg.get("message_type", 0)
@@ -461,11 +547,21 @@ class WeixinChannel(ChatChannel):
         if context_token and from_user:
             self._update_context_token(from_user, context_token)
 
+        session_id = from_user
+        # Mark media as in-flight *before* the (slow) synchronous download so a
+        # text message from the same user that is processed first can wait for
+        # it (see _wait_for_pending_media).
+        has_media = self._raw_msg_has_media(raw_msg)
+        if has_media and session_id:
+            self._mark_pending_media(session_id)
+
         cdn_base_url = self.api.cdn_base_url if self.api else CDN_BASE_URL
         try:
             wx_msg = WeixinMessage(raw_msg, cdn_base_url=cdn_base_url)
         except Exception as e:
             logger.error(f"[Weixin] Failed to parse WeixinMessage: {e}", exc_info=True)
+            if has_media and session_id:
+                self._clear_pending_media(session_id)
             return
 
         logger.info(f"[Weixin] Received: from={from_user} ctype={wx_msg.ctype} "
@@ -474,21 +570,31 @@ class WeixinChannel(ChatChannel):
         # File cache logic
         from channel.file_cache import get_file_cache
         file_cache = get_file_cache()
-        session_id = from_user
 
         if wx_msg.ctype == ContextType.IMAGE:
             if hasattr(wx_msg, "image_path") and wx_msg.image_path:
                 file_cache.add(session_id, wx_msg.image_path, file_type="image")
                 logger.info(f"[Weixin] Image cached for session {session_id}")
+            self._clear_pending_media(session_id)
             return
 
         if wx_msg.ctype == ContextType.FILE:
             wx_msg.prepare()
             file_cache.add(session_id, wx_msg.content, file_type="file")
             logger.info(f"[Weixin] File cached for session {session_id}: {wx_msg.content}")
+            self._clear_pending_media(session_id)
             return
 
         if wx_msg.ctype == ContextType.TEXT:
+            if has_media:
+                # This message already carries its own media inline; its ref was
+                # attached during parsing, so just release the in-flight marker.
+                self._clear_pending_media(session_id)
+            else:
+                # A media message from the same user may still be downloading (it
+                # can arrive in a separate poll batch); wait briefly so its path
+                # gets attached instead of the agent answering without the image.
+                self._wait_for_pending_media(session_id, file_cache)
             cached_files = file_cache.get(session_id)
             if cached_files:
                 refs = []
@@ -511,6 +617,8 @@ class WeixinChannel(ChatChannel):
             no_need_at=True,
         )
         if context:
+            from agent.team_addressing import stamp_speaker_from_channel
+            stamp_speaker_from_channel(self, context, wx_msg.content)
             self.produce(context)
 
     # ── _compose_context ───────────────────────────────────────────────
@@ -520,6 +628,7 @@ class WeixinChannel(ChatChannel):
         context.kwargs = kwargs
         if "channel_type" not in context:
             context["channel_type"] = self.channel_type
+        self.stamp_instance_context(context)
         if "origin_ctype" not in context:
             context["origin_ctype"] = ctype
 
@@ -554,15 +663,33 @@ class WeixinChannel(ChatChannel):
         context_token = self._get_context_token(receiver, msg)
 
         if not context_token:
-            logger.error(f"[Weixin] No context_token for receiver={receiver}, cannot send")
-            return
+            # Raise rather than return: a scheduled push routes through this same
+            # send(), and the scheduler treats a silent return as "delivered" and
+            # deletes a one-time task. Without a context_token the message cannot
+            # go out, so surface it as a failure the caller can defer/retry on.
+            raise RuntimeError(
+                f"[Weixin] No context_token for receiver={receiver}, cannot send"
+            )
+
+        # A media reply can carry an accompanying message (the agent's summary of
+        # the file it just sent). ilink has no caption field, so it goes out as a
+        # separate bubble first. Image replies are skipped: chat_channel already
+        # splits their text off before we get here, and doing it again would
+        # duplicate the bubble.
+        text_content = getattr(reply, "text_content", "") or ""
+        if text_content and reply.type not in (ReplyType.TEXT, ReplyType.IMAGE_URL, ReplyType.IMAGE):
+            self._send_text(text_content, receiver, context_token)
+            time.sleep(0.3)
 
         if reply.type == ReplyType.TEXT:
             self._send_text(reply.content, receiver, context_token)
         elif reply.type in (ReplyType.IMAGE_URL, ReplyType.IMAGE):
             self._send_image(reply.content, receiver, context_token)
         elif reply.type == ReplyType.FILE:
-            self._send_file(reply.content, receiver, context_token)
+            if getattr(reply, "file_type", "") == "video":
+                self._send_video(reply.content, receiver, context_token)
+            else:
+                self._send_file(reply.content, receiver, context_token)
         elif reply.type in (ReplyType.VIDEO, ReplyType.VIDEO_URL):
             self._send_video(reply.content, receiver, context_token)
         elif reply.type == ReplyType.VOICE:

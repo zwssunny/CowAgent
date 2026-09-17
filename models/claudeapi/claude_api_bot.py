@@ -28,6 +28,36 @@ except Exception as e:
 
 user_session = dict()
 
+# Anthropic exposes two mutually exclusive thinking controls. The 4.6
+# generation and newer only accept ``adaptive`` (strength then comes from
+# ``output_config.effort``) and reject ``enabled``; 4.5 and earlier only accept
+# ``enabled`` with an explicit ``budget_tokens`` and reject ``adaptive``.
+ADAPTIVE_THINKING_MODELS = (
+    "claude-fable-5-1",
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+)
+
+# Models that only take the ``enabled`` + ``budget_tokens`` form. Checked after
+# ADAPTIVE_THINKING_MODELS, since 4.6-generation names share these prefixes.
+BUDGET_THINKING_MODELS = (
+    "claude-3-7",
+    "claude-opus-4",
+    "claude-sonnet-4",
+    "claude-haiku-4",
+)
+
+# Upper bound for the legacy budget so a large max_tokens does not license an
+# unbounded thinking pass.
+MAX_THINKING_BUDGET = 16000
+
 
 # OpenAI对话模型API (可用)
 class ClaudeAPIBot(Bot, OpenAIImage):
@@ -213,20 +243,58 @@ class ClaudeAPIBot(Bot, OpenAIImage):
 
     def _get_max_tokens(self, model: str) -> int:
         """
-        Get max_tokens for the model.
-        Reference from pi-mono:
+        Get the request's max_tokens for the model.
+
+        Only the older Claude 3.x line has a small output cap; everything from
+        Claude 4 onward supports 64K. Default to 64K so a newly released model
+        (e.g. a future claude-*-6) does not silently regress to a tiny cap —
+        no code change needed per new model.
         - Claude 3.5/3.7: 8192
         - Claude 3 Opus: 4096
-        - Default: 8192
+        - Claude 4+ / default: 64000
         """
         if model and (model.startswith("claude-3-5") or model.startswith("claude-3-7")):
             return 8192
         elif model and model.startswith("claude-3") and "opus" in model:
             return 4096
-        elif model and (model.startswith("claude-sonnet-4") or model.startswith("claude-sonnet-5")
-                         or model.startswith("claude-opus-4") or model.startswith("claude-fable")):
-            return 64000
-        return 8192
+        return 64000
+
+    @staticmethod
+    def _thinking_params(model: str, thinking: object, max_tokens: int) -> Optional[dict]:
+        """Translate the generic thinking toggle into this model's native shape.
+
+        ``display`` must be requested explicitly: without it the API returns
+        thinking blocks whose ``thinking`` field is empty, carrying only a
+        signature. Returns ``None`` whenever a valid config cannot be built —
+        including for models with no thinking support at all — so the request
+        goes out without the field rather than being rejected.
+        """
+        if not isinstance(thinking, dict):
+            return None
+
+        lowered = (model or "").lower()
+        adaptive = lowered.startswith(ADAPTIVE_THINKING_MODELS)
+        if not adaptive and not lowered.startswith(BUDGET_THINKING_MODELS):
+            return None
+
+        if adaptive:
+            # Adaptive-only models reject ``thinking.type: disabled``. When the
+            # caller asks to disable thinking, omit the field entirely (the API
+            # then defaults to adaptive) rather than sending an unsupported value.
+            if thinking.get("type") == "disabled":
+                return None
+            return {"type": "adaptive", "display": "summarized"}
+        if thinking.get("type") == "disabled":
+            return {"type": "disabled"}
+
+        # Legacy models need a budget of at least 1024 that stays below
+        # max_tokens, since thinking tokens count towards the same limit.
+        if not isinstance(max_tokens, int):
+            return None
+        budget = min(max_tokens // 4, MAX_THINKING_BUDGET, max_tokens - 1)
+        if budget < 1024:
+            return None
+        return {"type": "enabled", "budget_tokens": budget}
 
     @staticmethod
     def _parse_data_url(data_url: str):
@@ -314,7 +382,12 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         Returns:
             Formatted response compatible with OpenAI format or generator for streaming
         """
-        actual_model = self._model_mapping(conf().get("model"))
+        # A per-session model override arrives as kwargs["model"] (see
+        # AgentLLMModel.call_stream). Prefer it over the global config so
+        # switching the model for one chat actually reaches the API; otherwise
+        # a session pinned to another provider's model would be sent here with
+        # the wrong (global) model name.
+        actual_model = self._model_mapping(kwargs.get("model") or conf().get("model"))
 
         # Extract system prompt from messages if present
         system_prompt = kwargs.get("system", conf().get("character_desc", ""))
@@ -339,19 +412,35 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         if tools:
             request_params["tools"] = tools
 
+        # Claude exposes effort under output_config rather than the generic
+        # reasoning_effort field used by OpenAI-compatible providers.
+        output_config = dict(kwargs.get("output_config") or {})
+        reasoning_effort = kwargs.get("reasoning_effort")
+        if reasoning_effort:
+            output_config["effort"] = reasoning_effort
+        if output_config:
+            request_params["output_config"] = output_config
+
+        thinking_params = self._thinking_params(
+            actual_model, kwargs.get("thinking"), request_params["max_tokens"]
+        )
+        if thinking_params:
+            request_params["thinking"] = thinking_params
+
         try:
             if stream:
                 return self._handle_stream_response(request_params)
             else:
                 return self._handle_sync_response(request_params)
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"Claude API call error: {e}")
             if stream:
                 # Return error generator for stream
                 def error_generator():
                     yield {
                         "error": True,
-                        "message": str(e),
+                        "message": error_msg,
                         "status_code": 500
                     }
 
@@ -413,12 +502,15 @@ class ClaudeAPIBot(Bot, OpenAIImage):
 
         # Extract content blocks
         text_content = ""
+        reasoning_content = ""
         tool_calls = []
 
         content_blocks = claude_response.get("content", [])
         for block in content_blocks:
             if block.get("type") == "text":
                 text_content += block.get("text", "")
+            elif block.get("type") == "thinking":
+                reasoning_content += block.get("thinking", "")
             elif block.get("type") == "tool_use":
                 tool_calls.append({
                     "id": block.get("id", ""),
@@ -434,6 +526,8 @@ class ClaudeAPIBot(Bot, OpenAIImage):
             "role": "assistant",
             "content": text_content
         }
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
         if tool_calls:
             message["tool_calls"] = tool_calls
 
@@ -476,6 +570,11 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         tool_uses_map = {}  # {index: {id, name, input}}
         current_tool_use_index = -1
         stop_reason = None  # Track stop reason from Claude
+        # Track token usage across the stream: Anthropic reports input_tokens on
+        # the message_start event and (cumulative) output_tokens on message_delta.
+        # Surfaced as a final usage chunk so the agent can show a real count.
+        usage_input_tokens = 0
+        usage_output_tokens = 0
 
         try:
             # Make streaming HTTP request
@@ -515,7 +614,13 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                             event = json.loads(line)
                             event_type = event.get("type")
 
-                            if event_type == "content_block_start":
+                            if event_type == "message_start":
+                                # Anthropic reports the prompt token count here.
+                                msg_usage = (event.get("message", {}) or {}).get("usage", {}) or {}
+                                usage_input_tokens = msg_usage.get("input_tokens", 0) or 0
+                                usage_output_tokens = msg_usage.get("output_tokens", 0) or usage_output_tokens
+
+                            elif event_type == "content_block_start":
                                 # New content block
                                 block = event.get("content_block", {})
                                 if block.get("type") == "tool_use":
@@ -569,6 +674,11 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                                 if "stop_reason" in delta:
                                     stop_reason = delta.get("stop_reason")
                                     logger.info(f"[Claude] Stream stop_reason: {stop_reason}")
+                                # Anthropic reports the (cumulative) output token
+                                # count on message_delta.
+                                md_usage = event.get("usage", {}) or {}
+                                if md_usage.get("output_tokens"):
+                                    usage_output_tokens = md_usage.get("output_tokens")
                                 
                                 # Message complete - yield tool calls if any
                                 if tool_uses_map:
@@ -599,6 +709,22 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                             elif event_type == "message_stop":
                                 # Final event - log completion
                                 logger.debug(f"[Claude] Stream completed with stop_reason: {stop_reason}")
+                                # Surface token usage as a trailing chunk (OpenAI
+                                # streaming shape) so the agent can record a real
+                                # prompt_tokens count for the context indicator.
+                                if usage_input_tokens or usage_output_tokens:
+                                    yield {
+                                        "id": event.get("id", ""),
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": request_params["model"],
+                                        "choices": [],
+                                        "usage": {
+                                            "prompt_tokens": usage_input_tokens,
+                                            "completion_tokens": usage_output_tokens,
+                                            "total_tokens": usage_input_tokens + usage_output_tokens,
+                                        },
+                                    }
 
                         except json.JSONDecodeError:
                             continue

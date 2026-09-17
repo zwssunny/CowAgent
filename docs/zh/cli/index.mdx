@@ -44,6 +44,10 @@ Memory & Knowledge:
   memory    Memory distillation (dream)
   knowledge View knowledge base stats and structure
 
+Data portability:
+  backup    Back up config and agent workspace
+  restore   Restore a CowAgent backup
+
 Others:
   help      Show this help message
   version   Show version
@@ -58,6 +62,7 @@ Others:
 | `/help` | 显示命令帮助 |
 | `/status` | 查看服务状态和配置 |
 | `/cancel` | 中止当前正在运行的 Agent 任务 |
+| `/steer <指令>` | 引导当前正在运行的 Agent 任务，不新建排队回合 |
 | `/config` | 查看或修改运行时配置 |
 | `/skill` | 管理技能（安装、卸载、启用、禁用等） |
 | `/memory dream [N]` | 手动触发记忆蒸馏（默认 3 天，最大 30） |
@@ -92,6 +97,7 @@ Others:
 | start / stop / restart | ✓ | ✗ |
 | update | ✓ | ✗ |
 | install-browser | ✓ | ✗ |
+| backup / restore | ✓ | ✗ |
 
 <Note>
   `context` 在终端中仅提示到对话中使用。`config` 仅支持在对话中修改。

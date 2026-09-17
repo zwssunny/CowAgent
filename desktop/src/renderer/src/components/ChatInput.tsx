@@ -1,11 +1,39 @@
-import React, { useState, useRef, useCallback, useEffect, forwardRef, useImperativeHandle } from 'react'
-import { Plus, Paperclip, Square, X, File as FileIcon, Loader2, Trash2 } from 'lucide-react'
+import React, { useState, useRef, useCallback, useEffect, useMemo, forwardRef, useImperativeHandle } from 'react'
+import {
+  Plus,
+  Paperclip,
+  Square,
+  X,
+  File as FileIcon,
+  Loader2,
+  AtSign,
+  Folder,
+  Mic
+} from 'lucide-react'
 import { t } from '../i18n'
-import type { Attachment } from '../types'
+import type { Attachment, WorkspaceEntry, AgentBadge } from '../types'
+import AgentAvatar from './AgentAvatar'
+import { chatDraft } from '../store/draftStore'
 import apiClient from '../api/client'
 import { PaperPlaneIcon } from './icons'
+import { WORKSPACE_DRAG_TYPE } from './FileTree'
+import { iconFor, colorFor } from '../lib/fileKind'
+import WorkspaceSelector from './WorkspaceSelector'
+import PermissionSelector from './PermissionSelector'
+import ModelSelector from './ModelSelector'
+import AgentSelector from './AgentSelector'
+import { useAgentStore, selectMultiAgent } from '../store/agentStore'
+import Tooltip from './Tooltip'
+import ContextUsagePopover from './ContextUsagePopover'
+import { useSessionSettingsStore, selectSharedConversation } from '../store/sessionSettingsStore'
 
 export type ChatInputHandle = (text: string, attachments: Attachment[]) => void
+
+// Voice input needs MediaRecorder + getUserMedia; hide the mic when absent.
+const micSupported =
+  typeof navigator !== 'undefined' &&
+  !!navigator.mediaDevices?.getUserMedia &&
+  typeof window.MediaRecorder !== 'undefined'
 
 interface SlashCommand {
   cmd: string
@@ -22,21 +50,212 @@ interface ChatInputProps {
   onClearContext: () => void
   isStreaming: boolean
   sessionId: string
+  // Navigate to the Agent config (used by the context pie's "Config" action).
+  onAdjustContext: () => void
+  // Transient toast surface owned by the page.
+  onToast?: (msg: string) => void
 }
 
 const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput(
-  { onSend, onNewChat, onStop, onClearContext, isStreaming, sessionId },
+  { onSend, onNewChat, onStop, onClearContext, isStreaming, sessionId, onAdjustContext, onToast },
   ref
 ) {
-  const [text, setText] = useState('')
-  const [attachments, setAttachments] = useState<Attachment[]>([])
+  // Restore the draft saved in `chatDraft` on mount (lazy init: the very first
+  // render must already show it, otherwise the write-through effect below would
+  // overwrite the saved draft with the initial empty state).
+  const [text, setText] = useState(() => chatDraft.text)
+  const [attachments, setAttachments] = useState(() => chatDraft.attachments)
+  // Show the Agent picker only when the install runs a team. Single-Agent
+  // clients never see it, keeping the composer row identical to before.
+  const multiAgent = useAgentStore(selectMultiAgent)
+  // A group conversation has several Agents, each answering on its own model, so
+  // there's no single per-session model to pin — hide the chip, like the web.
+  const sharedConversation = useSessionSettingsStore(
+    (s) => (s.sessionId === sessionId ? selectSharedConversation(s) : false)
+  )
   const [uploading, setUploading] = useState(false)
+  const [uploadError, setUploadError] = useState('')
+  // Locks the composer while a synchronous context compaction runs.
+  const [compacting, setCompacting] = useState(false)
+  // Bumped when a turn finishes so the context pie refetches fresh usage.
+  const [ctxRefreshKey, setCtxRefreshKey] = useState(0)
+  const wasStreamingRef = useRef(isStreaming)
   const [dragOver, setDragOver] = useState(false)
   const [slashOpen, setSlashOpen] = useState(false)
   const [slashIndex, setSlashIndex] = useState(0)
+  // `@` picker: Agent mentions (group chats only) come first, then workspace
+  // files. Agents are matched locally against the session roster; files are
+  // fetched from the backend as the user types.
+  const [mentionItems, setMentionItems] = useState<WorkspaceEntry[]>([])
+  const [mentionAgents, setMentionAgents] = useState<AgentBadge[]>([])
+  const [mentionIndex, setMentionIndex] = useState(0)
+  const mentionStartRef = useRef(-1)
+  const mentionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // The teammates addressable with @ in the current group chat. The owner (the
+  // one already replying) is left out — @ hands the turn to someone else.
+  const activeAgentId = useAgentStore((s) => s.activeAgentId)
+  const team = useSessionSettingsStore((s) => (s.sessionId === sessionId ? s.cfg?.team : undefined))
+  const mentionRoster = useMemo<AgentBadge[]>(() => {
+    if (!sharedConversation) return []
+    const roster: AgentBadge[] = []
+    for (const m of team?.members || []) {
+      if (m.id !== activeAgentId && !roster.some((a) => a.id === m.id)) roster.push(m)
+    }
+    return roster
+  }, [sharedConversation, activeAgentId, team])
   const composingRef = useRef(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Voice input: record via MediaRecorder, transcribe via the configured ASR
+  // provider (same flow as the web console's mic button).
+  const [micState, setMicState] = useState<'idle' | 'recording' | 'busy'>('idle')
+  const [micError, setMicError] = useState('')
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const chunksRef = useRef<Blob[]>([])
+  const micStartedAtRef = useRef(0)
+  const micErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const pickMicMimeType = () => {
+    const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4']
+    for (const m of candidates) {
+      if (window.MediaRecorder.isTypeSupported?.(m)) return m
+    }
+    return ''
+  }
+
+  const flashMicError = (msg: string) => {
+    setMicError(msg)
+    if (micErrorTimerRef.current) clearTimeout(micErrorTimerRef.current)
+    micErrorTimerRef.current = setTimeout(() => setMicError(''), 2500)
+  }
+
+  const stopMicStream = () => {
+    streamRef.current?.getTracks().forEach((tr) => tr.stop())
+    streamRef.current = null
+  }
+
+  const uploadRecording = async (blob: Blob) => {
+    setMicState('busy')
+    try {
+      const res = await apiClient.voiceAsr(blob)
+      if (res.status === 'success' && res.text) {
+        const recognized = res.text
+        // Fill the recognized text into the input for the user to review and send.
+        setText((prev) => (prev ? (prev.endsWith(' ') ? prev : prev + ' ') + recognized : recognized))
+        requestAnimationFrame(() => {
+          const el = textareaRef.current
+          if (el) {
+            el.focus()
+            el.selectionStart = el.selectionEnd = el.value.length
+            autoSize(el)
+          }
+        })
+      } else {
+        flashMicError(res.message || t('mic_error'))
+      }
+    } catch (e) {
+      flashMicError(`${t('mic_error')}: ${(e as Error).message}`)
+    } finally {
+      setMicState('idle')
+    }
+  }
+
+  const startRecording = async () => {
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch (e) {
+      // Surface the concrete failure name so a denied/missing-device/insecure
+      // context can be told apart instead of always blaming permissions.
+      const err = e as Error
+      flashMicError(`${t('mic_permission_denied')} (${err.name || 'Error'})`)
+      return
+    }
+    streamRef.current = stream
+    chunksRef.current = []
+    const mimeType = pickMicMimeType()
+    let recorder: MediaRecorder
+    try {
+      recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
+    } catch (e) {
+      stopMicStream()
+      flashMicError(`${t('mic_error')}: ${(e as Error).message}`)
+      return
+    }
+    mediaRecorderRef.current = recorder
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data)
+    }
+    recorder.onstop = () => {
+      stopMicStream()
+      const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' })
+      // 256 bytes ≈ container header only — treat as an accidental tap.
+      if (blob.size < 256) {
+        setMicState('idle')
+        flashMicError(t('mic_too_short'))
+        return
+      }
+      uploadRecording(blob)
+    }
+    // timeslice=250ms: flush a chunk every 250ms so very short taps aren't lost.
+    recorder.start(250)
+    micStartedAtRef.current = Date.now()
+    setMicState('recording')
+  }
+
+  const stopRecording = () => {
+    const recorder = mediaRecorderRef.current
+    if (!recorder || recorder.state === 'inactive') return
+    // Give the recorder a moment to capture at least one chunk on quick taps.
+    const elapsed = Date.now() - micStartedAtRef.current
+    const minMs = 350
+    if (elapsed < minMs) {
+      setTimeout(() => {
+        if (recorder.state !== 'inactive') recorder.stop()
+      }, minMs - elapsed)
+    } else {
+      recorder.stop()
+    }
+  }
+
+  const toggleMic = () => {
+    if (micState === 'recording') stopRecording()
+    else if (micState === 'idle') startRecording()
+  }
+
+  // Release the mic and timers when the chat page unmounts.
+  useEffect(() => {
+    return () => {
+      const recorder = mediaRecorderRef.current
+      if (recorder && recorder.state !== 'inactive') {
+        recorder.onstop = null
+        recorder.stop()
+      }
+      stopMicStream()
+      if (micErrorTimerRef.current) clearTimeout(micErrorTimerRef.current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Per-session model / permission chips follow the active conversation.
+  useEffect(() => {
+    useSessionSettingsStore.getState().refresh(sessionId)
+    useSessionSettingsStore.getState().setOpenMenu(null)
+  }, [sessionId])
+
+  // Refresh the context pie when a turn finishes (streaming true -> false) so
+  // the indicator tracks usage in real time, matching the web console.
+  useEffect(() => {
+    if (wasStreamingRef.current && !isStreaming) setCtxRefreshKey((k) => k + 1)
+    wasStreamingRef.current = isStreaming
+  }, [isStreaming])
+
+  // Also refresh when switching conversations.
+  useEffect(() => {
+    setCtxRefreshKey((k) => k + 1)
+  }, [sessionId])
 
   // Local actions ('new'/'clear') plus completion commands handled by backend
   // command plugins (cow_cli/godcmd). Commands ending with a space expect an
@@ -47,6 +266,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     { cmd: '/help', desc: t('slash_help') },
     { cmd: '/status', desc: t('slash_status') },
     { cmd: '/context', desc: t('slash_context') },
+    { cmd: '/compact', desc: t('slash_compact') },
     { cmd: '/skill list', desc: t('slash_skill_list') },
     { cmd: '/skill search ', desc: t('slash_skill_search') },
     { cmd: '/skill install ', desc: t('slash_skill_install') },
@@ -66,16 +286,16 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   // never shows a scrollbar (matches the web console behavior).
   const autoSize = (el: HTMLTextAreaElement | null) => {
     if (!el) return
-    el.style.height = '42px'
-    const h = Math.min(el.scrollHeight, 180)
+    el.style.height = '48px'
+    const h = Math.min(el.scrollHeight, 200)
     el.style.height = h + 'px'
-    el.style.overflowY = el.scrollHeight > 180 ? 'auto' : 'hidden'
+    el.style.overflowY = el.scrollHeight > 200 ? 'auto' : 'hidden'
   }
 
   const resetHeight = () => {
     const el = textareaRef.current
     if (!el) return
-    el.style.height = '42px'
+    el.style.height = '48px'
     el.style.overflowY = 'hidden'
   }
 
@@ -85,6 +305,15 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     autoSize(textareaRef.current)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Write the input through to `chatDraft` on every change so it survives this
+  // component unmounting when the user navigates to another page (chat route
+  // unmounts ChatPage; see store/draftStore.ts). Sending clears the input, which
+  // therefore also clears the saved draft.
+  useEffect(() => {
+    chatDraft.text = text
+    chatDraft.attachments = attachments
+  }, [text, attachments])
 
   // Allow the parent to load a draft (e.g. when editing a past user message).
   useImperativeHandle(ref, () => (draft: string, atts: Attachment[]) => {
@@ -137,7 +366,102 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     resetHeight()
   }, [text, attachments, isStreaming, onSend])
 
+  // The picker shows agents (group chats) then files; either being non-empty
+  // keeps it open. `mentionCount` is the combined length for keyboard nav.
+  const mentionCount = mentionAgents.length + mentionItems.length
+  const mentionOpen = mentionStartRef.current >= 0 && mentionCount > 0
+
+  const closeMention = () => {
+    mentionStartRef.current = -1
+    setMentionItems([])
+    setMentionAgents([])
+    setMentionIndex(0)
+  }
+
+  // Insert "@name " where the mention was typed, so the backend's leading-@
+  // rule routes the turn to that Agent (matches the web console).
+  const acceptAgentMention = (index: number) => {
+    const agent = mentionAgents[index]
+    const el = textareaRef.current
+    if (!agent || !el) return
+    const caret = el.selectionStart
+    const insert = `@${agent.name || agent.id} `
+    const next = text.slice(0, mentionStartRef.current) + insert + text.slice(caret)
+    const caretAfter = mentionStartRef.current + insert.length
+    setText(next)
+    closeMention()
+    requestAnimationFrame(() => {
+      el.focus()
+      el.selectionStart = el.selectionEnd = caretAfter
+      autoSize(el)
+    })
+  }
+
+  // One list, agents first. Accept whichever row the combined index lands on.
+  const acceptMentionAt = (index: number) => {
+    if (index < mentionAgents.length) acceptAgentMention(index)
+    else acceptMention(index - mentionAgents.length)
+  }
+
+  /** Reference an existing workspace file or folder in place, not as an upload. */
+  const addWorkspaceRef = (entry: WorkspaceEntry) => {
+    setAttachments((prev) =>
+      prev.some((a) => a.file_type === 'workspace_ref' && a.file_path === entry.path)
+        ? prev
+        : [
+            ...prev,
+            {
+              file_path: entry.path,
+              file_name: entry.name,
+              file_type: 'workspace_ref',
+              is_dir: entry.is_dir,
+            },
+          ]
+    )
+  }
+
+  const acceptMention = (index: number) => {
+    const item = mentionItems[index]
+    const el = textareaRef.current
+    if (!item || !el) return
+    addWorkspaceRef(item)
+    // Drop the "@query" fragment: the file rides along as an attachment.
+    const caret = el.selectionStart
+    const next = text.slice(0, mentionStartRef.current) + text.slice(caret)
+    const caretAfter = mentionStartRef.current
+    setText(next)
+    closeMention()
+    requestAnimationFrame(() => {
+      el.focus()
+      el.selectionStart = el.selectionEnd = caretAfter
+      autoSize(el)
+    })
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Mention menu takes precedence: it's only open while typing "@…".
+    if (mentionOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setMentionIndex((i) => (i + 1) % mentionCount)
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setMentionIndex((i) => (i - 1 + mentionCount) % mentionCount)
+        return
+      }
+      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+        e.preventDefault()
+        acceptMentionAt(mentionIndex)
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        closeMention()
+        return
+      }
+    }
     // Slash menu navigation
     if (slashOpen && filtered.length > 0) {
       if (e.key === 'ArrowDown') {
@@ -174,30 +498,69 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     // open slash menu when the input starts with "/" and has no space
     setSlashOpen(v.startsWith('/') && !v.includes(' '))
     setSlashIndex(0)
+
+    // Trigger the file picker on "@" at the start or after whitespace.
+    const match = v.slice(0, e.target.selectionStart).match(/(?:^|\s)@([^\s@]*)$/)
+    if (mentionTimerRef.current) clearTimeout(mentionTimerRef.current)
+    if (!match) {
+      closeMention()
+      return
+    }
+    mentionStartRef.current = e.target.selectionStart - match[1].length - 1
+    const query = match[1]
+    // Agents match locally and update instantly (no request), so the group
+    // roster shows the moment "@" is typed.
+    const q = query.toLowerCase()
+    const matchedAgents = mentionRoster.filter(
+      (a) => !q || (a.name || a.id).toLowerCase().includes(q) || a.id.toLowerCase().includes(q)
+    )
+    setMentionAgents(matchedAgents)
+    setMentionIndex(0)
+    mentionTimerRef.current = setTimeout(async () => {
+      try {
+        const res = await apiClient.workspaceSearch(query, 12, sessionId)
+        if (mentionStartRef.current < 0) return
+        setMentionItems(res.results || [])
+      } catch {
+        setMentionItems([])
+      }
+    }, 160)
   }
 
   const uploadFiles = async (files: File[]) => {
     if (!files.length) return
     setUploading(true)
+    setUploadError('')
+    // Report per-file outcomes: a silent failure here is indistinguishable from
+    // the file picker never opening, which makes the feature look broken.
+    const failed: string[] = []
     try {
       for (const file of files) {
-        const result = await apiClient.uploadFile(file, sessionId)
-        if (result.status === 'success') {
-          setAttachments((prev) => [
-            ...prev,
-            {
-              file_path: result.file_path,
-              file_name: result.file_name,
-              file_type: result.file_type as Attachment['file_type'],
-              preview_url: result.preview_url,
-            },
-          ])
+        try {
+          const result = await apiClient.uploadFile(file, sessionId)
+          if (result.status === 'success') {
+            setAttachments((prev) => [
+              ...prev,
+              {
+                file_path: result.file_path,
+                file_name: result.file_name,
+                file_type: result.file_type as Attachment['file_type'],
+                preview_url: result.preview_url,
+              },
+            ])
+          } else {
+            failed.push(`${file.name}: ${result.message || 'unknown error'}`)
+          }
+        } catch (err) {
+          failed.push(`${file.name}: ${(err as Error).message}`)
         }
       }
-    } catch (err) {
-      console.error('Upload failed:', err)
     } finally {
       setUploading(false)
+      if (failed.length) {
+        console.error('Upload failed:', failed)
+        setUploadError(`${t('upload_failed')} — ${failed.join('; ')}`)
+      }
     }
   }
 
@@ -207,12 +570,26 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault()
-    setDragOver(false)
-    const files = Array.from(e.dataTransfer.files || [])
+  const handleDropData = (dt: DataTransfer) => {
+    // A file dragged from the workspace panel is already on disk in the
+    // workspace — reference it instead of uploading a duplicate.
+    const wsPayload = dt.getData(WORKSPACE_DRAG_TYPE)
+    if (wsPayload) {
+      try {
+        addWorkspaceRef(JSON.parse(wsPayload) as WorkspaceEntry)
+      } catch {
+        /* malformed drag payload */
+      }
+      return
+    }
+    const files = Array.from(dt.files || [])
     if (files.length) uploadFiles(files)
   }
+
+  // Read through a ref so the window listeners below can stay bound once
+  // instead of re-subscribing whenever the input's state changes.
+  const dropHandlerRef = useRef(handleDropData)
+  dropHandlerRef.current = handleDropData
 
   const handlePaste = (e: React.ClipboardEvent) => {
     const items = e.clipboardData?.items
@@ -239,24 +616,89 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     if (slashIndex >= filtered.length) setSlashIndex(0)
   }, [filtered.length, slashIndex])
 
-  const canSend = !isStreaming && (!!text.trim() || attachments.length > 0)
+  // Accept drops anywhere in the window rather than only over the input box:
+  // users aim at the conversation area, and a drop that no element handles makes
+  // Chromium navigate to the dropped file, replacing the whole UI.
+  useEffect(() => {
+    const carriesFiles = (dt: DataTransfer | null) =>
+      !!dt && (dt.types.includes('Files') || dt.types.includes(WORKSPACE_DRAG_TYPE))
+
+    // dragenter/dragleave also fire when moving between descendants, so track
+    // nesting depth and only drop the highlight once the drag really left.
+    let depth = 0
+    const onDragEnter = (e: DragEvent) => {
+      if (!carriesFiles(e.dataTransfer)) return
+      e.preventDefault()
+      depth += 1
+      setDragOver(true)
+    }
+    const onDragOver = (e: DragEvent) => {
+      if (!carriesFiles(e.dataTransfer)) return
+      e.preventDefault()
+    }
+    const onDragLeave = (e: DragEvent) => {
+      if (!carriesFiles(e.dataTransfer)) return
+      depth = Math.max(0, depth - 1)
+      if (depth === 0) setDragOver(false)
+    }
+    const onDrop = (e: DragEvent) => {
+      depth = 0
+      setDragOver(false)
+      if (!carriesFiles(e.dataTransfer)) return
+      e.preventDefault()
+      dropHandlerRef.current(e.dataTransfer!)
+    }
+    // A drag can end without ever dropping (Esc, or released outside the window).
+    const onDragEnd = () => {
+      depth = 0
+      setDragOver(false)
+    }
+
+    window.addEventListener('dragenter', onDragEnter)
+    window.addEventListener('dragover', onDragOver)
+    window.addEventListener('dragleave', onDragLeave)
+    window.addEventListener('drop', onDrop)
+    window.addEventListener('dragend', onDragEnd)
+    return () => {
+      window.removeEventListener('dragenter', onDragEnter)
+      window.removeEventListener('dragover', onDragOver)
+      window.removeEventListener('dragleave', onDragLeave)
+      window.removeEventListener('drop', onDrop)
+      window.removeEventListener('dragend', onDragEnd)
+    }
+  }, [])
+
+  const canSend = !isStreaming && !compacting && (!!text.trim() || attachments.length > 0)
 
   return (
     <div className="flex-shrink-0 border-t border-default bg-surface px-4 py-3">
+      {/* One tall rounded card holds the textarea on top and a toolbar row
+          (chips + actions) at the bottom, matching the web console composer. */}
       <div
-        className={`max-w-3xl mx-auto relative rounded-2xl transition-all ${
-          dragOver ? 'ring-2 ring-accent ring-offset-2 ring-offset-surface' : ''
+        className={`max-w-3xl mx-auto relative rounded-2xl border bg-inset transition-colors ${
+          dragOver ? 'border-accent ring-2 ring-accent/30' : 'border-strong focus-within:border-accent'
         }`}
-        onDragOver={(e) => {
-          e.preventDefault()
-          setDragOver(true)
-        }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={handleDrop}
       >
         {dragOver && (
-          <div className="absolute inset-0 z-20 flex items-center justify-center rounded-2xl bg-accent-soft text-accent text-sm font-medium pointer-events-none">
-            {t('input_placeholder')}
+          // accent-soft is a 12%-alpha tint, so it needs an opaque layer under
+          // it — otherwise the textarea placeholder shows through the hint.
+          <div className="absolute inset-0 z-20 rounded-2xl bg-surface pointer-events-none">
+            <div className="flex h-full w-full items-center justify-center rounded-2xl bg-accent-soft text-accent text-sm font-medium">
+              {t('drop_to_attach')}
+            </div>
+          </div>
+        )}
+
+        {uploadError && (
+          <div className="mb-2 flex items-start gap-2 rounded-lg border border-danger-border bg-danger-soft px-3 py-2 text-xs text-danger">
+            <span className="flex-1 break-all">{uploadError}</span>
+            <button
+              onClick={() => setUploadError('')}
+              className="flex-shrink-0 cursor-pointer hover:opacity-70"
+              title={t('ws_close')}
+            >
+              <X size={12} />
+            </button>
           </div>
         )}
 
@@ -288,76 +730,112 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
           </div>
         )}
 
-        {/* Attachment preview */}
-        {attachments.length > 0 && (
-          <div className="flex flex-wrap gap-2 mb-2">
-            {attachments.map((att, i) => (
-              <div key={i} className="relative">
-                {att.file_type === 'image' && att.preview_url ? (
-                  <div className="relative">
-                    <img
-                      src={apiClient.getFileUrl(att.preview_url)}
-                      alt={att.file_name}
-                      className="w-16 h-16 rounded-lg object-cover border border-default"
-                    />
-                    <button
-                      onClick={() => removeAttachment(i)}
-                      className="absolute -top-1 -right-1 w-[18px] h-[18px] rounded-full bg-danger text-white flex items-center justify-center cursor-pointer"
-                    >
-                      <X size={10} />
-                    </button>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-inset border border-default rounded-lg text-xs text-content-secondary max-w-[180px] relative pr-7">
-                    <FileIcon size={12} />
-                    <span className="truncate">{att.file_name}</span>
-                    <button
-                      onClick={() => removeAttachment(i)}
-                      className="absolute -top-1 -right-1 w-[18px] h-[18px] rounded-full bg-danger text-white flex items-center justify-center cursor-pointer"
-                    >
-                      <X size={10} />
-                    </button>
-                  </div>
-                )}
-              </div>
+        {/* @ picker: group-chat Agents first, then workspace files — one flat
+            list so an Agent reads like any other pick. */}
+        {mentionOpen && (
+          <div className="absolute bottom-full left-0 right-0 mb-1.5 max-h-72 overflow-y-auto rounded-xl border border-default bg-elevated shadow-xl z-30 p-1.5">
+            {mentionAgents.map((a, i) => (
+              <button
+                key={`agent:${a.id}`}
+                onMouseEnter={() => setMentionIndex(i)}
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  acceptAgentMention(i)
+                }}
+                className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-left cursor-pointer transition-colors ${
+                  i === mentionIndex ? 'bg-accent-soft' : 'hover:bg-surface-2'
+                }`}
+              >
+                <AgentAvatar agent={a} size={20} />
+                <span className="text-[13px] text-content shrink-0 max-w-[55%] truncate">{a.name || a.id}</span>
+                <span className="flex-1 min-w-0 text-[11px] text-content-tertiary text-right truncate">{a.id}</span>
+              </button>
             ))}
+            {mentionItems.map((item, j) => {
+              const i = mentionAgents.length + j
+              const Icon = iconFor(item.kind)
+              return (
+                <button
+                  key={item.path}
+                  onMouseEnter={() => setMentionIndex(i)}
+                  onMouseDown={(e) => {
+                    e.preventDefault()
+                    acceptMention(j)
+                  }}
+                  className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-left cursor-pointer transition-colors ${
+                    i === mentionIndex ? 'bg-accent-soft' : 'hover:bg-surface-2'
+                  }`}
+                >
+                  <Icon size={13} className={`shrink-0 ${colorFor(item.kind)}`} />
+                  <span className="text-[13px] text-content shrink-0 max-w-[45%] truncate">{item.name}</span>
+                  <span className="flex-1 min-w-0 text-[11px] text-content-tertiary text-right truncate">
+                    {item.path}
+                  </span>
+                </button>
+              )
+            })}
           </div>
         )}
 
-        <div className="flex items-end gap-2">
-          <div className="flex items-center flex-shrink-0 gap-0.5 pb-0.5">
-            <button
-              onClick={onNewChat}
-              className="w-9 h-9 flex items-center justify-center rounded-btn text-content-secondary hover:text-accent hover:bg-accent-soft cursor-pointer transition-colors"
-              title={t('session_new')}
-            >
-              <Plus size={18} />
-            </button>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploading}
-              className="w-9 h-9 flex items-center justify-center rounded-btn text-content-secondary hover:text-accent hover:bg-accent-soft cursor-pointer transition-colors disabled:opacity-50"
-              title={t('chat_attach')}
-            >
-              {uploading ? <Loader2 size={18} className="animate-spin" /> : <Paperclip size={18} />}
-            </button>
-            <button
-              onClick={onClearContext}
-              className="w-9 h-9 flex items-center justify-center rounded-btn text-content-secondary hover:text-danger hover:bg-danger-soft cursor-pointer transition-colors"
-              title={t('chat_clear_context')}
-            >
-              <Trash2 size={18} />
-            </button>
+        {/* Attachment previews sit at the top of the card, above the textarea. */}
+        {attachments.length > 0 && (
+          <div className="flex items-center gap-2 relative px-3 pt-2.5">
+            <div className="flex-1 min-w-0 flex items-center gap-2 overflow-x-auto overflow-y-visible">
+              {attachments.map((att, i) => (
+                <div key={i} className="relative shrink-0">
+                  {att.file_type === 'image' && att.preview_url ? (
+                    <div className="relative">
+                      <img
+                        src={apiClient.getFileUrl(att.preview_url)}
+                        alt={att.file_name}
+                        className="w-8 h-8 rounded-lg object-cover border border-default"
+                      />
+                      <button
+                        onClick={() => removeAttachment(i)}
+                        className="absolute top-0 right-0 w-3.5 h-3.5 rounded-full bg-danger text-white flex items-center justify-center cursor-pointer ring-1 ring-surface leading-none"
+                      >
+                        <X size={8} strokeWidth={2.5} />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1.5 pl-2 pr-1 py-1 bg-surface border border-default rounded-lg text-[11px] text-content-secondary max-w-[160px]">
+                      {att.file_type === 'workspace_ref' ? (
+                        att.is_dir ? (
+                          <Folder size={11} className="text-accent shrink-0" />
+                        ) : (
+                          <AtSign size={11} className="text-accent shrink-0" />
+                        )
+                      ) : (
+                        <FileIcon size={11} className="shrink-0" />
+                      )}
+                      <span className="truncate" title={att.file_path}>
+                        {att.file_name}
+                      </span>
+                      <button
+                        onClick={() => removeAttachment(i)}
+                        className="shrink-0 w-4 h-4 rounded flex items-center justify-center text-content-tertiary hover:text-danger hover:bg-danger-soft cursor-pointer"
+                      >
+                        <X size={11} strokeWidth={2.5} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            className="hidden"
-            multiple
-            onChange={handleFileSelect}
-            accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.json,.xml,.zip,.py,.js,.ts,.java,.c,.cpp,.go,.rs,.md"
-          />
+        )}
 
+        <input
+          ref={fileInputRef}
+          type="file"
+          className="hidden"
+          multiple
+          onChange={handleFileSelect}
+        />
+
+        {/* Textarea sits at the top of the card, borderless (the card owns the
+            border) and taller than a single line so the composer reads tall. */}
+        <div className="relative">
           <textarea
             ref={textareaRef}
             id="chat-input"
@@ -367,29 +845,131 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
             onPaste={handlePaste}
             onCompositionStart={() => (composingRef.current = true)}
             onCompositionEnd={() => (composingRef.current = false)}
-            placeholder={t('input_placeholder')}
+            placeholder={
+              compacting
+                ? t('ctx_compacting')
+                : t(sharedConversation ? 'input_placeholder_team' : 'input_placeholder')
+            }
             rows={1}
-            className="flex-1 min-w-0 px-4 py-[10px] rounded-xl border border-strong bg-inset text-content placeholder:text-content-tertiary focus:outline-none focus:border-accent text-sm leading-relaxed transition-colors resize-none overflow-y-hidden"
+            disabled={compacting}
+            className="w-full px-4 pt-3 pb-0 bg-transparent text-content placeholder:text-content-tertiary focus:outline-none text-sm leading-relaxed resize-none overflow-y-hidden disabled:opacity-60 disabled:cursor-not-allowed"
           />
-
-          {isStreaming ? (
-            <button
-              onClick={onStop}
-              className="flex-shrink-0 w-10 h-10 flex items-center justify-center rounded-btn bg-surface-2 text-content hover:bg-inset cursor-pointer transition-colors"
-              title={t('msg_stop')}
-            >
-              <Square size={15} className="fill-current" />
-            </button>
-          ) : (
-            <button
-              onClick={handleSubmit}
-              disabled={!canSend}
-              className="flex-shrink-0 w-[42px] h-[42px] flex items-center justify-center rounded-btn bg-accent text-white hover:bg-accent-hover disabled:bg-surface-2 disabled:text-content-disabled disabled:cursor-not-allowed cursor-pointer transition-none [&_*]:transition-none"
-              title={t('chat_send')}
-            >
-              <PaperPlaneIcon size={15} />
-            </button>
+          {micError && (
+            // Transient error tip above the input, mirroring the web console.
+            <div className="absolute right-3 bottom-full mb-2 px-2 py-1 rounded-md text-xs text-white bg-black/80 dark:bg-white/20 shadow-md pointer-events-none whitespace-nowrap z-10">
+              {micError}
+            </div>
           )}
+        </div>
+
+        {/* Toolbar row inside the card: chips on the left, actions on the right.
+            This is what makes the composer read as one tall card like the web
+            console, instead of a short input with controls floating around it.
+            The middle chip group shrinks/truncates so a narrow composer (right
+            panel open) never overflows the card. */}
+        <div className="composer-toolbar flex items-center gap-1 px-2 pb-1 pt-2 min-w-0">
+          {/* The composer's "+" is a quick new chat: it opens a fresh
+              conversation owned by the current Agent right away, no picker
+              (matches the web console). Choosing a different Agent or starting a
+              group lives in the session-list "+" menu instead. */}
+          <Tooltip label={t('session_new')}>
+            <button
+              onClick={onNewChat}
+              className="shrink-0 w-8 h-8 flex items-center justify-center rounded-btn cursor-pointer transition-colors text-content-secondary hover:text-accent hover:bg-accent-soft"
+            >
+              <Plus size={18} />
+          </button>
+        </Tooltip>
+          {/* Context pie sits second (mirrors the web console), always visible
+              as a mini donut; hover/click opens the usage card with actions. */}
+          <ContextUsagePopover
+            sessionId={sessionId}
+            isStreaming={isStreaming}
+            refreshKey={ctxRefreshKey}
+            onClearContext={onClearContext}
+            onAdjust={onAdjustContext}
+            onCompactingChange={setCompacting}
+            onToast={onToast}
+          />
+          <Tooltip label={t('chat_attach')}>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              className="shrink-0 w-8 h-8 flex items-center justify-center rounded-btn text-content-secondary hover:text-accent hover:bg-accent-soft cursor-pointer transition-colors disabled:opacity-50"
+            >
+              {uploading ? <Loader2 size={16} className="animate-spin" /> : <Paperclip size={16} />}
+            </button>
+          </Tooltip>
+
+          <div className="mx-1 h-4 w-px bg-default shrink-0" />
+
+          {/* Chips share the flexible middle; each may shrink and truncate. */}
+          <div className="flex items-center gap-1 min-w-0 flex-1">
+            <WorkspaceSelector sessionId={sessionId} />
+            <PermissionSelector sessionId={sessionId} />
+          </div>
+
+          <div className="flex items-center gap-1 shrink-0 pl-1">
+            {!sharedConversation && (
+              <div className="max-w-[200px] min-w-0">
+                <ModelSelector sessionId={sessionId} />
+              </div>
+            )}
+            {/* Agent picker sits on the far right, avatar-only, as the identity
+                the reply comes from. Only in multi-Agent mode. */}
+            {multiAgent && <AgentSelector sessionId={sessionId} />}
+            {micSupported && (
+              <Tooltip
+                label={
+                  micState === 'recording'
+                    ? t('mic_recording_title')
+                    : micState === 'busy'
+                      ? t('mic_busy_title')
+                      : t('mic_idle_title')
+                }
+              >
+                <button
+                  onClick={toggleMic}
+                  disabled={micState === 'busy'}
+                  className={`w-8 h-8 flex items-center justify-center rounded-btn cursor-pointer transition-colors disabled:cursor-not-allowed ${
+                    micState === 'recording'
+                      ? 'text-red-500 animate-pulse hover:text-red-600'
+                      : micState === 'busy'
+                        ? 'text-accent'
+                        : 'text-content-tertiary hover:text-accent hover:bg-accent-soft'
+                  }`}
+                >
+                  {micState === 'recording' ? (
+                    <Square size={12} className="fill-current" />
+                  ) : micState === 'busy' ? (
+                    <Loader2 size={16} className="animate-spin" />
+                  ) : (
+                    <Mic size={16} />
+                  )}
+                </button>
+              </Tooltip>
+            )}
+            {isStreaming ? (
+              <Tooltip label={t('msg_stop')}>
+                <button
+                  onClick={onStop}
+                  className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-btn bg-surface-2 text-content hover:bg-inset-2 cursor-pointer transition-colors relative -top-px"
+                >
+                  <Square size={14} className="fill-current" />
+                </button>
+              </Tooltip>
+            ) : (
+              <Tooltip label={t('chat_send')}>
+                <button
+                  onClick={handleSubmit}
+                  disabled={!canSend}
+                  className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-btn bg-accent text-white hover:bg-accent-hover disabled:bg-surface-2 disabled:text-content-disabled disabled:cursor-not-allowed cursor-pointer transition-none [&_*]:transition-none relative -top-px"
+                >
+                  <PaperPlaneIcon size={14} />
+                </button>
+              </Tooltip>
+            )}
+          </div>
         </div>
       </div>
     </div>

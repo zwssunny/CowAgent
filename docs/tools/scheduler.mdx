@@ -35,6 +35,17 @@ Create and manage scheduled tasks with natural language:
 - "Remind me about the meeting tomorrow at 3 PM"
 - "Show all scheduled tasks"
 
+## Test-run an existing task
+
+Open the task in the authenticated Web console or Desktop app and click **Run
+now**. After you confirm the delivery, CowAgent queues one immediate execution
+to the task's configured channel and receiver. This user-initiated action is not
+exposed to the agent's scheduler tool.
+
+Manual execution works for disabled tasks and does not enable, delete, or
+reschedule the task. Its original `next_run_at` remains unchanged. A task cannot
+be run manually while the same task is already executing on schedule.
+
 <Frame>
   <img src="https://cdn.link-ai.tech/doc/20260202195402.png" width="800" />
 </Frame>

@@ -441,7 +441,7 @@ def _send(channel, reply: Reply, context, retry_cnt=0):
         logger.exception(e)
         if retry_cnt < 2:
             time.sleep(3 + 3 * retry_cnt)
-            channel.send(reply, context, retry_cnt + 1)
+            _send(channel, reply, context, retry_cnt + 1)
 
 
 def check_prefix(content, prefix_list):

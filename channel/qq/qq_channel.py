@@ -50,6 +50,19 @@ OP_HEARTBEAT_ACK = 11
 # Resumable error codes
 RESUMABLE_CLOSE_CODES = {4008, 4009}
 
+# WebSocket transport-level keepalive. Without this the client never sends
+# protocol pings, so a half-open connection (NAT/container network drop with no
+# TCP FIN/RST) is never detected and _on_close never fires — the socket looks
+# alive but no events arrive. ping_timeout closes the socket when a pong is
+# missed, which routes into the existing _on_close reconnect path.
+WS_PING_INTERVAL = 20
+WS_PING_TIMEOUT = 10
+
+# Heartbeat-ACK watchdog: if the QQ gateway stops acking our heartbeats for this
+# many missed intervals, the connection is silently dead — force it closed so the
+# reconnect path runs. Guards against a stall the transport ping alone can miss.
+HEARTBEAT_ACK_TIMEOUT_FACTOR = 3
+
 
 @singleton
 class QQChannel(ChatChannel):
@@ -72,7 +85,16 @@ class QQChannel(ChatChannel):
         self._session_id = None
         self._last_seq = None
         self._heartbeat_interval = 45000
+        # Timestamp of the last heartbeat ACK from the gateway, used by the
+        # heartbeat loop to detect a silently-dead connection and force a
+        # reconnect. Reset whenever a fresh connection starts sending heartbeats.
+        self._last_heartbeat_ack = 0.0
         self._can_resume = False
+        # Bumped on every stop so a superseded socket cannot reconnect itself.
+        self._generation = 0
+        # Last rejection from the QQ API, surfaced to the channel page so the
+        # user sees the platform's reason instead of a bare "unavailable".
+        self._last_api_error = ""
 
         self.received_msgs = ExpiredDict(60 * 60 * 7.1)
         self._msg_seq_counter = {}
@@ -85,8 +107,14 @@ class QQChannel(ChatChannel):
     # ------------------------------------------------------------------
 
     def startup(self):
-        self.app_id = conf().get("qq_app_id", "")
-        self.app_secret = conf().get("qq_app_secret", "")
+        if self._ws is not None:
+            # Restarting the channel calls startup() again on the same instance.
+            # Leaving the old socket open would make QQ push every event twice.
+            logger.warning("[QQ] A session is already open, closing it before reconnecting")
+            self.stop()
+
+        self.app_id = self.cfg("qq_app_id", "")
+        self.app_secret = self.cfg("qq_app_secret", "")
 
         if not self.app_id or not self.app_secret:
             err = "[QQ] qq_app_id and qq_app_secret are required"
@@ -96,7 +124,7 @@ class QQChannel(ChatChannel):
 
         self._refresh_access_token()
         if not self._access_token:
-            err = "[QQ] Failed to get initial access_token"
+            err = f"[QQ] Failed to get initial access_token: {self._last_api_error}"
             logger.error(err)
             self.report_startup_error(err)
             return
@@ -106,6 +134,7 @@ class QQChannel(ChatChannel):
 
     def stop(self):
         logger.info("[QQ] stop() called")
+        self._generation += 1
         self._stop_event.set()
         if self._ws:
             try:
@@ -128,7 +157,16 @@ class QQChannel(ChatChannel):
             )
             resp.raise_for_status()
             data = resp.json()
-            self._access_token = data.get("access_token", "")
+            token = data.get("access_token", "")
+            if not token:
+                # Credential errors arrive as HTTP 200 with a business code
+                # ("机器人不存在", "appid invalid"), so the status says nothing.
+                # Return without touching the expiry: the next call retries, and
+                # a token that still works is not thrown away over a hiccup.
+                self._last_api_error = resp.text
+                logger.error(f"[QQ] Access token request refused: {resp.text}")
+                return
+            self._access_token = token
             expires_in = int(data.get("expires_in", 7200))
             self._token_expires_at = time.time() + expires_in - 60
             logger.debug(f"[QQ] Access token refreshed, expires_in={expires_in}s")
@@ -158,19 +196,27 @@ class QQChannel(ChatChannel):
                 headers=self._get_auth_headers(),
                 timeout=10,
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                # The body carries the platform's own code / message / trace_id,
+                # the only thing that distinguishes an IP-allowlist rejection
+                # from a bad token or an unreleased bot.
+                self._last_api_error = f"status={resp.status_code}, body={resp.text}"
+                logger.error(f"[QQ] Failed to get gateway URL: {self._last_api_error}")
+                return ""
             url = resp.json().get("url", "")
             logger.debug(f"[QQ] Gateway URL: {url}")
             return url
         except Exception as e:
+            self._last_api_error = str(e)
             logger.error(f"[QQ] Failed to get gateway URL: {e}")
             return ""
 
     def _start_ws(self):
+        generation = self._generation
         ws_url = self._get_ws_url()
         if not ws_url:
             logger.error("[QQ] Cannot start WebSocket without gateway URL")
-            self.report_startup_error("Failed to get gateway URL")
+            self.report_startup_error(f"Failed to get gateway URL: {self._last_api_error}")
             return
 
         def _on_open(ws):
@@ -188,6 +234,11 @@ class QQChannel(ChatChannel):
 
         def _on_close(ws, close_status_code, close_msg):
             logger.warning(f"[QQ] WebSocket closed: status={close_status_code}, msg={close_msg}")
+            if self._generation != generation:
+                # A newer session took over; reconnecting here would revive the
+                # old one alongside it and double every incoming event.
+                logger.info("[QQ] Superseded session closed, not reconnecting")
+                return
             self._connected = False
             if not self._stop_event.is_set():
                 if close_status_code in RESUMABLE_CLOSE_CODES and self._session_id:
@@ -211,7 +262,12 @@ class QQChannel(ChatChannel):
 
         def run_forever():
             try:
-                websocket_app_run_forever(self._ws, ping_interval=0, reconnect=0)
+                websocket_app_run_forever(
+                    self._ws,
+                    ping_interval=WS_PING_INTERVAL,
+                    ping_timeout=WS_PING_TIMEOUT,
+                    reconnect=0,
+                )
             except (SystemExit, KeyboardInterrupt):
                 logger.info("[QQ] WebSocket thread interrupted")
             except Exception as e:
@@ -261,6 +317,10 @@ class QQChannel(ChatChannel):
             return
         self._heartbeat_interval = interval_ms
         interval_sec = interval_ms / 1000.0
+        # Seed the ACK clock so the watchdog measures silence from now, not from
+        # a stale value left by a previous connection.
+        self._last_heartbeat_ack = time.time()
+        ack_timeout = interval_sec * HEARTBEAT_ACK_TIMEOUT_FACTOR
 
         def heartbeat_loop():
             while not self._stop_event.is_set() and self._connected:
@@ -273,6 +333,23 @@ class QQChannel(ChatChannel):
                     logger.warning(f"[QQ] Heartbeat send failed: {e}")
                     break
                 self._stop_event.wait(interval_sec)
+                # A live socket whose gateway has gone silent (no ACKs) still
+                # passes ws_send, so detect the stall here and force a close so
+                # the _on_close reconnect path runs.
+                if self._stop_event.is_set() or not self._connected:
+                    break
+                if time.time() - self._last_heartbeat_ack > ack_timeout:
+                    logger.warning(
+                        f"[QQ] No heartbeat ACK for over {ack_timeout:.0f}s, "
+                        f"connection appears dead, forcing reconnect"
+                    )
+                    ws = self._ws
+                    if ws:
+                        try:
+                            ws.close()
+                        except Exception:
+                            pass
+                    break
 
         self._heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
@@ -300,7 +377,7 @@ class QQChannel(ChatChannel):
                 self._send_identify()
 
         elif op == OP_HEARTBEAT_ACK:
-            pass
+            self._last_heartbeat_ack = time.time()
 
         elif op == OP_HEARTBEAT:
             self._ws_send({"op": OP_HEARTBEAT, "d": self._last_seq})
@@ -406,6 +483,8 @@ class QQChannel(ChatChannel):
             no_need_at=True,
         )
         if context:
+            from agent.team_addressing import stamp_speaker_from_channel
+            stamp_speaker_from_channel(self, context, qq_msg.content)
             self.produce(context)
 
     # ------------------------------------------------------------------
@@ -417,6 +496,7 @@ class QQChannel(ChatChannel):
         context.kwargs = kwargs
         if "channel_type" not in context:
             context["channel_type"] = self.channel_type
+        self.stamp_instance_context(context)
         if "origin_ctype" not in context:
             context["origin_ctype"] = ctype
 

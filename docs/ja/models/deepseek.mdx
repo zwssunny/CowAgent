@@ -9,14 +9,14 @@ DeepSeek は現在 Agent モードでデフォルト推奨されているベン�
 
 ```json
 {
-  "model": "deepseek-v4-flash",
+  "model": "deepseek-flash",
   "deepseek_api_key": "YOUR_API_KEY"
 }
 ```
 
 | パラメータ | 説明 |
 | --- | --- |
-| `model` | `deepseek-v4-flash`（デフォルト）、`deepseek-v4-pro` をサポート |
+| `model` | `deepseek-flash`（デフォルト、V4.1 Flash、ネイティブマルチモーダル）、`deepseek-v4-flash`、`deepseek-v4-pro` をサポート |
 | `deepseek_api_key` | [DeepSeek プラットフォーム](https://platform.deepseek.com/api_keys) で作成 |
 | `deepseek_api_base` | 任意。デフォルトは `https://api.deepseek.com/v1`。サードパーティのプロキシアドレスに変更可能 |
 
@@ -24,12 +24,13 @@ DeepSeek は現在 Agent モードでデフォルト推奨されているベン�
 
 | モデル | 用途 |
 | --- | --- |
-| `deepseek-v4-flash` | デフォルト推奨。高速かつ低コスト |
+| `deepseek-flash` | デフォルト推奨。V4.1 Flash、ネイティブマルチモーダル、高速かつ低コスト |
+| `deepseek-v4-flash` | 前世代の V4 Flash |
 | `deepseek-v4-pro` | より高い知能。複雑なタスクで効果が高い |
 
 ## 思考モード
 
-V4 シリーズ（`deepseek-v4-flash` / `deepseek-v4-pro`）は明示的な「思考モード」をサポートしています：モデルは最終回答を出力する前に、まず思考連鎖（`reasoning_content`）を出力することで、回答の品質を向上させます。
+`deepseek-flash` および V4 シリーズ（`deepseek-v4-flash` / `deepseek-v4-pro`）は明示的な「思考モード」をサポートしています：モデルは最終回答を出力する前に、まず思考連鎖（`reasoning_content`）を出力することで、回答の品質を向上させます。
 
 ### スイッチ
 
@@ -68,5 +69,5 @@ V4 シリーズ（`deepseek-v4-flash` / `deepseek-v4-pro`）は明示的な「�
 - **マルチターンのツール呼び出し**：履歴にツール呼び出しが含まれる場合、DeepSeek はすべての assistant メッセージで `reasoning_content` を返却することを要求します。CowAgent は返却ロジックを自動的に処理しており、ターンをまたいで思考スイッチを切り替えてもエラーにはなりません。
 
 <Tip>
-  デフォルトでは `deepseek-v4-flash` を使用します。複雑なタスクには `deepseek-v4-pro` を使用でき、深い推論が必要な場合は `enable_thinking` をオンにできます。
+  デフォルトでは `deepseek-flash`（V4.1 Flash、ネイティブマルチモーダル）を使用します。複雑なタスクには `deepseek-v4-pro` を使用でき、深い推論が必要な場合は `enable_thinking` をオンにできます。
 </Tip>

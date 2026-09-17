@@ -1,5 +1,5 @@
-# access LinkAI knowledge base platform
-# docs: https://link-ai.tech/platform/link-app/wechat
+# access LinkAI agent platform
+# docs: https://docs.cowagent.ai/zh/models/linkai
 
 import re
 import time
@@ -18,6 +18,45 @@ import threading
 from common import memory, utils
 import base64
 import os
+from urllib.parse import urlparse
+
+
+def _linkai_base_url():
+    """Resolve the LinkAI API host, tolerating a stray trailing '/v1'.
+
+    Callers append '/v1/...' themselves, so a base that already ends in '/v1'
+    (a leftover from an OpenAI-style api_base) would build '.../v1/v1/...' and
+    hit no route, surfacing as a cryptic FastAPI 404 ({"detail":"Not Found"}).
+    Strip a trailing slash and a trailing '/v1' so both forms work.
+    """
+    base = (conf().get("linkai_api_base") or "https://api.link-ai.tech").strip()
+    base = base.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-len("/v1")]
+    return base
+
+
+def _explain_linkai_error(status_code, error_msg):
+    """Turn opaque gateway errors into actionable hints.
+
+    A bare FastAPI 404 ({"detail":"Not Found"}) means the request hit no route
+    on the LinkAI host — almost always a misconfigured linkai_api_base (e.g. one
+    that already carries a '/v1' suffix, yielding '.../v1/v1/chat/completions').
+    Surface that instead of the cryptic body so users can self-correct.
+    """
+    text = str(error_msg or "")
+    if status_code == 404 and ("not found" in text.lower() or '"detail"' in text.lower()):
+        base = (conf().get("linkai_api_base") or "").strip()
+        hint = (
+            "LinkAI endpoint not found (404). This usually means linkai_api_base "
+            "is misconfigured — it should be the host only, e.g. "
+            "'https://api.link-ai.tech' (without a trailing '/v1' or '/chat/completions')."
+        )
+        if base:
+            hint += f" Current linkai_api_base='{base}'."
+        return hint
+    return error_msg
+
 
 class LinkAIBot(Bot, OpenAICompatibleBot):
     # authentication failed
@@ -134,9 +173,10 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
                 body["file_id"] = file_id
             logger.info(f"[LINKAI] query={query}, app_code={app_code}, model={body.get('model')}, file_id={file_id}")
             headers = {"Authorization": "Bearer " + linkai_api_key, "X-Title": "CowAgent"}
+            utils.apply_client_source(headers)
 
             # do http request
-            base_url = conf().get("linkai_api_base", "https://api.link-ai.tech")
+            base_url = _linkai_base_url()
             res = requests.post(url=base_url + "/v1/chat/completions", json=body, headers=headers,
                                 timeout=conf().get("request_timeout", 180))
             if res.status_code == 200:
@@ -272,10 +312,15 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
             }
             if self.args.get("max_tokens"):
                 body["max_tokens"] = self.args.get("max_tokens")
+            sid = getattr(session, "session_id", "")
+            if sid and sid != "__title_gen__":
+                body["session_id"] = sid
             headers = {"Authorization": "Bearer " + conf().get("linkai_api_key"), "X-Title": "CowAgent"}
+            utils.apply_client_source(headers)
+            utils.apply_cloud_user(headers)
 
             # do http request
-            base_url = conf().get("linkai_api_base", "https://api.link-ai.tech")
+            base_url = _linkai_base_url()
             res = requests.post(url=base_url + "/v1/chat/completions", json=body, headers=headers,
                                 timeout=conf().get("request_timeout", 180))
             if res.status_code == 200:
@@ -318,7 +363,7 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
     def _fetch_app_info(self, app_code: str):
         headers = {"Authorization": "Bearer " + conf().get("linkai_api_key")}
         # do http request
-        base_url = conf().get("linkai_api_base", "https://api.link-ai.tech")
+        base_url = _linkai_base_url()
         params = {"app_code": app_code}
         res = requests.get(url=base_url + "/v1/app/info", params=params, headers=headers, timeout=(5, 10))
         if res.status_code == 200:
@@ -333,6 +378,8 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {conf().get('linkai_api_key')}"
             }
+            utils.apply_client_source(headers)
+            utils.apply_cloud_user(headers)
             data = {
                 "prompt": query,
                 "n": 1,
@@ -340,7 +387,7 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
                 "response_format": "url",
                 "img_proxy": conf().get("image_proxy")
             }
-            url = conf().get("linkai_api_base", "https://api.link-ai.tech") + "/v1/images/generations"
+            url = _linkai_base_url() + "/v1/images/generations"
             res = requests.post(url, headers=headers, json=data, timeout=(5, 90))
             t2 = time.time()
             image_url = res.json()["data"][0]["url"]
@@ -420,9 +467,10 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
                 if max_send_num and i >= max_send_num:
                     continue
                 i += 1
-                if url.endswith(".mp4"):
+                url_path = urlparse(url).path.lower()
+                if url_path.endswith(".mp4"):
                     reply_type = ReplyType.VIDEO_URL
-                elif url.endswith(file_type):
+                elif url_path.endswith(file_type):
                     reply_type = ReplyType.FILE
                     url = _download_file(url)
                     if not url:
@@ -442,7 +490,7 @@ def _download_file(url: str):
         file_path = "tmp"
         if not os.path.exists(file_path):
             os.makedirs(file_path)
-        file_name = url.split("/")[-1]  # 获取文件名
+        file_name = os.path.basename(urlparse(url).path) or "download"  # 获取文件名
         file_path = os.path.join(file_path, file_name)
         response = requests.get(url)
         with open(file_path, "wb") as f:
@@ -560,13 +608,29 @@ def _linkai_call_with_tools(self, messages, tools=None, stream=False, **kwargs):
             body["tools"] = tools
             body["tool_choice"] = kwargs.get("tool_choice", "auto")
 
+        model_name = str(body.get("model", "")).lower()
+        reasoning_effort = kwargs.get("reasoning_effort")
+        if reasoning_effort:
+            from models.reasoning_capabilities import get_reasoning_capability
+
+            # LinkAI forwards requests to different upstream vendors. Gate the
+            # passthrough field by verified model capability so OpenAI-like
+            # models do not receive an unknown parameter.
+            capability = get_reasoning_capability("linkai", model_name)
+            if capability.get("supported"):
+                body["reasoning_effort"] = reasoning_effort
+
         thinking = kwargs.get("thinking")
-        if thinking:
+        # Kimi K3 uses top-level reasoning_effort and rejects the generic
+        # thinking object used by older Kimi/DeepSeek-compatible paths.
+        if thinking and not model_name.startswith("kimi-k3"):
             body["thinking"] = thinking
 
         # Prepare headers
         headers = {"Authorization": "Bearer " + conf().get("linkai_api_key"), "X-Title": "CowAgent"}
-        base_url = conf().get("linkai_api_base", "https://api.link-ai.tech")
+        utils.apply_client_source(headers)
+        utils.apply_cloud_user(headers)
+        base_url = _linkai_base_url()
         
         if stream:
             return self._handle_linkai_stream_response(base_url, headers, body)
@@ -574,12 +638,13 @@ def _linkai_call_with_tools(self, messages, tools=None, stream=False, **kwargs):
             return self._handle_linkai_sync_response(base_url, headers, body)
             
     except Exception as e:
+        error_msg = str(e)
         logger.error(f"[LinkAI] call_with_tools error: {e}")
         if stream:
             def error_generator():
                 yield {
                     "error": True,
-                    "message": str(e),
+                    "message": error_msg,
                     "status_code": 500
                 }
             return error_generator()
@@ -608,8 +673,12 @@ def _handle_linkai_sync_response(self, base_url, headers, body):
             # LinkAI response is already in OpenAI-compatible format
             return response
         else:
-            error_data = res.json()
-            error_msg = error_data.get("error", {}).get("message", "Unknown error")
+            try:
+                error_data = res.json()
+                error_msg = error_data.get("error", {}).get("message", res.text)
+            except Exception:
+                error_msg = res.text or "Unknown error"
+            error_msg = _explain_linkai_error(res.status_code, error_msg)
             raise Exception(f"LinkAI API error: {res.status_code} - {error_msg}")
             
     except Exception as e:
@@ -634,7 +703,8 @@ def _handle_linkai_stream_response(self, base_url, headers, body):
                 error_msg = error_data.get("error", {}).get("message", error_text)
             except Exception:
                 error_msg = error_text or "Unknown error"
-            
+            error_msg = _explain_linkai_error(res.status_code, error_msg)
+
             yield {
                 "error": True,
                 "status_code": res.status_code,

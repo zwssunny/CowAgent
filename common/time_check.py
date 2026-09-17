@@ -13,15 +13,24 @@ def time_checker(f):
             chat_start_time = _config.get("chat_start_time", "00:00")
             chat_stop_time = _config.get("chat_stop_time", "24:00")
 
-            time_regex = re.compile(r"^([01]?[0-9]|2[0-4])(:)([0-5][0-9])$")
+            time_regex = re.compile(r"^([01]?[0-9]|2[0-3]):[0-5][0-9]$")
 
-            if not (time_regex.match(chat_start_time) and time_regex.match(chat_stop_time)):
+            if not (
+                time_regex.match(chat_start_time)
+                and (time_regex.match(chat_stop_time) or chat_stop_time == "24:00")
+            ):
                 logger.warning("时间格式不正确，请在config.json中修改CHAT_START_TIME/CHAT_STOP_TIME。")
                 return None
 
-            now_time = time.strptime(time.strftime("%H:%M"), "%H:%M")
-            chat_start_time = time.strptime(chat_start_time, "%H:%M")
-            chat_stop_time = time.strptime(chat_stop_time, "%H:%M")
+            def _to_minutes(value):
+                hours, minutes = (int(part) for part in value.split(":"))
+                return hours * 60 + minutes
+
+            now_time = _to_minutes(time.strftime("%H:%M"))
+            chat_start_time = _to_minutes(chat_start_time)
+            chat_stop_time = (
+                24 * 60 if chat_stop_time == "24:00" else _to_minutes(chat_stop_time)
+            )
             # 结束时间小于开始时间，跨天了
             if chat_stop_time < chat_start_time and (chat_start_time <= now_time or now_time <= chat_stop_time):
                 f(self, *args, **kwargs)

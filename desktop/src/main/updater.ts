@@ -7,12 +7,17 @@ import path from 'path'
 // import compiles to `electron_updater_1.autoUpdater` and resolves correctly,
 // whereas `import pkg from 'electron-updater'` yields undefined.
 import { autoUpdater } from 'electron-updater'
+import { loadAppConfig } from './themes'
 
 // Status payloads pushed to the renderer over the 'update-status' channel.
 // The renderer drives the NavRail badge + update panel from these.
 export type UpdateStatus =
   | { state: 'checking' }
-  | { state: 'available'; version: string; notes?: string }
+  // userInitiated: the check came from an explicit "check for update" click
+  // (not the startup/interval poll). The renderer uses this to decide whether
+  // to auto-open the panel: automatic checks stay silent (dot only) once a
+  // version was dismissed; a manual check always re-opens.
+  | { state: 'available'; version: string; notes?: string; userInitiated?: boolean }
   | { state: 'not-available' }
   | { state: 'downloading'; percent: number }
   | { state: 'downloaded'; version: string }
@@ -33,6 +38,11 @@ function isLegacyWindows(): boolean {
   return Number.isFinite(major) && major < 10
 }
 
+// A bundled app-config may point the updater at a different feed origin. When
+// set, that single URL is used as-is (no China/R2 dual-origin switching, which
+// is specific to the default build's infrastructure). Absent -> default feed.
+const CONFIGURED_FEED = (loadAppConfig()?.updateFeedUrl || '').trim()
+
 // The update feed. Both entries hit the same Pages Function
 // (https://cowagent.ai/update/); the ?lang=zh query tells it to 302 installer
 // downloads to the China CDN mirror instead of R2. The feed metadata is
@@ -40,7 +50,10 @@ function isLegacyWindows(): boolean {
 // to fall back from one download origin to the other. Legacy Windows appends a
 // /legacy/ segment so it gets the win-legacy release instead of the standard.
 const FEED_BASE = 'https://cowagent.ai/update/' + (isLegacyWindows() ? 'legacy/' : '')
-const feedUrlFor = (china: boolean) => (china ? `${FEED_BASE}?lang=zh` : FEED_BASE)
+const feedUrlFor = (china: boolean) => {
+  if (CONFIGURED_FEED) return CONFIGURED_FEED
+  return china ? `${FEED_BASE}?lang=zh` : FEED_BASE
+}
 
 // Which origin the current session prefers, derived from the app UI language
 // (zh -> China mirror). Downloads that fail on the preferred origin retry once
@@ -152,11 +165,12 @@ export function initUpdater(windowGetter: () => BrowserWindow | null): void {
     send({ state: 'checking' })
   })
   autoUpdater.on('update-available', (info) => {
-    log(`update-available: current=${app.getVersion()} remote=${info.version} -> update needed`)
+    log(`update-available: current=${app.getVersion()} remote=${info.version} userInitiated=${userInitiatedCheck} -> update needed`)
     send({
       state: 'available',
       version: info.version,
       notes: typeof info.releaseNotes === 'string' ? info.releaseNotes : undefined,
+      userInitiated: userInitiatedCheck,
     })
   })
   autoUpdater.on('update-not-available', (info) => {
@@ -178,10 +192,19 @@ export function initUpdater(windowGetter: () => BrowserWindow | null): void {
   })
 }
 
+// Tracks whether the in-flight check was triggered by an explicit user click.
+// Stamped onto the resulting 'available' event so the renderer knows whether to
+// auto-open the panel (manual) or stay silent with just the dot (automatic).
+let userInitiatedCheck = false
+
 // Silent check shortly after launch. When not packaged there's no update feed,
 // but a manual click should still get visible feedback instead of looking dead:
 // reply "not-available" so the menu can show "up to date".
-export function checkForUpdates(): void {
+//   userInitiated: pass true for an explicit "check for update" click so the
+//   panel re-opens even if the version was previously dismissed. The startup +
+//   interval polls pass false, so a dismissed version only lights the dot.
+export function checkForUpdates(userInitiated = false): void {
+  userInitiatedCheck = userInitiated
   if (!app.isPackaged) {
     // Dev-only UI harness: set COW_MOCK_UPDATE=1 to simulate an available
     // update so the update panel/menu interactions can be exercised in
@@ -189,7 +212,7 @@ export function checkForUpdates(): void {
     if (process.env.COW_MOCK_UPDATE) {
       const version = process.env.COW_MOCK_UPDATE_VERSION || '9.9.9'
       log(`checkForUpdates: not packaged, MOCK available version=${version}`)
-      send({ state: 'available', version })
+      send({ state: 'available', version, userInitiated: userInitiatedCheck })
       return
     }
     log('checkForUpdates: not packaged, replying not-available')

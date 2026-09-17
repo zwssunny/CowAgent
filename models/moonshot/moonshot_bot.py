@@ -55,13 +55,18 @@ class MoonshotBot(Bot):
         """
         return model_name.lower().startswith("kimi-k2.7-code")
 
+    @staticmethod
+    def _is_kimi_k3_model(model_name: str) -> bool:
+        """Return True for Kimi K3 models using top-level effort control."""
+        return model_name.lower().startswith("kimi-k3")
+
     @classmethod
     def _model_supports_thinking(cls, model_name: str) -> bool:
         """Return True if the model accepts the ``thinking`` request parameter."""
         m = model_name.lower()
         if cls._is_builtin_reasoning_model(m):
             return False
-        return m.startswith("kimi-k2") or m.startswith("kimi-k1.5")
+        return m.startswith("kimi-k3") or m.startswith("kimi-k2") or m.startswith("kimi-k1.5")
 
     def _build_headers(self) -> dict:
         """Build HTTP headers, adding Coding-Agent User-Agent for Kimi Coding Plan."""
@@ -277,6 +282,10 @@ class MoonshotBot(Bot):
                 "messages": converted_messages,
                 "stream": stream,
             }
+            # Ask for a trailing usage chunk on streaming calls so the agent can
+            # surface a real prompt_tokens count for the context indicator.
+            if stream:
+                request_body["stream_options"] = {"include_usage": True}
             if max_tokens is not None:
                 request_body["max_tokens"] = max_tokens
 
@@ -285,10 +294,15 @@ class MoonshotBot(Bot):
                 request_body["tools"] = converted_tools
                 request_body["tool_choice"] = "auto"
 
-            # Kimi Coding Plan has built-in reasoning and ignores the thinking param.
-            # For regular Kimi models, only K2/K1.5 series support the thinking param.
-            # Respect the enable_thinking config passed from agent_bridge.
-            if not self._is_kimi_coding_plan and self._model_supports_thinking(model):
+            # Kimi Coding Plan and Kimi K3 are always-thinking models. K3
+            # controls reasoning with top-level reasoning_effort, not thinking.
+            if not self._is_kimi_coding_plan and self._is_kimi_k3_model(model):
+                reasoning_effort = kwargs.get("reasoning_effort")
+                if reasoning_effort:
+                    request_body["reasoning_effort"] = reasoning_effort
+            # For regular Kimi K2/K1.5 models, respect the enable_thinking
+            # config passed from agent_bridge through the thinking parameter.
+            elif not self._is_kimi_coding_plan and self._model_supports_thinking(model):
                 thinking = kwargs.get("thinking", {"type": "enabled"})
                 request_body["thinking"] = thinking
 
@@ -301,12 +315,13 @@ class MoonshotBot(Bot):
                 return self._handle_sync_response(request_body)
 
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"[MOONSHOT] call_with_tools error: {e}")
             import traceback
             logger.error(traceback.format_exc())
 
             def error_generator():
-                yield {"error": True, "message": str(e), "status_code": 500}
+                yield {"error": True, "message": error_msg, "status_code": 500}
             return error_generator()
 
     # -------------------- streaming --------------------
@@ -327,6 +342,7 @@ class MoonshotBot(Bot):
 
             current_tool_calls = {}
             finish_reason = None
+            stream_usage = None  # Provider-reported token usage (include_usage)
 
             for line in response.iter_lines():
                 if not line:
@@ -356,6 +372,11 @@ class MoonshotBot(Bot):
                     logger.error(f"[MOONSHOT] stream error: {error_msg}")
                     yield {"error": True, "message": error_msg, "status_code": 500}
                     return
+
+                # The include_usage chunk carries usage with an empty choices
+                # list — capture it before the choices skip below drops it.
+                if isinstance(chunk.get("usage"), dict):
+                    stream_usage = chunk["usage"]
 
                 if not chunk.get("choices"):
                     continue
@@ -421,14 +442,17 @@ class MoonshotBot(Bot):
                             }]
                         }
 
-            # Final chunk with finish_reason
-            yield {
+            # Final chunk with finish_reason (+ usage when the provider reported it)
+            final_chunk = {
                 "choices": [{
                     "index": 0,
                     "delta": {},
                     "finish_reason": finish_reason
                 }]
             }
+            if stream_usage is not None:
+                final_chunk["usage"] = stream_usage
+            yield final_chunk
 
         except requests.exceptions.Timeout:
             logger.error("[MOONSHOT] Request timeout")
@@ -461,6 +485,14 @@ class MoonshotBot(Bot):
             finish_reason = result["choices"][0]["finish_reason"]
 
             response_data = {"role": "assistant", "content": []}
+
+            # Kimi K3 requires reasoning_content to be preserved in multi-turn
+            # conversations when thinking was active for that assistant turn.
+            if message.get("reasoning_content"):
+                response_data["content"].append({
+                    "type": "thinking",
+                    "thinking": message["reasoning_content"]
+                })
 
             # Add text content
             if message.get("content"):

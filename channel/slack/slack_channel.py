@@ -57,8 +57,8 @@ class SlackChannel(ChatChannel):
     # ------------------------------------------------------------------
 
     def startup(self):
-        self.bot_token = conf().get("slack_bot_token", "")
-        self.app_token = conf().get("slack_app_token", "")
+        self.bot_token = self.cfg("slack_bot_token", "")
+        self.app_token = self.cfg("slack_app_token", "")
         if not self.bot_token or not self.app_token:
             err = "[Slack] slack_bot_token and slack_app_token are both required"
             logger.error(err)
@@ -278,6 +278,8 @@ class SlackChannel(ChatChannel):
                 context["receiver"] = channel_id
                 context["slack_channel"] = channel_id
                 context["slack_thread_ts"] = thread_ts if is_group else None
+                from agent.team_addressing import stamp_speaker_from_channel
+                stamp_speaker_from_channel(self, context, slack_msg.content)
                 self.produce(context)
             logger.debug(f"[Slack] received: type={ctype}, content={str(slack_msg.content)[:80]}")
         except Exception as e:
@@ -287,7 +289,15 @@ class SlackChannel(ChatChannel):
         """Fast-path: /cancel calls cancel_session directly without going through agent."""
         try:
             from agent.protocol import get_cancel_registry
-            cancelled = get_cancel_registry().cancel_session(session_id)
+            from bridge.bridge import Bridge
+            agent_bridge = Bridge().get_agent_bridge()
+            agent_id = agent_bridge.agent_router.resolve(
+                explicit_agent_id=getattr(self, "bound_agent_id", "") or None,
+            )
+            scoped_session_id = agent_bridge._cancel_key(
+                agent_id, session_id, agent_bridge.agent_registry.default_agent_id
+            )
+            cancelled = get_cancel_registry().cancel_session(scoped_session_id)
             text = "Current task cancelled." if cancelled else "No running task to cancel."
             thread_ts = event.get("thread_ts") or event.get("ts")
             self._client.chat_postMessage(channel=channel_id, text=text, thread_ts=thread_ts)
@@ -390,6 +400,7 @@ class SlackChannel(ChatChannel):
         context.kwargs = kwargs
         if "channel_type" not in context:
             context["channel_type"] = self.channel_type
+        self.stamp_instance_context(context)
         if "origin_ctype" not in context:
             context["origin_ctype"] = ctype
 

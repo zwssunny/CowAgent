@@ -8,22 +8,27 @@ from typing import Dict, Any
 
 from agent.tools.base_tool import BaseTool, ToolResult
 from common.utils import expand_path
+from agent.tools.utils.credentials import DENIED_MESSAGE, is_credential_path
 from agent.tools.utils.diff import (
     strip_bom,
     detect_line_ending,
     normalize_to_lf,
     restore_line_endings,
-    count_matches,
-    fuzzy_find_text,
-    generate_diff_string
+    find_match_spans,
+    generate_diff_string,
+    looks_like_line_numbered_block,
+    reindent_replacement,
+    strip_line_number_prefixes,
 )
+from agent.tools.utils.file_state import note_write, staleness_warning
+from agent.tools.utils.syntax_check import review as syntax_review
 
 
 class Edit(BaseTool):
     """Tool for precise file editing"""
     
     name: str = "edit"
-    description: str = "Edit a file by replacing exact text, or append to end if oldText is empty. For append: use empty oldText. For replace: oldText must match exactly (including whitespace)."
+    description: str = "Edit a file by replacing exact text, or append to end if oldText is empty. For append: use empty oldText. For replace: oldText must match exactly (including whitespace) and must be unique unless replaceAll is true. IMPORTANT: the read tool prefixes each line with `12|` for display only - never include those prefixes in oldText or newText."
     
     params: dict = {
         "type": "object",
@@ -34,11 +39,15 @@ class Edit(BaseTool):
             },
             "oldText": {
                 "type": "string",
-                "description": "Text to find and replace. Use empty string to append to end of file. For replacement: must match exactly including whitespace."
+                "description": "Text to find and replace, copied from the file itself WITHOUT the `12|` line-number prefixes shown by the read tool. Use empty string to append to end of file. For replacement: must match exactly including whitespace."
             },
             "newText": {
                 "type": "string",
-                "description": "New text to replace the old text with"
+                "description": "New text to replace the old text with (no line-number prefixes)"
+            },
+            "replaceAll": {
+                "type": "boolean",
+                "description": "Replace every occurrence of oldText instead of requiring it to be unique. Default false."
             }
         },
         "required": ["path", "oldText", "newText"]
@@ -59,13 +68,20 @@ class Edit(BaseTool):
         path = args.get("path", "").strip()
         old_text = args.get("oldText", "")
         new_text = args.get("newText", "")
+        replace_all = bool(args.get("replaceAll", False))
+        replacements_made = 1
         
         if not path:
             return ToolResult.fail("Error: path parameter is required")
         
         # Resolve path
         absolute_path = self._resolve_path(path)
-        
+
+        # Same guard the read tool applies. Editing is also a read: the success
+        # result carries a diff whose context lines would expose the secrets.
+        if is_credential_path(absolute_path):
+            return ToolResult.fail(DENIED_MESSAGE)
+
         # Check if file exists
         if not os.path.exists(absolute_path):
             return ToolResult.fail(f"Error: File not found: {path}")
@@ -100,35 +116,63 @@ class Edit(BaseTool):
                     new_content = normalized_content + normalized_new_text
                 base_content = normalized_content  # For verification
             else:
-                # Normal edit mode: find and replace
-                # Use fuzzy matching to find old text (try exact match first, then fuzzy match)
-                match_result = fuzzy_find_text(normalized_content, normalized_old_text)
-                
-                if not match_result.found:
+                # Normal edit mode: find and replace.
+                # Exact match is preferred; the fuzzy pattern only kicks in when
+                # the exact substring is absent (see find_match_spans).
+                spans, exact = find_match_spans(normalized_content, normalized_old_text)
+
+                if not spans:
+                    # Fallback: the model may have copied the `12|` gutter out of
+                    # read output. Retry once without it. Doing this only after a
+                    # normal miss means content that genuinely contains `12|` is
+                    # never mangled.
+                    retry_old = strip_line_number_prefixes(normalized_old_text)
+                    if retry_old:
+                        spans, exact = find_match_spans(normalized_content, retry_old)
+                        if spans:
+                            normalized_old_text = retry_old
+                            stripped_new = strip_line_number_prefixes(normalized_new_text)
+                            if stripped_new:
+                                normalized_new_text = stripped_new
+
+                if not spans:
                     return ToolResult.fail(
                         f"Error: Could not find the exact text in {path}. "
                         "The old text must match exactly including all whitespace and newlines."
                     )
-                
-                # Count occurrences with the same matcher used to locate and
-                # replace (fuzzy_find_text), so the uniqueness guard cannot
-                # disagree with what actually gets replaced.
-                occurrences = count_matches(normalized_content, normalized_old_text)
-                
-                if occurrences > 1:
+
+                if len(spans) > 1 and not replace_all:
                     return ToolResult.fail(
-                        f"Error: Found {occurrences} occurrences of the text in {path}. "
-                        "The text must be unique. Please provide more context to make it unique."
+                        f"Error: Found {len(spans)} occurrences of the text in {path}. "
+                        "The text must be unique. Please provide more context to make it unique, "
+                        "or set replaceAll to true to replace all of them."
                     )
-                
-                # Execute replacement (use matched text position)
-                base_content = match_result.content_for_replacement
-                new_content = (
-                    base_content[:match_result.index] +
-                    normalized_new_text +
-                    base_content[match_result.index + match_result.match_length:]
-                )
+
+                # Rebuild the file around the matched spans, back to front so the
+                # earlier offsets stay valid.
+                base_content = normalized_content
+                new_content = base_content
+                for start, end in reversed(spans):
+                    replacement = normalized_new_text
+                    if not exact:
+                        # A fuzzy match swallowed the file's own indentation;
+                        # re-anchor the replacement to it instead of silently
+                        # reindenting the line to whatever the model sent.
+                        replacement = reindent_replacement(
+                            base_content[start:end], normalized_old_text, replacement
+                        )
+                    new_content = new_content[:start] + replacement + new_content[end:]
+                replacements_made = len(spans)
             
+            # Checked after the fallback above, so a newText whose gutter was
+            # already stripped alongside oldText still goes through.
+            if looks_like_line_numbered_block(normalized_new_text):
+                return ToolResult.fail(
+                    f"Error: newText looks like read tool output ('12|content'), not file "
+                    f"content. Those line-number prefixes are display only - strip them "
+                    f"before editing {path}."
+                )
+
             # Verify replacement actually changed content
             if base_content == new_content:
                 return ToolResult.fail(
@@ -139,20 +183,38 @@ class Edit(BaseTool):
             
             # Restore original line endings
             final_content = bom + restore_line_endings(new_content, original_ending)
-            
+
+            # Check before writing - our own write would reset the mtime.
+            warning = staleness_warning(absolute_path)
+
+            blocking, syntax_warning = syntax_review(absolute_path, base_content, new_content)
+            if blocking:
+                return ToolResult.fail(f"Error: {blocking}")
+
             # Write file
             with open(absolute_path, 'w', encoding='utf-8') as f:
                 f.write(final_content)
+            note_write(absolute_path)
             
             # Generate diff
             diff_result = generate_diff_string(base_content, new_content)
-            
+
+            if replacements_made > 1:
+                message = f"Successfully replaced {replacements_made} occurrences in {path}"
+            else:
+                message = f"Successfully replaced text in {path}"
+
             result = {
-                "message": f"Successfully replaced text in {path}",
+                "message": message,
                 "path": path,
                 "diff": diff_result['diff'],
                 "first_changed_line": diff_result['first_changed_line']
             }
+            if replacements_made > 1:
+                result["replacements"] = replacements_made
+            warnings = [w for w in (warning, syntax_warning) if w]
+            if warnings:
+                result["warning"] = " ".join(warnings)
             
             # Notify memory manager if file is in memory directory
             if self.memory_manager and "memory/" in path:

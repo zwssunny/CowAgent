@@ -119,13 +119,32 @@ class WecomBotChannel(ChatChannel):
     # ------------------------------------------------------------------
 
     def startup(self):
-        self.mode = conf().get("wecom_bot_mode", "websocket")
+        self.mode = self.cfg("wecom_bot_mode", "websocket")
+        # Webhook mode binds a fixed HTTP port, so it cannot host more than one
+        # instance in a process. Only the websocket transport is multi-instance
+        # ready; refuse to start a bound (multi-instance) webhook bot instead of
+        # silently colliding on the port with another instance.
         if self.mode == "webhook":
+            # Webhook binds a fixed HTTP port, so only one webhook bot can run
+            # per process. The default (bootstrapped) instance keeps
+            # instance_id == channel_type and is allowed — it is still the one
+            # webhook bot, just carrying an Agent binding. An *extra* instance
+            # (a distinct instance_id) would collide on the port, so refuse it
+            # and point the user at websocket mode.
+            iid = getattr(self, "instance_id", "") or ""
+            if iid and iid != self.channel_type:
+                err = (
+                    "[WecomBot] webhook mode does not support multiple instances "
+                    "(it binds a fixed port); use websocket mode for extra bots"
+                )
+                logger.error(err)
+                self.report_startup_error(err)
+                return
             self._startup_callback()
             return
 
-        self.bot_id = conf().get("wecom_bot_id", "")
-        self.bot_secret = conf().get("wecom_bot_secret", "")
+        self.bot_id = self.cfg("wecom_bot_id", "")
+        self.bot_secret = self.cfg("wecom_bot_secret", "")
 
         if not self.bot_id or not self.bot_secret:
             err = "[WecomBot] wecom_bot_id and wecom_bot_secret are required"
@@ -506,6 +525,8 @@ class WecomBotChannel(ChatChannel):
         wecom_msg.req_id = req_id
         if req_id:
             context["on_event"] = self._make_stream_callback(req_id)
+        from agent.team_addressing import stamp_speaker_from_channel
+        stamp_speaker_from_channel(self, context, wecom_msg.content)
         self.produce(context)
 
     def _build_context(self, body: dict, is_group: bool, default_aeskey: str = ""):
@@ -688,6 +709,7 @@ class WecomBotChannel(ChatChannel):
         context.kwargs = kwargs
         if "channel_type" not in context:
             context["channel_type"] = self.channel_type
+        self.stamp_instance_context(context)
         if "origin_ctype" not in context:
             context["origin_ctype"] = ctype
 

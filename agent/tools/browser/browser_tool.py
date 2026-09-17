@@ -25,12 +25,19 @@ from urllib.parse import urlparse
 from agent.tools.base_tool import BaseTool, ToolResult
 from agent.tools.browser.browser_service import BrowserService
 from common.log import logger
+from common.utils import is_cloud_deployment, memory_headroom_mb
 
 
 # Cloud-metadata endpoints worth blocking even though they are not link-local.
 # (169.254.169.254 — AWS/GCP/Azure IMDS — is already covered by is_link_local;
 # fd00:ec2::254 is the AWS IPv6 IMDS address.)
 _CLOUD_METADATA_IPS = frozenset({ipaddress.ip_address("fd00:ec2::254")})
+
+# Memory a browser engine needs to start and render a real page: the engine's
+# own processes plus the driver that supervises them. Launching below this leaves
+# the whole runtime without room, and since page cache then gets evicted and
+# faulted back in continuously, every unrelated operation slows to a crawl too.
+_MIN_LAUNCH_HEADROOM_MB = 300
 
 
 class BrowserTool(BaseTool):
@@ -185,6 +192,49 @@ class BrowserTool(BaseTool):
                     f"({ip_str}), request blocked for security"
                 )
 
+    def _check_memory_budget(self) -> Optional[ToolResult]:
+        """Refuse to launch when there is not enough memory left to do it safely.
+
+        Only applies where the runtime enforces a memory limit small enough that a
+        browser cannot fit; installs that manage their own resources are left
+        untouched. Skipped once a browser is already running, so an in-progress
+        session is never interrupted mid-task, and skipped in CDP mode where the
+        browser is an external process we merely attach to.
+
+        The threshold is configurable via ``min_memory_mb`` under
+        ``tools.browser`` (0 disables the check).
+        """
+        if not is_cloud_deployment():
+            return None
+        if self.config.get("cdp_endpoint"):
+            return None
+        running = BrowserTool._shared_service
+        if running is not None and running.is_running():
+            return None
+
+        threshold = self.config.get("min_memory_mb", _MIN_LAUNCH_HEADROOM_MB)
+        try:
+            threshold = float(threshold)
+        except (TypeError, ValueError):
+            threshold = _MIN_LAUNCH_HEADROOM_MB
+        if threshold <= 0:
+            return None
+
+        headroom = memory_headroom_mb()
+        if headroom is None or headroom >= threshold:
+            return None
+
+        logger.warning(
+            f"[Browser] Not enough memory to launch: {headroom:.0f}MB free, "
+            f"{threshold:.0f}MB required"
+        )
+        return ToolResult.fail(
+            "Browser unavailable: this deployment does not have enough memory to "
+            f"run one ({headroom:.0f}MB free, {threshold:.0f}MB needed). "
+            "Use web_search to gather the information instead, and tell the user "
+            "the browser needs a larger memory allocation. Do not retry this tool."
+        )
+
     def _check_engine_ready(self) -> Optional[ToolResult]:
         """Return an actionable onboarding message if no browser engine is ready.
 
@@ -235,6 +285,12 @@ class BrowserTool(BaseTool):
         not_ready = self._check_engine_ready()
         if not_ready is not None:
             return not_ready
+
+        # An engine being installed is not enough: launching it without room to
+        # spare degrades everything else in the runtime, so check that too.
+        no_budget = self._check_memory_budget()
+        if no_budget is not None:
+            return no_budget
 
         try:
             return handler(self, args)

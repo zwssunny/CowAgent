@@ -25,7 +25,7 @@ class Bridge(object):
         if bot_type:
             self.btype["chat"] = bot_type
         else:
-            model_type = conf().get("model") or const.GPT_41_MINI
+            model_type = conf().get("model") or const.DEFAULT_MODEL
             
             # Ensure model_type is string to prevent AttributeError when using startswith()
             # This handles cases where numeric model names (e.g., "1") are parsed as integers from YAML

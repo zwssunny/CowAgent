@@ -74,6 +74,7 @@ im:message,im:message.group_at_msg,im:message.group_at_msg:readonly,im:message.p
     | `feishu_app_id` | 飞书应用 App ID | - |
     | `feishu_app_secret` | 飞书应用 App Secret | - |
     | `feishu_stream_reply` | 是否开启流式打字机回复 | `true` |
+    | `feishu_detailed_card` | 流式回复是否使用详细卡片（工具调用、思考过程、耗时展示）；关闭时用普通打字机卡片 | `true` |
   </Tab>
 </Tabs>
 
@@ -85,7 +86,9 @@ im:message,im:message.group_at_msg,im:message.group_at_msg:readonly,im:message.p
 
 2. 点击 **添加事件**，搜索 "接收消息"，选择 **接收消息 v2.0** 并确认。
 
-3. 点击 **版本管理与发布**，创建版本并申请 **线上发布**，在飞书客户端审核通过：
+3. （可选）在 **回调** 中添加 **卡片回传交互**（`card.action.trigger`），以启用 `/tasks` 定时任务管理命令；添加 **撤回消息**（`im.message.recalled_v1`）事件，以支持撤回消息取消任务功能。
+
+4. 点击 **版本管理与发布**，创建版本并申请 **线上发布**，在飞书客户端审核通过：
 
 <img src="https://cdn.link-ai.tech/doc/202601311807356.png" width="600"/>
 
@@ -98,7 +101,11 @@ im:message,im:message.group_at_msg,im:message.group_at_msg:readonly,im:message.p
 | 文本消息 | ✅ 收发 |
 | 图片消息 | ✅ 收发 |
 | 语音消息 | ✅ 收发 |
+| 引用回复 | ✅ 引用文本与富文本上下文 |
 | 流式回复 | ✅（通过 `feishu_stream_reply` 配置控制，默认开启） |
+| Markdown 卡片 | ✅ 静态卡片与流式最终态会将远程图片上传到飞书 |
+| 详细卡片 | ✅ 工具调用、思考过程与耗时展示（`feishu_detailed_card` 控制，默认开启） |
+| 定时任务操作卡 | ✅ `/tasks` 查看、启用、停用与删除 |
 
 <Note>
   流式回复需要机器人具备 `cardkit:card:write` 权限（一键创建已默认开通），且接收方飞书客户端版本 ≥ 7.20。低版本客户端会显示升级提示，权限或版本不满足时自动降级为普通文本回复。
@@ -109,3 +116,5 @@ im:message,im:message.group_at_msg,im:message.group_at_msg:readonly,im:message.p
 完成接入后，在飞书中搜索机器人名称即可开始单聊对话。
 
 如需在群聊中使用，将机器人添加到群中，@机器人发送消息即可。
+
+私聊发送 `/tasks`，或在群聊中 @机器人并发送 `/tasks`，即可管理属于当前会话的定时任务。

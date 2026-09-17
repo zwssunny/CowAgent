@@ -5,12 +5,9 @@ Convert a discord.py Message into cow's unified ChatMessage.
 File downloads are NOT performed here; the channel layer downloads
 attachments on demand inside the async event loop.
 """
-import os
-
 from bridge.context import ContextType
 from channel.chat_message import ChatMessage
-from common.utils import expand_path
-from config import conf
+from common import state_dir
 
 
 class DiscordMessage(ChatMessage):
@@ -53,8 +50,5 @@ class DiscordMessage(ChatMessage):
 
     @staticmethod
     def get_tmp_dir() -> str:
-        """Local download directory, aligned with other channels (agent_workspace/tmp)."""
-        workspace_root = expand_path(conf().get("agent_workspace", "~/cow"))
-        tmp_dir = os.path.join(workspace_root, "tmp")
-        os.makedirs(tmp_dir, exist_ok=True)
-        return tmp_dir
+        """Local download directory, aligned with other channels (workspace tmp)."""
+        return str(state_dir.tmp_dir())

@@ -19,10 +19,9 @@ A single turn may include multiple tool calls (controlled by `agent_max_steps`).
 
 | Parameter | Description | Default |
 | --- | --- | --- |
-| `agent_max_context_tokens` | Maximum context token budget | `50000` |
-| `agent_max_context_turns` | Maximum conversation turns in context | `20` |
-| `agent_max_steps` | Maximum decision steps per turn (tool call count) | `15` |
-
+| `agent_max_context_tokens` | Maximum context token budget | `64000` |
+| `agent_max_context_turns` | Maximum conversation turns in context | `30` |
+| `agent_max_steps` | Maximum decision steps per turn (tool call count) | `30` |
 Configurable via `config.json` or the `/config` chat command.
 
 ## Compression Strategy
@@ -57,6 +56,10 @@ When the model API returns a context overflow error:
 2. Aggressive trimming is applied (tool results limited to 10K chars, user text to 10K, max 5 turns)
 3. If still overflowing, the entire conversation context is cleared
 
+### 5. Manual Compaction
+
+Besides the automatic strategies above, you can compact context on demand with the `/compact` command. It reuses the same logic as automatic trimming — older turns are summarized by the LLM and injected into the retained context, while the most recent turns are kept intact. Unlike auto-trim, it runs immediately regardless of current token usage, which is handy for freeing context before a long task.
+
 ## Session Persistence
 
 Conversation messages are persisted to a local database, automatically restored after service restart. Restore strategy:
@@ -72,7 +75,8 @@ Use these commands in chat to manage context:
 | Command | Description |
 | --- | --- |
 | `/context` | View current context statistics (message count, role distribution, total characters) |
-| `/context clear` | Clear current session context |
+| `/clear` | Clear current session context (`/context clear` still works as an alias) |
+| `/compact` | Summarize older turns to free up context, keeping recent turns intact |
 | `/config agent_max_context_tokens 80000` | Adjust context token budget |
 | `/config agent_max_context_turns 30` | Adjust context turn limit |
 

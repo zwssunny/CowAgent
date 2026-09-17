@@ -43,10 +43,16 @@ fi
 # fi
 
 
+# apply runtime timezone from TZ env so datetime.now() uses local time
+if [ -n "$TZ" ] && [ -f "/usr/share/zoneinfo/$TZ" ]; then
+    ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime 2>/dev/null || true
+    echo "$TZ" > /etc/timezone 2>/dev/null || true
+fi
+
 # fix ownership of mounted volumes then drop to non-root user
 if [ "$(id -u)" = "0" ]; then
-    mkdir -p /home/agent/cow
-    chown agent:agent /home/agent/cow
+    mkdir -p /home/agent/cow "${COW_DATA_DIR:-/home/agent/.cow}"
+    chown agent:agent /home/agent/cow "${COW_DATA_DIR:-/home/agent/.cow}"
     exec su agent -s /bin/bash -c "cd $CHATGPT_ON_WECHAT_PREFIX && $CHATGPT_ON_WECHAT_EXEC"
 fi
 

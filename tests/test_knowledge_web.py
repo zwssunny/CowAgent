@@ -43,8 +43,11 @@ def test_knowledge_action_handler_preserves_dispatch_error(tmp_path):
 
 def test_knowledge_frontend_management_contract():
     root = Path(__file__).parents[1]
-    html = (root / "channel/web/chat.html").read_text(encoding="utf-8")
-    js = (root / "channel/web/static/js/console.js").read_text(encoding="utf-8")
+    # The page is assembled from templates/, so assert against what is served.
+    from channel.web import template
+    html = template.render("chat.html")
+    from conftest import console_js
+    js = console_js()
 
     assert 'id="knowledge-dialog-overlay"' in html
     assert 'id="knowledge-dialog-textarea"' in html
@@ -68,7 +71,7 @@ def test_knowledge_frontend_management_contract():
     assert "function importKnowledgeDocuments(" in js
     assert "function validateKnowledgeImportFiles(" in js
     assert "KNOWLEDGE_IMPORT_MAX_FILE_SIZE" in js
-    assert "fetch('/api/knowledge/import'" in js
+    assert "fetch(_kbUrl('/api/knowledge/import')" in js
     assert "initKnowledgeImportDropZone()" in js
 
     knowledge_section = js[js.index("// Knowledge View"):js.index("function _hasFilterMatch")]

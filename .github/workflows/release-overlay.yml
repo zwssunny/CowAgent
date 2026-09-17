@@ -1,0 +1,381 @@
+name: Release Desktop Overlay
+
+# Cloud build for a branded desktop variant. The variant lives in a private
+# overlay repo (product code + branding) that is applied onto this repo's
+# desktop/ tree at build time; the core is never modified. Installers go
+# straight to R2, which is both the CDN origin and the staging area between
+# jobs.
+#
+# WHY THIS WORKFLOW LIVES IN THE PUBLIC CORE REPO
+# Actions minutes are billed to the repo that owns the workflow RUN, not the
+# repos it checks out, and public repos get standard runners for free — macOS
+# included. That matters because macOS burns the included-minutes allowance at
+# a 10x multiplier: run from the private overlay repo, ten builds exhausted the
+# monthly allowance and every later job was refused before it started. Here the
+# same builds cost nothing. Only the workflow moved; the overlay stays private
+# and is pulled in with a read-only deploy key.
+#
+# CAUTION: logs of this workflow are PUBLIC. Product-identifying values are
+# kept in secrets so Actions masks them, and OVERLAY_PRODUCT_NAME is registered
+# with ::add-mask:: so the packager's own output (which prints installer
+# filenames built from productName) is redacted too. Don't add steps that dump
+# the overlay tree, the environment, or R2 responses.
+#
+# Flow (per platform, in the matrix):
+#   1. checkout this repo (core, at the ref you dispatch) + the overlay
+#   2. build the Python backend (PyInstaller)
+#   3. build-overlay.mjs: apply overlay -> build renderer/main -> electron-builder
+#   4. rewrite-yml.mjs: prefix update paths with v<ver>/ (feed served at CDN root)
+#   5. upload-r2.mjs: installers AND the feed yml -> <prefix>v<ver>/
+#
+# The yml is parked in the versioned folder where no client reads it; the
+# publish-feed job pulls it back down and republishes it at the feed root, so a
+# version only goes live once every platform has landed. Nothing travels
+# through GitHub artifacts — see keep_installer_artifacts for the escape hatch.
+#
+# Required secrets in THIS repo:
+#   OVERLAY_DEPLOY_KEY     read-only deploy key for the overlay repo
+#   OVERLAY_R2_PREFIX      R2 key prefix for this variant, e.g. "<name>/"
+#   OVERLAY_PRODUCT_NAME   the overlay's productName, used only to redact it
+#                          from the public logs (optional but recommended)
+#   CLIENT_SMS_SECRET      matches client.sms.secret on the server
+#   CLOUDFLARE_API_TOKEN   R2 upload
+#   CLOUDFLARE_ACCOUNT_ID  R2 upload
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp (e.g. 2.1.4). Used for package.json + R2 path."
+        type: string
+        required: true
+      overlay_ref:
+        description: "Overlay repo ref to build with (branch/tag/sha)."
+        type: string
+        default: "main"
+      upload:
+        description: "Upload to R2 (needs the Cloudflare secrets)."
+        type: boolean
+        default: false
+      keep_installer_artifacts:
+        description: "Also keep installers as GitHub artifacts (only for a dry build you need by hand)."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  OVERLAY_REPO: zhayujie/cow-private-overlay
+  R2_BUCKET: cow-skills
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't cancel the other platforms if one fails — we want to see all
+      # failures in a single run.
+      fail-fast: false
+      matrix:
+        include:
+          # meta_arch tags the feed yml this leg parks on R2. Both mac legs emit
+          # the same feed name, so without it the second one overwrites the
+          # first and the published feed loses an architecture. Windows has a
+          # single leg and parks its feed untagged.
+          - name: macOS arm64
+            os: macos-14
+            platform: mac
+            eb_flags: --mac --arm64
+            meta_arch: arm64
+          - name: macOS x64
+            os: macos-15-intel
+            platform: mac
+            eb_flags: --mac --x64
+            meta_arch: x64
+          - name: Windows x64
+            os: windows-latest
+            platform: win
+            eb_flags: --win --x64
+
+    steps:
+      # The core takes the workspace root, matching the layout the spec file
+      # and build-overlay.mjs resolve their relative paths against. Checkout
+      # defaults to the ref this run was dispatched on, so the branch picker in
+      # the Actions UI selects the core revision — no separate input needed.
+      - name: Checkout core
+        uses: actions/checkout@v4
+
+      # A deploy key rather than a PAT: it grants read on this one repo only
+      # and doesn't expire out from under the release. Swap ssh-key for
+      # `token: ${{ secrets.<PAT> }}` if you'd rather use a token.
+      - name: Checkout overlay
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OVERLAY_REPO }}
+          ref: ${{ inputs.overlay_ref }}
+          ssh-key: ${{ secrets.OVERLAY_DEPLOY_KEY }}
+          path: overlay
+
+      # electron-builder names every installer after the overlay's productName
+      # and prints those names as it works. Registering the name here redacts
+      # it from the rest of this job's (public) log. Case-sensitive substring
+      # match, so the lowercase form is registered too — it shows up in bundle
+      # ids and asset paths.
+      - name: Redact product name from logs
+        shell: bash
+        env:
+          PRODUCT_NAME: ${{ secrets.OVERLAY_PRODUCT_NAME }}
+        run: |
+          if [ -n "$PRODUCT_NAME" ]; then
+            echo "::add-mask::$PRODUCT_NAME"
+            echo "::add-mask::$(echo "$PRODUCT_NAME" | tr '[:upper:]' '[:lower:]')"
+          else
+            echo "::warning::OVERLAY_PRODUCT_NAME not set — installer names will appear in this public log."
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build Python backend (PyInstaller)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r desktop/build/requirements-desktop.txt
+          pip install pyinstaller
+          # Run from repo root so the spec's relative datas resolve correctly.
+          pyinstaller desktop/build/cowagent-backend.spec \
+            --noconfirm \
+            --distpath desktop/build/dist \
+            --workpath desktop/build/build-work
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+
+      # Bundle ripgrep on Windows so the grep tool has a fast backend out of the
+      # box instead of falling back to PowerShell (slow, and prone to encoding /
+      # path quirks). macOS is intentionally excluded: it always has a working
+      # system `grep` that the tool uses correctly. Mirrors the core release
+      # workflow; build-overlay.mjs stages its own resources alongside this and
+      # only removes what it staged, so the two don't collide.
+      - name: Bundle ripgrep binary (Windows only)
+        if: matrix.platform == 'win'
+        shell: bash
+        env:
+          RG_VERSION: "15.2.0"
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/resources/bin
+          url="https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc.zip"
+          curl -fL "$url" -o rg.zip
+          # -j flatten, -o overwrite; grab just the rg.exe from the archive.
+          unzip -j -o rg.zip '*/rg.exe' -d desktop/resources/bin
+          ls -l desktop/resources/bin
+
+      - name: Stamp version
+        working-directory: desktop
+        shell: bash
+        run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
+
+      # Download the Windows signing CLI. The URL comes from a repo variable, so
+      # nothing about the signing setup is hardcoded in a public workflow. Only
+      # runs on the Windows leg and only when a URL is set; otherwise the build
+      # stays unsigned. SIGNTOOL_PATH is exported for the next step's
+      # electron-builder.win.js to invoke. Mirrors the core release workflow.
+      - name: Download Windows signing CLI
+        if: matrix.platform == 'win' && vars.SIGNTOOL_CLI_URL != ''
+        shell: bash
+        env:
+          SIGNTOOL_CLI_URL: ${{ vars.SIGNTOOL_CLI_URL }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signtool"
+          curl -fsSL "$SIGNTOOL_CLI_URL" -o "$RUNNER_TEMP/signtool/cli.zip"
+          # Unzip and locate the signtool executable regardless of nesting.
+          unzip -o "$RUNNER_TEMP/signtool/cli.zip" -d "$RUNNER_TEMP/signtool" >/dev/null
+          exe="$(find "$RUNNER_TEMP/signtool" -type f -iname 'signtool*.exe' | head -n1)"
+          if [ -z "$exe" ]; then
+            echo "signtool.exe not found in downloaded archive" >&2
+            find "$RUNNER_TEMP/signtool" -type f >&2
+            exit 1
+          fi
+          # Normalize to a Windows-style path for execFileSync in Node.
+          echo "SIGNTOOL_PATH=$(cygpath -w "$exe")" >> "$GITHUB_ENV"
+          echo "resolved signtool: $exe"
+
+      # build-overlay.mjs stages overlay resources, merges build.config.json
+      # over the core build config, runs the core build, then electron-builder.
+      #
+      # --publish always (not never): with a generic provider, electron-builder
+      # only WRITES the update metadata (latest*.yml) locally and never uploads
+      # (generic is a read-only feed you fill yourself). With --publish never it
+      # skips writing latest*.yml entirely, which the steps below need.
+      - name: Build overlay
+        working-directory: overlay
+        shell: bash
+        env:
+          COW_CORE_DIR: ${{ github.workspace }}/desktop
+          # Trusted-client SMS secret (matches client.sms.secret on the server).
+          CLIENT_SMS_SECRET: ${{ secrets.CLIENT_SMS_SECRET }}
+          # Signing secrets, shared with the core release workflow. Passed through
+          # as-is and only exported below when non-empty: an empty CSC_LINK makes
+          # electron-builder load a bogus certificate and fail, so unset is the
+          # correct state for an unsigned build.
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          # Windows code signing via the signing CLI; SIGNTOOL_PATH was exported
+          # by the download step above. COW_SIGN_DRY_RUN (repo variable) validates
+          # the pipeline with a self-signed cert, consuming no signing quota.
+          SIGNTOOL_ACCESS_KEY: ${{ secrets.SIGNTOOL_ACCESS_KEY }}
+          SIGNTOOL_ACCESS_SECRET: ${{ secrets.SIGNTOOL_ACCESS_SECRET }}
+          SIGNTOOL_CERT_CODE: ${{ secrets.SIGNTOOL_CERT_CODE }}
+          COW_SIGN_DRY_RUN: ${{ vars.COW_SIGN_DRY_RUN }}
+        run: |
+          # Pick the signing cert for THIS platform only. Both secrets sit in the
+          # job env, but a mac cert must never reach a Windows build (electron-
+          # builder would try to load it and fail) and vice versa. Windows signs
+          # through the hook in electron-builder.win.js using the SIGNTOOL_* env
+          # above, so there is nothing to export for it here.
+          if [ "${{ matrix.platform }}" = "mac" ] && [ -n "$MAC_CSC_LINK" ]; then
+            export CSC_LINK="$MAC_CSC_LINK"
+            export CSC_KEY_PASSWORD="$MAC_CSC_KEY_PASSWORD"
+          fi
+          node build-overlay.mjs ${{ matrix.eb_flags }} --publish always
+
+      # A leg packages the backend PyInstaller just built on its own runner, so
+      # an app whose Electron shell is a different arch than that backend is a
+      # packaging mistake: an x86_64 backend under an arm64 shell drags the whole
+      # agent through Rosetta (slow enough that spawning a browser times out),
+      # and an arm64 backend under an x64 shell cannot execute at all. The pair
+      # is only ever implied by flags and config, so assert it on the output.
+      - name: Verify packaged architectures
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(desktop/release/mac*/*.app)
+          if [ ${#apps[@]} -eq 0 ]; then
+            echo "::error::no .app was packaged"
+            exit 1
+          fi
+          for app in "${apps[@]}"; do
+            # App names carry the (masked) product name — report the out dir.
+            leg="$(basename "$(dirname "$app")")"
+            shell_bin="$app/Contents/MacOS/$(basename "$app" .app)"
+            backend="$app/Contents/Resources/backend/cowagent-backend/cowagent-backend"
+            if [ ! -f "$backend" ]; then
+              echo "::error::$leg: the app carries no backend"
+              exit 1
+            fi
+            shell_arch="$(lipo -archs "$shell_bin")"
+            backend_arch="$(lipo -archs "$backend")"
+            echo "$leg: shell=$shell_arch backend=$backend_arch"
+            if [ "$shell_arch" != "$backend_arch" ]; then
+              echo "::error::$leg pairs a $shell_arch shell with a $backend_arch backend"
+              exit 1
+            fi
+          done
+
+      # Prefix update paths with v<ver>/ so the root feed resolves installers
+      # from the versioned folder.
+      - name: Rewrite update metadata
+        working-directory: overlay
+        shell: bash
+        env:
+          COW_CORE_DIR: ${{ github.workspace }}/desktop
+        run: node rewrite-yml.mjs "${{ inputs.version }}"
+
+      # wrangler@latest needs Node >=22 while the packager runs on Node 20.
+      # The build is finished by now, so switching the PATH here is harmless.
+      - name: Set up Node 22 for wrangler
+        if: inputs.upload
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Ship this platform's installers to R2, and park its feed yml next to
+      # them under v<ver>/ (R2_META_VERSIONED) rather than at the feed root.
+      - name: Upload to R2
+        if: inputs.upload
+        working-directory: overlay
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          COW_CORE_DIR: ${{ github.workspace }}/desktop
+          R2_PREFIX: ${{ secrets.OVERLAY_R2_PREFIX }}
+          R2_VERSION: ${{ inputs.version }}
+          R2_META_VERSIONED: "1"
+          R2_META_ARCH: ${{ matrix.meta_arch }}
+          UPLOAD_TOOL: wrangler
+        run: |
+          # Empty would silently fall back to the default prefix and scatter
+          # this variant's files over the core release's keys.
+          if [ -z "$R2_PREFIX" ]; then
+            echo "::error::OVERLAY_R2_PREFIX secret is not set"
+            exit 1
+          fi
+          node upload-r2.mjs
+
+      # Opt-in escape hatch for a dry run (upload=false) where you still want
+      # the installers by hand. Kept short-lived: artifacts bill against the
+      # account's storage quota, and a full matrix run is ~1.9GB.
+      - name: Upload installer artifacts (opt-in)
+        if: always() && inputs.keep_installer_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: overlay-${{ matrix.name }}
+          path: |
+            desktop/release/*.dmg
+            desktop/release/*.zip
+            desktop/release/*.exe
+            desktop/release/*.blockmap
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # Publish the update feed only after every platform's installers are on R2,
+  # so the yml can never advertise a build that isn't downloadable yet.
+  publish-feed:
+    name: Publish update feed
+    needs: build
+    if: inputs.upload
+    runs-on: ubuntu-latest
+    steps:
+      # Only the overlay is needed here — fetch-feed.mjs and upload-r2.mjs live
+      # in it, and neither reads the core tree.
+      - name: Checkout overlay
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OVERLAY_REPO }}
+          ref: ${{ inputs.overlay_ref }}
+          ssh-key: ${{ secrets.OVERLAY_DEPLOY_KEY }}
+
+      # Pull the yml the build jobs parked under v<ver>/ into a scratch release
+      # dir, then republish it at the feed root — the URL shipped clients poll.
+      # This is the step that makes the version go live.
+      #
+      # Each mac leg parked its feed under its own arch tag, so fetch-feed.mjs
+      # merges their entries into one <channel>-mac.yml before the republish.
+      - name: Publish feed to R2
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          COW_CORE_DIR: ${{ github.workspace }}/stage
+          R2_PREFIX: ${{ secrets.OVERLAY_R2_PREFIX }}
+          R2_VERSION: ${{ inputs.version }}
+          UPLOAD_TOOL: wrangler
+        run: |
+          if [ -z "$R2_PREFIX" ]; then
+            echo "::error::OVERLAY_R2_PREFIX secret is not set"
+            exit 1
+          fi
+          node fetch-feed.mjs
+          R2_FILTER=meta node upload-r2.mjs

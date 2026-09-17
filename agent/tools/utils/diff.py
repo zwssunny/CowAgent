@@ -85,12 +85,16 @@ def normalize_for_fuzzy_match(text: str) -> str:
 
 class FuzzyMatchResult:
     """Fuzzy match result"""
-    
-    def __init__(self, found: bool, index: int = -1, match_length: int = 0, content_for_replacement: str = ""):
+
+    def __init__(self, found: bool, index: int = -1, match_length: int = 0,
+                 content_for_replacement: str = "", exact: bool = False):
         self.found = found
         self.index = index
         self.match_length = match_length
         self.content_for_replacement = content_for_replacement
+        # False when the whitespace-flexible pattern was needed. The caller must
+        # then re-anchor the replacement's indentation (see reindent_replacement).
+        self.exact = exact
 
 
 def _build_fuzzy_pattern(old_text: str) -> Optional[str]:
@@ -127,69 +131,150 @@ def _build_fuzzy_pattern(old_text: str) -> Optional[str]:
     return '\n'.join(line_patterns)
 
 
-def fuzzy_find_text(content: str, old_text: str) -> FuzzyMatchResult:
+def find_match_spans(content: str, old_text: str) -> Tuple[list, bool]:
     """
-    Find text in content, try exact match first, then fuzzy match
-    
-    :param content: Content to search in
-    :param old_text: Text to find
-    :return: Match result
-    """
-    # First try exact match
-    index = content.find(old_text)
-    if index != -1:
-        return FuzzyMatchResult(
-            found=True,
-            index=index,
-            match_length=len(old_text),
-            content_for_replacement=content
-        )
+    Locate every non-overlapping occurrence of ``old_text`` in ``content``.
 
-    # Fuzzy match: the exact substring was not found, most likely because the
-    # whitespace differs (indentation, spaces around operators, trailing
-    # spaces). Locate the region in the ORIGINAL content using a
-    # whitespace-flexible pattern and return offsets into that original
-    # content.
+    Exact substring matching is preferred; only when it finds nothing do we fall
+    back to the whitespace-flexible pattern. Finding, counting and replacing all
+    go through this one function so the uniqueness guard can never disagree with
+    what actually gets replaced.
+
+    :return: (list of (start, end) offsets into ``content``, whether exact)
+    """
+    if not old_text:
+        return [], True
+
+    if content.find(old_text) != -1:
+        spans = []
+        start = 0
+        while True:
+            index = content.find(old_text, start)
+            if index == -1:
+                break
+            spans.append((index, index + len(old_text)))
+            start = index + len(old_text)
+        return spans, True
+
+    # The exact substring was not found, most likely because the whitespace
+    # differs (indentation, spaces around operators, trailing spaces). Locate
+    # the region in the ORIGINAL content using a whitespace-flexible pattern
+    # and return offsets into that original content.
     #
     # This must NOT replace inside a whitespace-normalized copy of the file:
-    # doing so previously returned the normalized copy as
-    # content_for_replacement, which caused the whole file to be rewritten
-    # with collapsed indentation (every untouched line got reformatted).
+    # doing so previously returned the normalized copy as the replacement base,
+    # which rewrote the whole file with collapsed indentation.
     pattern = _build_fuzzy_pattern(old_text)
-    if pattern is not None:
-        match = re.search(pattern, content)
-        if match:
-            return FuzzyMatchResult(
-                found=True,
-                index=match.start(),
-                match_length=match.end() - match.start(),
-                content_for_replacement=content
-            )
+    if pattern is None:
+        return [], False
+    return [(m.start(), m.end()) for m in re.finditer(pattern, content)], False
 
-    # Not found
-    return FuzzyMatchResult(found=False)
+
+def fuzzy_find_text(content: str, old_text: str) -> FuzzyMatchResult:
+    """Find the first occurrence of ``old_text``; exact match preferred."""
+    spans, exact = find_match_spans(content, old_text)
+    if not spans:
+        return FuzzyMatchResult(found=False)
+    start, end = spans[0]
+    return FuzzyMatchResult(
+        found=True,
+        index=start,
+        match_length=end - start,
+        content_for_replacement=content,
+        exact=exact,
+    )
 
 
 def count_matches(content: str, old_text: str) -> int:
-    """
-    Count occurrences of ``old_text`` using the SAME strategy as
-    :func:`fuzzy_find_text`: an exact substring when one is present, otherwise
-    the whitespace-flexible fuzzy regex.
+    """Count occurrences using the same strategy as :func:`find_match_spans`."""
+    return len(find_match_spans(content, old_text)[0])
 
-    The edit tool's uniqueness guard must agree with the matcher that actually
-    performs the replacement. Counting through a separate normalization pass
-    (the previous approach) could disagree with the regex used to locate and
-    replace, so both paths now share :func:`_build_fuzzy_pattern`.
+
+def reindent_replacement(matched_text: str, old_text: str, new_text: str) -> str:
     """
-    if not old_text:
-        return 0
-    # Mirror fuzzy_find_text: prefer exact matching when it applies.
-    if content.find(old_text) != -1:
-        return content.count(old_text)
-    pattern = _build_fuzzy_pattern(old_text)
-    if pattern is None:
-        return 0
-    return len(re.findall(pattern, content))
+    Re-anchor ``new_text``'s indentation to the indentation actually in the file.
+
+    The fuzzy pattern tolerates differing indentation, and when ``old_text`` is
+    indented that leading whitespace sits *inside* the matched region. Writing
+    ``new_text`` back verbatim would therefore silently reindent the line to
+    whatever the model happened to send - in Python or YAML that changes the
+    meaning of the code, or breaks it outright, while the tool reports success.
+
+    Only the first line's indentation is compared; the delta is applied to every
+    line so the block's internal structure is preserved.
+    """
+    old_first = old_text.split('\n', 1)[0]
+    old_indent = old_first[:len(old_first) - len(old_first.lstrip())]
+    if not old_indent:
+        # An unindented old_text never swallows the file's indentation, so
+        # there is nothing to restore.
+        return new_text
+
+    file_first = matched_text.split('\n', 1)[0]
+    file_indent = file_first[:len(file_first) - len(file_first.lstrip())]
+    if file_indent == old_indent:
+        return new_text
+
+    out = []
+    for line in new_text.split('\n'):
+        if line.strip() and line.startswith(old_indent):
+            out.append(file_indent + line[len(old_indent):])
+        else:
+            out.append(line)
+    return '\n'.join(out)
+
+
+# A `12|` gutter, as emitted by the read tool.
+_LINE_NUMBER_PREFIX_RE = re.compile(r'^[ \t]*\d+\|')
+
+
+def looks_like_line_numbered_block(text: str) -> bool:
+    """
+    Detect read-tool display text (``12|content``) being written back as file content.
+
+    Since read numbers its output, a model that echoes that output into write -
+    or into edit's newText - would silently prepend a gutter to every line of a
+    real file. Rejecting is only safe if legitimate content is never mistaken
+    for a gutter, so this demands three things at once: at least two lines, a
+    clear majority carrying a numeric prefix, and those numbers running
+    consecutively. A lone ``1|value`` line, a markdown table row or an ordinary
+    numbered list therefore all pass through untouched.
+    """
+    if not isinstance(text, str):
+        return False
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+
+    numbered = []
+    for line in lines:
+        prefix, sep, _rest = line.lstrip().partition('|')
+        if sep and prefix.isdigit():
+            numbered.append(int(prefix))
+
+    if len(numbered) < 2 or len(numbered) / len(lines) < 0.6:
+        return False
+    return all(b == a + 1 for a, b in zip(numbered, numbered[1:]))
+
+
+def strip_line_number_prefixes(text: str) -> Optional[str]:
+    """
+    Remove ``12|`` gutters the model may have copied out of read output.
+
+    Returns None when the text does not look like numbered output, so callers
+    only use this as a fallback after normal matching failed - that way content
+    which genuinely contains ``12|`` is never corrupted.
+    """
+    lines = text.split('\n')
+    numbered = [line for line in lines if line.strip()]
+    if not numbered or not all(_LINE_NUMBER_PREFIX_RE.match(l) for l in numbered):
+        return None
+    stripped = '\n'.join(
+        _LINE_NUMBER_PREFIX_RE.sub('', line, count=1) if line.strip() else line
+        for line in lines
+    )
+    return stripped if stripped != text else None
 
 
 def generate_diff_string(old_content: str, new_content: str) -> dict:

@@ -1,0 +1,129 @@
+        <!-- ================================================================ -->
+        <!-- SIDEBAR                                                          -->
+        <!-- ================================================================ -->
+        <aside id="sidebar" class="fixed inset-y-0 left-0 z-50 w-52 bg-[#0A0A0A] text-neutral-400 flex flex-col
+                                    transform -translate-x-full lg:relative lg:translate-x-0
+                                    transition-transform duration-300 ease-in-out">
+            <!-- Logo -->
+            <div class="flex items-center gap-3 px-5 h-14 border-b border-white/10 flex-shrink-0">
+                <!-- The mark itself goes home, as it does everywhere else on the
+                     web. Only the image: the name beside it is a heading. -->
+                <img id="sidebar-home" role="button" tabindex="0"
+                     src="/assets/logo.jpg" alt="CowAgent"
+                     class="w-8 h-8 rounded-lg flex-shrink-0 cursor-pointer
+                            hover:opacity-80 transition-opacity duration-150">
+                <div class="flex flex-col min-w-0">
+                    <span class="text-white font-semibold text-sm truncate">CowAgent</span>
+                    <span class="text-neutral-500 text-xs" data-i18n="console">控制台</span>
+                </div>
+            </div>
+
+            <!-- Navigation -->
+            <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-1">
+                <!-- Chat Group -->
+                <div class="menu-group open" data-group="chat">
+                    <button class="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-neutral-500 hover:text-neutral-300 cursor-pointer transition-colors duration-150">
+                        <i class="fas fa-chevron-right text-[10px] chevron"></i>
+                        <span data-i18n="nav_chat">对话</span>
+                    </button>
+                    <div class="menu-group-items pl-2">
+                        <a class="sidebar-item active flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="chat">
+                            <i class="fas fa-message item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_chat">对话</span>
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Management Group -->
+                <div class="menu-group open" data-group="manage">
+                    <button class="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-neutral-500 hover:text-neutral-300 cursor-pointer transition-colors duration-150">
+                        <i class="fas fa-chevron-right text-[10px] chevron"></i>
+                        <span data-i18n="nav_manage">管理</span>
+                    </button>
+                    <div class="menu-group-items pl-2">
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="agents">
+                            <i class="fas fa-people-group item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_agents">智能体</span>
+                        </a>
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="config">
+                            <i class="fas fa-sliders item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_config">配置</span>
+                        </a>
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="skills">
+                            <i class="fas fa-bolt item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_skills">技能</span>
+                        </a>
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="memory">
+                            <i class="fas fa-brain item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_memory">记忆</span>
+                        </a>
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="knowledge">
+                            <i class="fas fa-book item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_knowledge">知识</span>
+                        </a>
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="channels">
+                            <i class="fas fa-tower-broadcast item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_channels">通道</span>
+                        </a>
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="tasks">
+                            <i class="fas fa-clock item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_tasks">定时</span>
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Monitor Group -->
+                <div class="menu-group open" data-group="monitor">
+                    <button class="w-full flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-neutral-500 hover:text-neutral-300 cursor-pointer transition-colors duration-150">
+                        <i class="fas fa-chevron-right text-[10px] chevron"></i>
+                        <span data-i18n="nav_monitor">监控</span>
+                    </button>
+                    <div class="menu-group-items pl-2">
+                        <a class="sidebar-item flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all duration-150 hover:bg-white/5 hover:text-neutral-200 text-[14px]"
+                           data-view="logs">
+                            <i class="fas fa-terminal item-icon text-xs w-5 text-center"></i>
+                            <span data-i18n="menu_logs">日志</span>
+                        </a>
+                    </div>
+                </div>
+            </nav>
+
+            <!-- Sidebar Footer -->
+            <div class="px-4 py-3 border-t border-white/10 flex-shrink-0 relative">
+                <div class="flex items-center gap-2 text-xs text-neutral-600">
+                    <i class="fas fa-circle text-[6px] text-primary-400"></i>
+                    <button type="button" id="sidebar-version" onclick="toggleUpdateMenu(event)"
+                       class="update-version-btn hover:text-primary-400 transition-colors duration-150 cursor-pointer bg-transparent border-0 p-0 text-left"
+                       aria-haspopup="menu" aria-controls="update-menu" aria-expanded="false"></button>
+                </div>
+
+                <!-- Up-popover menu anchored to the version row -->
+                <div id="update-menu" class="update-menu hidden" role="menu" aria-labelledby="sidebar-version">
+                    <!-- Single update entry: "检查更新" turns into "立即更新" once a
+                         newer version is found (mirrors the desktop NavRail). -->
+                    <button type="button" id="update-action-item" class="update-menu-item" role="menuitem" onclick="onUpdateActionClick()">
+                        <span class="update-menu-icon">
+                            <i id="update-action-icon" class="fas fa-arrows-rotate"></i>
+                            <span id="update-dot" class="update-dot hidden" aria-hidden="true"></span>
+                        </span>
+                        <span id="update-action-label" class="update-menu-label" data-i18n="update_check">检查更新</span>
+                    </button>
+                    <button type="button" class="update-menu-item" role="menuitem" onclick="openReleaseNotes()">
+                        <span class="update-menu-icon"><i class="fas fa-file-lines"></i></span>
+                        <span class="update-menu-label" data-i18n="update_changelog">版本说明</span>
+                        <i class="fas fa-arrow-up-right-from-square update-menu-ext"></i>
+                    </button>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Mobile Overlay -->
+        <div id="sidebar-overlay" class="fixed inset-0 bg-black/50 z-40 hidden lg:hidden cursor-pointer" onclick="toggleSidebar()"></div>

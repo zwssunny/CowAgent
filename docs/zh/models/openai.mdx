@@ -22,7 +22,7 @@ OpenAI 是覆盖最完整的厂商，可同时承担文本对话、视觉理解�
 
 | 参数 | 说明 |
 | --- | --- |
-| `model` | 与 OpenAI 接口的 [model 参数](https://platform.openai.com/docs/models) 一致，支持 `gpt-5.6-luna`、`gpt-5.6-terra`、`gpt-5.6-sol`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.4-nano`、`gpt-5` 系列、`gpt-4.1` 等；Agent 模式默认 `gpt-5.6-luna`，追求性价比可改为 `gpt-5.4` |
+| `model` | 与 OpenAI 接口的 [model 参数](https://platform.openai.com/docs/models) 一致，支持 `gpt-5.6-luna`、`gpt-6-astra`、`gpt-5.6-terra`、`gpt-5.6-sol`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.4-nano`、`gpt-5` 系列、`gpt-4.1` 等；Agent 模式默认 `gpt-5.6-luna`，`gpt-6-astra` 为最强旗舰（智能最高、成本较高，工具调用走 Responses 接口），追求性价比可改为 `gpt-5.4` |
 | `open_ai_api_key` | 在 [OpenAI 平台](https://platform.openai.com/api-keys) 创建 |
 | `open_ai_api_base` | 可选，修改可接入第三方代理 |
 | `bot_type` | 使用 OpenAI 官方模型时无需填写；通过兼容协议接入厂商模型时需设为 `openai` |
@@ -51,13 +51,13 @@ OpenAI 是覆盖最完整的厂商，可同时承担文本对话、视觉理解�
 {
   "skills": {
     "image-generation": {
-      "model": "gpt-image-2"
+      "model": "gpt-image-2.5-flare"
     }
   }
 }
 ```
 
-支持的图像生成模型：`gpt-image-2`、`gpt-image-1`。
+支持的图像生成模型：`gpt-image-2.5-flare`（推荐默认）、`gpt-image-2.5-sunburst`、`gpt-image-2`、`gpt-image-1`。
 
 ## 语音识别
 

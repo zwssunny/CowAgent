@@ -4,7 +4,7 @@ Skill manager for managing skill lifecycle and operations.
 
 import os
 import json
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 from pathlib import Path
 from common.log import logger
 from agent.skills.types import Skill, SkillEntry, SkillSnapshot
@@ -12,6 +12,44 @@ from agent.skills.loader import SkillLoader
 from agent.skills.formatter import format_skill_entries_for_prompt
 
 SKILLS_CONFIG_FILE = "skills_config.json"
+
+
+def build_skill_manager(
+    agent_id: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
+    config: Optional[Dict] = None,
+) -> "SkillManager":
+    """Build a manager pointed at the skills one Agent actually draws on.
+
+    Resolved through ``state_dir`` rather than joined with ``"skills"``: an
+    Agent without a directory of its own falls back to the shared one, which is
+    what makes an installed skill reachable from every Agent. The profile's
+    selection is what still lets them differ.
+    """
+    from common import state_dir
+    from common.runtime_identity import RuntimeIdentity, current_identity
+
+    identity = (
+        RuntimeIdentity(agent_id=agent_id) if agent_id else current_identity()
+    )
+    selection = None
+    try:
+        from agent.registry import get_agent_registry
+
+        profile = get_agent_registry().get(
+            identity.agent_id or None, require_enabled=False
+        )
+        selection = profile.skills
+    except Exception:
+        # An unresolvable Agent must not cost the caller its skills; the
+        # unfiltered shared set is the pre-selection behaviour.
+        pass
+
+    if workspace_dir:
+        custom_dir = state_dir.skills_dir(base=workspace_dir)
+    else:
+        custom_dir = state_dir.skills_dir(identity)
+    return SkillManager(custom_dir=str(custom_dir), config=config, selection=selection)
 
 
 class SkillManager:
@@ -22,6 +60,7 @@ class SkillManager:
         builtin_dir: Optional[str] = None,
         custom_dir: Optional[str] = None,
         config: Optional[Dict] = None,
+        selection: Optional[Iterable[str]] = None,
     ):
         """
         Initialize the skill manager.
@@ -29,12 +68,18 @@ class SkillManager:
         :param builtin_dir: Built-in skills directory (project root ``skills/``)
         :param custom_dir: Custom skills directory (workspace ``skills/``)
         :param config: Configuration dictionary
+        :param selection: Names this Agent draws on. ``None`` means all of them.
         """
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         self.builtin_dir = builtin_dir or os.path.join(project_root, 'skills')
         self.custom_dir = custom_dir or os.path.join(project_root, 'workspace', 'skills')
         self.config = config or {}
         self._skills_config_path = os.path.join(self.custom_dir, SKILLS_CONFIG_FILE)
+        # Which of the shared skills this Agent uses. Kept separate from
+        # skills_config.json because that file describes the instance-wide
+        # library, which every Agent reads and which one Agent turning a skill
+        # off for itself must not rewrite.
+        self.selection: Optional[set] = None if selection is None else set(selection)
 
         # skills_config: full skill metadata keyed by name
         # { "web-fetch": {"name": ..., "description": ..., "source": ..., "enabled": true}, ... }
@@ -119,11 +164,18 @@ class SkillManager:
 
     def is_skill_enabled(self, name: str) -> bool:
         """
-        Check if a skill is enabled according to skills_config.
+        Check if a skill is enabled for this Agent.
+
+        A skill has to clear both gates: the instance-wide library switch in
+        skills_config.json, and this Agent's own selection. Narrowing rather
+        than overriding keeps "turn this off everywhere" working no matter which
+        Agents happen to have selected it.
 
         :param name: skill name
         :return: True if enabled (default True if not in config)
         """
+        if self.selection is not None and name not in self.selection:
+            return False
         entry = self.skills_config.get(name)
         if entry is None:
             return True

@@ -6,4 +6,16 @@ def singleton(cls):
             instances[cls] = cls(*args, **kwargs)
         return instances[cls]
 
+    # Expose the undecorated class so callers that legitimately need more than
+    # one instance (e.g. running several instances of the same channel type,
+    # each with its own credentials) can bypass the process-wide cache. Legacy
+    # callers keep going through get_instance() and still get the singleton.
+    get_instance.__wrapped__ = cls
+
+    def new_instance(*args, **kwargs):
+        """Build a fresh, uncached instance of the wrapped class."""
+        return cls(*args, **kwargs)
+
+    get_instance.new_instance = new_instance
+
     return get_instance

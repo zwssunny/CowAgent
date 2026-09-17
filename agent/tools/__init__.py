@@ -9,6 +9,7 @@ from agent.tools.edit.edit import Edit
 from agent.tools.bash.bash import Bash
 from agent.tools.ls.ls import Ls
 from agent.tools.send.send import Send
+from agent.tools.search_files.search_files import SearchFiles
 
 # Import memory tools
 from agent.tools.memory.memory_search import MemorySearchTool
@@ -16,6 +17,10 @@ from agent.tools.memory.memory_get import MemoryGetTool
 
 # Import self-evolution tools
 from agent.tools.evolution_undo.evolution_undo import EvolutionUndoTool
+from agent.tools.agent_delegate.agent_delegate import AgentDelegateTool
+
+# Import sub agent tools
+from agent.tools.subagent.subagent import SubagentTool
 
 # Import tools with optional dependencies
 def _import_optional_tools():
@@ -130,9 +135,12 @@ __all__ = [
     'Bash',
     'Ls',
     'Send',
+    'SearchFiles',
     'MemorySearchTool',
     'MemoryGetTool',
     'EvolutionUndoTool',
+    'SubagentTool',
+    'AgentDelegateTool',
     'EnvConfig',
     'SchedulerTool',
     'WebSearch',

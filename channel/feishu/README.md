@@ -63,7 +63,7 @@ python3 app.py
 2. 进入应用详情 -> 事件订阅
 3. 选择 **将事件发送至开发者服务器**
 4. 填写请求地址: `http://your-domain:9891/`
-5. 添加事件: `im.message.receive_v1` (接收消息v2.0)
+5. 添加事件: `im.message.receive_v1` (接收消息v2.0) 和 `im.message.recalled_v1` (消息撤回)
 6. 保存配置
 
 ### 4. 注意事项
@@ -101,7 +101,7 @@ python3 app.py
 1. 登录[飞书开放平台](https://open.feishu.cn/)
 2. 进入应用详情 -> 事件订阅
 3. 选择 **使用长连接接收事件**
-4. 添加事件: `im.message.receive_v1` (接收消息v2.0)
+4. 添加事件: `im.message.receive_v1` (接收消息v2.0) 和 `im.message.recalled_v1` (消息撤回)
 5. 保存配置
 
 ### 5. 注意事项
@@ -168,7 +168,7 @@ Address already in use
 ### 收不到消息
 
 1. 检查飞书应用的事件订阅配置
-2. 确认已添加 `im.message.receive_v1` 事件
+2. 确认已添加 `im.message.receive_v1` 和 `im.message.recalled_v1` 事件
 3. 检查应用权限: 需要 `im:message` 权限
 4. 查看日志中的错误信息
 

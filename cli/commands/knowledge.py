@@ -4,20 +4,12 @@ import os
 
 import click
 
-from cli.utils import get_project_root
+from cli.utils import get_knowledge_dir, get_project_root
 
 
 def _get_knowledge_dir():
     """Resolve the knowledge directory path from config or default."""
-    try:
-        import sys
-        sys.path.insert(0, get_project_root())
-        from config import conf
-        from common.utils import expand_path
-        workspace = expand_path(conf().get("agent_workspace", "~/cow"))
-    except Exception:
-        workspace = os.path.expanduser("~/cow")
-    return os.path.join(workspace, "knowledge")
+    return get_knowledge_dir()
 
 
 def _get_knowledge_enabled():

@@ -23,12 +23,22 @@ import hashlib
 import math
 from abc import ABC, abstractmethod
 from typing import List, Optional
+from urllib.parse import urlparse
 
 # HTTP read timeout for a single embeddings request (seconds). A batch of
 # 64+ chunks can take 30-50s end-to-end from China-side networks, so 30s is
 # routinely too tight; 90s gives meaningful headroom without letting bad
 # endpoints hang forever.
 EMBEDDING_HTTP_TIMEOUT = 90
+
+# OpenAI-compatible endpoints reject an empty string inside an `input` array
+# and fail the entire batch on it, so blank texts are substituted rather than
+# dropped: the returned vectors must stay aligned with the caller's texts.
+BLANK_INPUT_PLACEHOLDER = " "
+
+
+def _is_blank(text) -> bool:
+    return not text or not text.strip()
 
 
 class EmbeddingProvider(ABC):
@@ -190,6 +200,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         needs_client_normalize: bool = False,
         query_instruction: str = "",
         max_batch_size: int = 256,
+        source_tagged: Optional[bool] = None,
     ):
         """
         Args:
@@ -210,6 +221,10 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self.api_key = api_key
         self.api_base = api_base or "https://api.openai.com/v1"
         self.extra_headers = extra_headers or {}
+        if source_tagged is None:
+            _host = (urlparse(self.api_base).hostname or "").lower()
+            source_tagged = _host == "link-ai.tech" or _host.endswith(".link-ai.tech")
+        self._source_tagged = source_tagged
         self.supports_dim_param = supports_dim_param
         self.needs_client_truncate = needs_client_truncate
         self.needs_client_normalize = needs_client_normalize
@@ -225,6 +240,30 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             # Legacy heuristic for OpenAI text-embedding-3-* family
             self._dimensions = 1536 if "small" in model else 3072
 
+    def _request_headers(self) -> dict:
+        headers = dict(self.extra_headers)
+        if self._source_tagged:
+            try:
+                from common.utils import apply_client_source
+                apply_client_source(headers)
+            except Exception:
+                pass
+        return headers
+
+    @staticmethod
+    def _sanitize_input(input_data):
+        """Swap blank texts for a placeholder before they hit the wire."""
+        texts = [input_data] if isinstance(input_data, str) else list(input_data)
+        blanks = sum(1 for t in texts if _is_blank(t))
+        if blanks:
+            from common.log import logger
+            logger.warning(
+                f"[Embedding] {blanks}/{len(texts)} blank input(s) replaced with a "
+                f"placeholder; the caller should not embed empty texts"
+            )
+        cleaned = [BLANK_INPUT_PLACEHOLDER if _is_blank(t) else t for t in texts]
+        return cleaned[0] if isinstance(input_data, str) else cleaned
+
     def _call_api(self, input_data):
         """Call OpenAI-compatible /embeddings endpoint"""
         import requests
@@ -233,10 +272,10 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            **self.extra_headers,
+            **self._request_headers(),
         }
         data = {
-            "input": input_data,
+            "input": self._sanitize_input(input_data),
             "model": self.model,
         }
         if self.supports_dim_param and self._dimensions:
@@ -360,7 +399,7 @@ class DoubaoEmbeddingProvider(EmbeddingProvider):
         }
         payload = {
             "model": self.model,
-            "input": [{"type": "text", "text": text}],
+            "input": [{"type": "text", "text": BLANK_INPUT_PLACEHOLDER if _is_blank(text) else text}],
             "dimensions": self._dimensions,
             "encoding_format": "float",
         }
@@ -438,6 +477,7 @@ def create_embedding_provider(
     api_base: Optional[str] = None,
     extra_headers: Optional[dict] = None,
     dimensions: Optional[int] = None,
+    source_tagged: Optional[bool] = None,
 ) -> EmbeddingProvider:
     """
     Factory function to create an embedding provider.
@@ -489,6 +529,7 @@ def create_embedding_provider(
             api_key=api_key,
             api_base=api_base,
             extra_headers=extra_headers,
+            source_tagged=source_tagged,
         )
 
     final_dim = dimensions if (dimensions and dimensions > 0) else meta["default_dimensions"]
@@ -512,4 +553,5 @@ def create_embedding_provider(
         needs_client_normalize=meta["needs_client_normalize"],
         query_instruction=meta["query_instruction"],
         max_batch_size=meta.get("max_batch_size", 256),
+        source_tagged=source_tagged,
     )

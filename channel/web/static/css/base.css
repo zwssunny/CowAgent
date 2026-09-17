@@ -1,0 +1,115 @@
+/* Foundation: keyframes, scrollbars, tooltips, view switching.
+   Split out of console.css; see channel/web/README.md for the
+   load order, which is load-bearing. */
+
+/* =====================================================================
+   CowAgent Console Styles
+   ===================================================================== */
+
+/* Mobile viewport fixes.
+   On mobile browsers `100vh` includes the (collapsible) URL bar, so a full-height
+   layout ends up taller than the visible area and leaks a vertical scrollbar/jitter.
+   `dvh` tracks the *dynamic* viewport instead. On desktop `dvh` equals `vh`, so this
+   is a no-op there and leaves the PC layout untouched. Guarded by @supports so old
+   engines keep the `100vh` fallback baked into the markup. */
+@supports (height: 100dvh) {
+    html.h-screen,
+    body.h-screen,
+    #app.h-screen,
+    #main-content.h-screen,
+    .session-panel {
+        height: 100dvh;
+    }
+}
+
+/* Belt-and-braces horizontal-overflow guard for phones. Some inner toolbars are
+   laid out as single non-wrapping flex rows that can exceed a narrow viewport; on
+   iOS Safari `overflow-x: hidden` alone doesn't always stop the page from panning.
+   Scoped to small screens so the desktop layout is completely unaffected. */
+@media (max-width: 768px) {
+    html, body { max-width: 100%; overflow-x: hidden; }
+    /* The header logout icon is redundant on phones (and was overflowing the top
+       bar). Hide it on small screens regardless of the JS-toggled `hidden` class. */
+    #logout-btn-header { display: none !important; }
+}
+
+/* Animations */
+@keyframes pulseDot {
+    0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+    40% { transform: scale(1); opacity: 1; }
+}
+
+/* Scrollbar */
+* { scrollbar-width: thin; scrollbar-color: #94a3b8 transparent; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #64748b; }
+.dark ::-webkit-scrollbar-thumb { background: #475569; }
+.dark ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+
+/* Generic Tooltip (via data-tooltip attribute) */
+[data-tooltip] {
+    position: relative;
+}
+[data-tooltip]::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 8px);
+    transform: translateX(-50%);
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.4;
+    white-space: nowrap;
+    background: #1e293b;
+    color: #e2e8f0;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+    z-index: 100;
+}
+[data-tooltip-pos="bottom"]::after {
+    bottom: auto;
+    top: calc(100% + 8px);
+}
+.dark [data-tooltip]::after {
+    background: #334155;
+    color: #f1f5f9;
+}
+[data-tooltip]:hover::after {
+    opacity: 1;
+}
+[data-tooltip=""]:hover::after {
+    display: none;
+}
+/* Float-portal elements render their tooltip via the body-level node, so
+   suppress the clipped ::after variant to avoid a double tooltip. */
+[data-tip-float]::after,
+[data-tip-float]::before {
+    display: none !important;
+}
+
+/* Menu Groups */
+.menu-group-items { max-height: 0; overflow: hidden; transition: max-height 0.25s ease-out; }
+.menu-group.open .menu-group-items { max-height: 2000px; transition: max-height 0.35s ease-in; }
+.menu-group .chevron { transition: transform 0.25s ease; }
+.menu-group.open .chevron { transform: rotate(90deg); }
+
+/* View Switching */
+.view { display: none; height: 100%; }
+.view.active { display: flex; flex-direction: column; }
+
+/* Chat view is split horizontally: conversation + workspace panel */
+#view-chat.active { flex-direction: row; }
+.chat-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+

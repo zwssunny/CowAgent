@@ -42,6 +42,11 @@ class BaiduTranslator(Translator):
                     raise Exception(result["error_msg"])
             else:
                 break
+        if retry_cnt == 0:
+            # every attempt hit a transient error (52001/52002), so the last
+            # response carries no trans_result: report the api error instead of
+            # letting the join below fail with a bare KeyError
+            raise Exception(result["error_msg"])
         text = "\n".join([item["dst"] for item in result["trans_result"]])
         return text
 

@@ -3,14 +3,24 @@ Agent Stream Execution Module - Multi-turn reasoning based on tool-call
 
 Provides streaming output, event system, and complete tool-call loop
 """
+import contextvars
+import copy
 import json
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Callable, Tuple
 
 from agent.protocol.cancel import AgentCancelledError
 from agent.protocol.models import LLMRequest, LLMModel
-from agent.protocol.message_utils import sanitize_claude_messages, compress_turn_to_text_only
-from agent.tools.base_tool import BaseTool, ToolResult
+from agent.protocol.message_utils import (
+    sanitize_claude_messages,
+    compress_turn_to_text_only,
+    identify_complete_turns,
+    build_compaction_summary_text,
+    find_first_user_text_block,
+)
+from agent.tools.base_tool import BaseTool, ToolResult, is_tool_available, renders_own_cards
 from common.log import logger
 from common.i18n import t as _t
 
@@ -34,6 +44,54 @@ MAX_STORED_REASONING_CHARS = 4 * 1024  # 4 KB
 # Marker inserted between head and tail when reasoning is truncated.
 _REASONING_TRUNCATE_MARKER = "\n\n... [reasoning truncated, {omitted} chars omitted] ...\n\n"
 
+# --------------------------------------------------------------------------
+# Fatal-error classification.
+#
+# Both branches below drop the whole in-memory context, so a false positive
+# costs the user their working conversation. Every marker must therefore be
+# specific enough that it cannot appear in an unrelated failure: generic words
+# ("without", "each", "must have", "not found") matched far too much, and a
+# bare "400" substring also matched token counts such as 4000.
+# --------------------------------------------------------------------------
+
+# Word-bounded so "4000" / "40096" are not read as HTTP 400.
+_RE_HTTP_400 = re.compile(r"\b400\b")
+
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context length exceeded", "maximum context length", "prompt is too long",
+    "context overflow", "context window", "exceeds model context",
+    "request_too_large", "request exceeds the maximum size",
+    "too many tokens", "input is too long", "tokens exceed",
+)
+
+# Structural tool_use/tool_result pairing complaints only.
+_MESSAGE_FORMAT_MARKERS = (
+    "tool_use", "tool_result", "tool_call_id", "tool_calls",
+    "tool result", "tool id",
+    "must be a response to a preceeding message",
+)
+
+
+def _is_context_overflow(error_str_lower: str) -> bool:
+    if "[context_overflow]" in error_str_lower:
+        return True
+    return any(m in error_str_lower for m in _CONTEXT_OVERFLOW_MARKERS)
+
+
+def _is_message_format_error(error_str_lower: str) -> bool:
+    """Detect broken tool_use/tool_result pairing rejected by the provider.
+
+    Requires both a structural marker and a 400-class signal, so an unrelated
+    400 (bad model name, missing parameter, oversized upload) never qualifies.
+    """
+    if not any(m in error_str_lower for m in _MESSAGE_FORMAT_MARKERS):
+        return False
+    return bool(
+        _RE_HTTP_400.search(error_str_lower)
+        or "invalid_request" in error_str_lower
+        or "invalidparameter" in error_str_lower
+    )
+
 
 def _truncate_reasoning_for_storage(text: str) -> str:
     """Trim long reasoning to head + tail with an omission marker.
@@ -53,19 +111,76 @@ def _truncate_reasoning_for_storage(text: str) -> str:
     return head + _REASONING_TRUNCATE_MARKER.format(omitted=omitted) + tail
 
 
-def _parse_tool_args(args_str: str, finish_reason: Optional[str]) -> Tuple[dict, Optional[str]]:
+# Cap for the 429 incremental backoff. The base curve is 30 + retry_count*15,
+# which without a cap crosses the web channel's 600s SSE idle timeout by the
+# 8th retry; capping each wait at 60s keeps the cumulative sleep in bounds.
+RATE_LIMIT_MAX_WAIT = 60  # seconds
+
+
+# Appended only for the file-writing tools, where "send less" needs to say how.
+_SPLIT_WRITE_ADVICE = (
+    "To change an existing file, use edit rather than rewriting the whole file. "
+    "To create a large file, write the first part, then append each remaining part "
+    "with edit using an empty oldText (calling write again would overwrite what you "
+    "just wrote)."
+)
+
+
+def _cut_off_message(cause: str, tool_name: Optional[str]) -> str:
+    message = (
+        f"Your tool call was cut off by {cause}, so it did not run and nothing was written. "
+        "Repeating the same call will be cut off again - send less in one call instead."
+    )
+    if tool_name in ("write", "edit"):
+        message += " " + _SPLIT_WRITE_ADVICE
+    return message
+
+
+def build_tools_schema(tools: list) -> list:
+    """Build the tool definitions handed to the LLM.
+
+    Prefer get_json_schema() when it yields real properties (lets tools augment
+    schema at runtime), otherwise fall back to the static `tool.params` (MCP
+    tools rely on this).
+    """
+    tools_schema = []
+    for tool in tools or []:
+        input_schema = tool.params
+        try:
+            dynamic = (tool.get_json_schema() or {}).get("parameters") or {}
+            if dynamic.get("properties"):
+                input_schema = dynamic
+        except Exception:
+            pass
+        tools_schema.append({
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": input_schema,
+        })
+    return tools_schema
+
+
+def _parse_tool_args(args_str: str, finish_reason: Optional[str],
+                     tool_name: Optional[str] = None) -> Tuple[dict, Optional[str]]:
     """Parse tool args JSON. Returns (args, error_msg); error_msg is None on success.
 
     On JSONDecodeError: detect truncation first (skip repair, surface max_tokens hint);
     otherwise try json-repair for escape issues; finally fall back to the raw decoder error.
     """
+    truncated_by_limit = finish_reason in ("length", "max_tokens")
     if not args_str:
+        # No arguments at all is valid for tools that take none, so only the
+        # finish reason can convict here. _execute_tool catches the rest by
+        # checking the call against the tool's required parameters.
+        if truncated_by_limit:
+            return {}, _cut_off_message("the output token limit", tool_name)
         return {}, None
     try:
         return json.loads(args_str), None
     except json.JSONDecodeError as e:
-        if finish_reason in ("length", "max_tokens") or not args_str.rstrip().endswith("}"):
-            return {}, "Output truncated (max_tokens reached). Split content into smaller chunks across multiple tool calls."
+        if truncated_by_limit or not args_str.rstrip().endswith("}"):
+            cause = "the output token limit" if truncated_by_limit else "arguments ending mid-JSON"
+            return {}, _cut_off_message(cause, tool_name)
         if _HAS_JSON_REPAIR:
             try:
                 repaired = _repair_json(args_str, return_objects=True)
@@ -99,6 +214,8 @@ class AgentStreamExecutor:
             messages: Optional[List[Dict]] = None,
             max_context_turns: int = 30,
             cancel_event=None,
+            steer_inbox=None,
+            allow_empty_response: bool = False,
     ):
         """
         Initialize stream executor
@@ -116,6 +233,12 @@ class AgentStreamExecutor:
                 Checked at every safe point (turn boundary, before tool execution,
                 during LLM streaming). When set, raises AgentCancelledError which
                 run_stream catches to gracefully wind down.
+            steer_inbox: Optional SteerInbox for explicit instructions sent to
+                this active run. Drained only at message-safe checkpoints.
+            allow_empty_response: When True, an empty final answer is a valid
+                outcome and is returned as-is instead of being replaced with
+                fallback text. Set for runs with no human waiting on a reply
+                (scheduled tasks), where silence can be the intended result.
         """
         self.agent = agent
         self.model = model
@@ -126,6 +249,8 @@ class AgentStreamExecutor:
         self.on_event = on_event
         self.max_context_turns = max_context_turns
         self.cancel_event = cancel_event
+        self.steer_inbox = steer_inbox
+        self.allow_empty_response = allow_empty_response
 
         # Message history - use provided messages or create new list
         self.messages = messages if messages is not None else []
@@ -136,6 +261,10 @@ class AgentStreamExecutor:
         # Track files to send (populated by read tool)
         self.files_to_send = []  # List of file metadata dicts
 
+        # Absolute paths already reported as artifacts, so a write-then-edit
+        # sequence on the same file only surfaces one card in the UI.
+        self._emitted_artifacts = set()
+
     def _check_cancelled(self) -> None:
         """Raise AgentCancelledError if the user requested cancellation.
 
@@ -144,6 +273,102 @@ class AgentStreamExecutor:
         """
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise AgentCancelledError("agent cancelled by user")
+
+    def _drain_steering(self) -> List[str]:
+        if self.steer_inbox is None:
+            return []
+        return self.steer_inbox.drain()
+
+    def _explicit_response_prompt(self) -> str:
+        """Prompt that asks a silent model for its final answer.
+
+        When silence is a valid outcome the model has to be told so, or it
+        writes filler text just to satisfy the request.
+        """
+        if self.allow_empty_response:
+            return (
+                "请说明刚才工具执行的结果。如果本次无需向用户发送任何内容"
+                "（例如任务只要求在满足特定条件时才通知，而当前条件不满足），"
+                "直接返回空即可，不要输出任何文字。"
+            )
+        return "请向用户说明刚才工具执行的结果或回答用户的问题。"
+
+    def _empty_response_fallback(self) -> str:
+        """Text to return when the model produced no answer at all.
+
+        Stays empty for runs that allow silence, so a scheduled task whose
+        notify condition wasn't met delivers nothing instead of an apology
+        addressed to a user who never asked anything.
+        """
+        if self.allow_empty_response:
+            logger.info("[Agent] Empty response kept as-is (silence allowed for this run)")
+            return ""
+        logger.info("Generated fallback response for empty LLM output")
+        return _t(
+            "抱歉，我暂时无法生成回复。请尝试换一种方式描述你的需求，或稍后再试。",
+            "Sorry, I can't generate a reply right now. Please try rephrasing your request, or try again later.",
+        )
+
+    @staticmethod
+    def _steering_text(updates: List[str]) -> str:
+        if len(updates) == 1:
+            body = updates[0]
+        else:
+            body = "\n".join(f"{idx}. {text}" for idx, text in enumerate(updates, 1))
+        return (
+            "[Steering update for the active task]\n"
+            "Use this new instruction for the current task before continuing.\n\n"
+            f"{body}"
+        )
+
+    def _append_steering(
+        self,
+        updates: List[str],
+        pending_tool_calls: Optional[List[Dict]] = None,
+        content_blocks: Optional[List[Dict]] = None,
+    ) -> None:
+        """Append guidance, closing any tool_use blocks that will be skipped."""
+        if not updates:
+            return
+        blocks = content_blocks if content_blocks is not None else []
+        for tool_call in pending_tool_calls or []:
+            blocks.append({
+                "type": "tool_result",
+                "tool_use_id": tool_call["id"],
+                "content": "Skipped because the user redirected the active task.",
+                "is_error": True,
+            })
+        blocks.append({"type": "text", "text": self._steering_text(updates)})
+        if content_blocks is None:
+            self.messages.append({"role": "user", "content": blocks})
+        self._emit_event("agent_steered", {"count": len(updates)})
+        logger.info(f"[Agent] Applied {len(updates)} steering update(s)")
+
+    def _close_or_apply_final_steering(self) -> bool:
+        """Return True only when the run can finish without losing a steer."""
+        updates = self._drain_steering()
+        if updates:
+            self._append_steering(updates)
+            return False
+        if self.steer_inbox is None:
+            return True
+        if self.steer_inbox.close_if_empty():
+            return True
+        updates = self._drain_steering()
+        if updates:
+            self._append_steering(updates)
+        return False
+
+    def _drain_and_close_steering(self) -> None:
+        """Preserve any final guidance before the max-step summary call."""
+        if self.steer_inbox is None:
+            return
+        while True:
+            updates = self._drain_steering()
+            if updates:
+                self._append_steering(updates)
+            if self.steer_inbox.close_if_empty():
+                return
 
     def _handle_cancelled(self, partial_response: str) -> None:
         """Wind down ``self.messages`` after a user-initiated cancel.
@@ -198,10 +423,30 @@ class AgentStreamExecutor:
             # clear stop boundary on the next turn.
             self.messages.append({
                 "role": "assistant",
-                "content": [{"type": "text", "text": "_(Cancelled by user)_"}],
+                "content": [{"type": "text", "text": self._cancellation_marker()}],
             })
         except Exception as e:
             logger.warning(f"[Agent] _handle_cancelled cleanup failed: {e}")
+
+    @staticmethod
+    def _cancellation_marker() -> str:
+        """Stop-boundary note, listing background jobs a cancel does not kill."""
+        marker = "_(Cancelled by user)_"
+        try:
+            from agent.tools.bash import background
+            running = [job for job in background.list_jobs() if job["running"]]
+        except Exception:
+            return marker
+        if not running:
+            return marker
+        lines = "\n".join(
+            f"- {job['id']}: {job['command']} ({job['elapsed']}s elapsed)"
+            for job in running
+        )
+        return (
+            f"{marker}\nBackground commands are still running - cancelling does not "
+            f"stop them. Use bash(bash_id=..., kill=true) to stop one.\n{lines}"
+        )
 
     def _emit_event(self, event_type: str, data: dict = None):
         """Emit event"""
@@ -214,7 +459,47 @@ class AgentStreamExecutor:
                 })
             except Exception as e:
                 logger.error(f"Event callback error: {e}")
-    
+
+    # Tools whose successful execution may have produced a user-facing file.
+    _ARTIFACT_TOOLS = ("write", "edit")
+
+    def _maybe_emit_artifact(self, tool_call: dict, result: dict) -> None:
+        """Report a file written by `write`/`edit` so clients can preview it."""
+        if not self.on_event:
+            return
+        if tool_call.get("name") not in self._ARTIFACT_TOOLS:
+            return
+        if result.get("status") != "success":
+            return
+
+        data = result.get("result")
+        path = data.get("path") if isinstance(data, dict) else None
+        if not path:
+            path = (tool_call.get("arguments") or {}).get("path")
+        if not path:
+            return
+
+        from agent.protocol.artifact import safe_build_artifact
+
+        # Anchor artifact detection to the session's working dir. In project mode
+        # this is the project dir, so files written there surface as cards; the
+        # default state_root is used when no project is open.
+        art_root = None
+        try:
+            eff = getattr(self.agent, "effective_cwd", None)
+            if callable(eff):
+                art_root = eff()
+        except Exception:
+            art_root = None
+        artifact = safe_build_artifact(path, art_root)
+        if not artifact:
+            return
+        if artifact["path"] in self._emitted_artifacts:
+            return
+        self._emitted_artifacts.add(artifact["path"])
+        logger.info(f"🗂  Artifact: {artifact['rel_path']} ({artifact['kind']})")
+        self._emit_event("artifact", artifact)
+
     def _is_thinking_enabled(self) -> bool:
         """Whether deep-thinking mode is on at the model layer.
 
@@ -224,6 +509,20 @@ class AgentStreamExecutor:
         """
         from config import conf
         return bool(conf().get("enable_thinking", False))
+
+    def _catalog_max_output_tokens(self):
+        """max_tokens for the request, from the model's catalog entry.
+
+        Returns None when the model has no catalogued max_output_tokens, in
+        which case the provider default is used (some gateways reject an
+        explicit max_tokens, so it is only sent when configured)."""
+        if self.model is not None and hasattr(self.model, "catalog_model_meta"):
+            try:
+                value = (self.model.catalog_model_meta() or {}).get("max_output_tokens")
+                return int(value) if value else None
+            except Exception:
+                return None
+        return None
 
     def _should_render_thinking_inline(self) -> bool:
         """Whether ``<think>...</think>`` blocks embedded directly in ``content``
@@ -258,6 +557,40 @@ class AgentStreamExecutor:
             # Also strip unclosed <think> tag at the end (streaming partial)
             text = re.sub(r'<think>[\s\S]*$', '', text)
         return text
+
+    @staticmethod
+    def _split_content_blocks(content) -> Tuple[str, str]:
+        """Split a content-blocks list into (visible_text, reasoning_text).
+
+        Some providers (Anthropic-shaped adapters, MiMo sync wrappers) stream
+        ``content`` as a list of blocks instead of a string. Thinking/reasoning
+        blocks must never be treated as the visible reply — that is what leaked
+        CoT into IM channels as an "Agent Reply". A plain string passes through
+        unchanged as visible text.
+        """
+        if isinstance(content, str):
+            return content, ""
+        if not isinstance(content, list):
+            return "", ""
+        text_parts = []
+        reasoning_parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype in ("thinking", "reasoning"):
+                thinking_text = (
+                    block.get("thinking")
+                    or block.get("reasoning")
+                    or block.get("text")
+                    or ""
+                )
+                if thinking_text:
+                    reasoning_parts.append(thinking_text)
+                continue
+            if btype in ("text", "text_delta", None):
+                text_parts.append(block.get("text") or "")
+        return "".join(text_parts), "".join(reasoning_parts)
 
     def _hash_args(self, args: dict) -> str:
         """Generate a simple hash for tool arguments"""
@@ -351,10 +684,20 @@ class AgentStreamExecutor:
         # injected transcripts / large prompts) so logs stay readable.
         thinking_enabled = self._is_thinking_enabled()
         thinking_label = " | 💭 thinking" if thinking_enabled else ""
+        # When deep thinking is on, also surface the resolved reasoning effort
+        # (per-model aware) so the operator can confirm the effective intensity.
+        effort_label = ""
+        if thinking_enabled:
+            try:
+                effort = self.model._normalized_reasoning_effort()
+                if effort:
+                    effort_label = f" | effort={effort}"
+            except Exception:
+                effort_label = ""
         _log_msg = user_message if len(user_message) <= 500 else (
             user_message[:500] + f" …(+{len(user_message) - 500} chars)"
         )
-        logger.info(f"🤖 {self.model.model}{thinking_label} | 👤 {_log_msg}")        
+        logger.info(f"🤖 {self.model.model}{thinking_label}{effort_label} | 👤 {_log_msg}")
         
         # Add user message (Claude format - use content blocks for consistency)
         self.messages.append({
@@ -388,6 +731,37 @@ class AgentStreamExecutor:
         final_response = ""
         turn = 0
 
+        # Respect a run id an outer scope already set (a subagent spawn or a
+        # delegated task passes one down); only mint a fresh one when this turn
+        # is the top of its own run. Writing through set_agent_run_id keeps the
+        # outbound header-tagging path and RuntimeIdentity on the same id.
+        import uuid as _uuid
+        from common.utils import set_agent_run_id, clear_agent_run_id, current_agent_run_id
+        # Captured before minting: once this run sets its own id, nothing
+        # downstream can tell whether it was nested. A sub agent inherits the
+        # parent's run id through identity_scope, so an id already being
+        # present is exactly what "nested" means.
+        _nested_run = bool(current_agent_run_id())
+        _run_token = None
+        if not _nested_run:
+            _run_token = set_agent_run_id(_uuid.uuid4().hex)
+
+        # Reset any fallback routing left over from a *previous* run: a new user
+        # message always starts fresh on the primary model. Within this run the
+        # fallback is deliberately sticky — once the primary has failed a turn
+        # for good we stay on the backup for the remaining steps instead of
+        # re-hitting a provider we already know is down every step (a sustained
+        # outage — dead key, IP block, regional downtime — would otherwise burn
+        # one wasted primary call per step). The primary gets a fresh chance on
+        # the next user message.
+        #
+        # Must run *after* the run id above, not before: the reset is a no-op
+        # for a nested run (see _reset_model_fallback), and only the id tells
+        # the two apart. A nested run keeps the parent's fallback engaged — the
+        # sub agent is running inside the same outage and should inherit the
+        # backup rather than start over on the provider that just failed.
+        self._reset_model_fallback(nested_run=_nested_run)
+
         cancelled = False
         try:
             while turn < self.max_turns:
@@ -395,13 +769,36 @@ class AgentStreamExecutor:
                 # between turns short-circuits cleanly.
                 self._check_cancelled()
 
+                steering_updates = self._drain_steering()
+                if steering_updates:
+                    self._append_steering(steering_updates)
+
                 turn += 1
                 logger.info(f"[Agent] Turn {turn}")
                 self._emit_event("turn_start", {"turn": turn})
 
                 # Call LLM (enable retry_on_empty for better reliability)
-                assistant_msg, tool_calls = self._call_llm_stream(retry_on_empty=True)
+                assistant_msg, tool_calls, stop_reason = self._call_llm_stream(retry_on_empty=True)
                 final_response = assistant_msg
+
+                # A steer that arrived while the model was streaming takes
+                # precedence over its proposed continuation. Tool calls have
+                # already been written to history, so close every one with a
+                # synthetic result before asking the model to reconsider.
+                steering_updates = self._drain_steering()
+                if steering_updates:
+                    self._append_steering(
+                        steering_updates,
+                        pending_tool_calls=tool_calls,
+                    )
+                    self._emit_event("turn_end", {
+                        "turn": turn,
+                        "has_tool_calls": bool(tool_calls),
+                        "tool_count": len(tool_calls),
+                        "stop_reason": stop_reason,
+                        "steered": True,
+                    })
+                    continue
 
                 # No tool calls, end loop
                 if not tool_calls:
@@ -422,12 +819,12 @@ class AgentStreamExecutor:
                                 "role": "user",
                                 "content": [{
                                     "type": "text",
-                                    "text": "请向用户说明刚才工具执行的结果或回答用户的问题。"
+                                    "text": self._explicit_response_prompt()
                                 }]
                             })
                             
                             # 再调用一次 LLM
-                            assistant_msg, tool_calls = self._call_llm_stream(retry_on_empty=False)
+                            assistant_msg, tool_calls, stop_reason = self._call_llm_stream(retry_on_empty=False)
                             final_response = assistant_msg
                             
                             # Remove the injected prompt from history so it doesn't
@@ -449,28 +846,39 @@ class AgentStreamExecutor:
                             elif not assistant_msg:
                                 # Still empty (no text and no tool_calls): use fallback
                                 logger.warning(f"[Agent] Still empty after explicit request")
-                                final_response = _t(
-                                    "抱歉，我暂时无法生成回复。请尝试换一种方式描述你的需求，或稍后再试。",
-                                    "Sorry, I can't generate a reply right now. Please try rephrasing your request, or try again later.",
-                                )
-                                logger.info(f"Generated fallback response for empty LLM output")
+                                final_response = self._empty_response_fallback()
                         else:
                             # First-turn empty reply, fall back directly
-                            final_response = _t(
-                                "抱歉，我暂时无法生成回复。请尝试换一种方式描述你的需求，或稍后再试。",
-                                "Sorry, I can't generate a reply right now. Please try rephrasing your request, or try again later.",
-                            )
-                            logger.info(f"Generated fallback response for empty LLM output")
+                            final_response = self._empty_response_fallback()
                     else:
                         logger.info(f"💭 {assistant_msg[:150]}{'...' if len(assistant_msg) > 150 else ''}")
                     
                     # If the explicit-response retry produced tool_calls, skip the break
                     # and continue down to the tool execution branch in this same iteration.
                     if not tool_calls:
-                        logger.debug(f"✅ Done (no tool calls)")
+                        steering_updates = self._drain_steering()
+                        if steering_updates:
+                            self._append_steering(steering_updates)
+                            self._emit_event("turn_end", {
+                                "turn": turn,
+                                "has_tool_calls": False,
+                                "stop_reason": stop_reason,
+                                "steered": True,
+                            })
+                            continue
+                        if not self._close_or_apply_final_steering():
+                            self._emit_event("turn_end", {
+                                "turn": turn,
+                                "has_tool_calls": False,
+                                "stop_reason": stop_reason,
+                                "steered": True,
+                            })
+                            continue
+                        logger.debug(f"✅ Done (no tool calls, stop_reason={stop_reason or 'none'})")
                         self._emit_event("turn_end", {
                             "turn": turn,
-                            "has_tool_calls": False
+                            "has_tool_calls": False,
+                            "stop_reason": stop_reason
                         })
                         break
 
@@ -499,10 +907,22 @@ class AgentStreamExecutor:
                 tool_result_blocks = []
 
                 try:
-                    for tool_call in tool_calls:
+                    already_run = self._run_parallel_calls(tool_calls)
+                    for tool_index, tool_call in enumerate(tool_calls):
                         # Honour cancel between tool invocations within the same turn
                         self._check_cancelled()
-                        result = self._execute_tool(tool_call)
+                        steering_updates = self._drain_steering()
+                        if steering_updates:
+                            self._append_steering(
+                                steering_updates,
+                                pending_tool_calls=tool_calls[tool_index:],
+                                content_blocks=tool_result_blocks,
+                            )
+                            break
+                        if tool_call["id"] in already_run:
+                            result = already_run[tool_call["id"]]
+                        else:
+                            result = self._execute_tool(tool_call)
                         tool_results.append(result)
                         
                         # Debug: Check if tool is being called repeatedly with same args
@@ -525,6 +945,9 @@ class AgentStreamExecutor:
                                 self.files_to_send.append(result_data)
                                 logger.info(f"📎 File queued for sending: {result_data.get('file_name', result_data.get('path'))}")
                                 self._emit_event("file_to_send", result_data)
+
+                        # Surface user-facing files written by the agent
+                        self._maybe_emit_artifact(tool_call, result)
                         
                         # Check for critical error - abort entire conversation
                         if result.get("status") == "critical_error":
@@ -636,11 +1059,13 @@ class AgentStreamExecutor:
                 self._emit_event("turn_end", {
                     "turn": turn,
                     "has_tool_calls": True,
-                    "tool_count": len(tool_calls)
+                    "tool_count": len(tool_calls),
+                    "stop_reason": stop_reason
                 })
 
             if turn >= self.max_turns:
                 logger.warning(f"⚠️  Reached max decision step limit: {self.max_turns}")
+                self._drain_and_close_steering()
                 
                 # Force model to summarize without tool calls
                 logger.info(f"[Agent] Requesting summary from LLM after reaching max steps...")
@@ -659,7 +1084,7 @@ class AgentStreamExecutor:
                 
                 # Call LLM one more time to get summary (without retry to avoid loops)
                 try:
-                    summary_response, summary_tools = self._call_llm_stream(retry_on_empty=False)
+                    summary_response, summary_tools, _ = self._call_llm_stream(retry_on_empty=False)
                     if summary_response:
                         final_response = summary_response
                         logger.info(f"💭 Summary: {summary_response[:150]}{'...' if len(summary_response) > 150 else ''}")
@@ -699,6 +1124,10 @@ class AgentStreamExecutor:
             raise
 
         finally:
+            if _run_token is not None:
+                clear_agent_run_id(_run_token)
+            if self.steer_inbox is not None:
+                self.steer_inbox.close()
             final_response = final_response.strip() if final_response else final_response
             if cancelled:
                 # Emit before agent_end so channels can mark UI as cancelled
@@ -711,6 +1140,9 @@ class AgentStreamExecutor:
     def _select_tools_for_injection(self) -> list:
         """Decide which tools to inject into the current LLM turn.
 
+        A tool behind a setting is left out while that setting is off, and
+        picked up again on the turn after it is switched back on.
+
         Built-in tools are ALWAYS injected in full (skills and core flows hard
         depend on them). MCP tools are also injected in full UNLESS on-demand
         retrieval is enabled AND the MCP tool count exceeds the configured
@@ -722,7 +1154,7 @@ class AgentStreamExecutor:
         failure, count below threshold, or any error → inject all tools. Tools
         are never silently dropped.
         """
-        all_tools = list(self.tools.values())
+        all_tools = [tool for tool in self.tools.values() if is_tool_available(tool)]
         try:
             from config import conf
             if not conf().get("mcp_tool_retrieval_enabled", False):
@@ -741,7 +1173,7 @@ class AgentStreamExecutor:
             from agent.tools import ToolManager
             from agent.tools.mcp.tool_retrieval import (
                 build_retrieval_query,
-                select_mcp_tools,
+                select_mcp_tools_with_metadata,
             )
 
             tm = ToolManager()
@@ -749,20 +1181,34 @@ class AgentStreamExecutor:
             query = build_retrieval_query(self.messages)
             query_vector = tm.embed_query(query)
 
-            selected = select_mcp_tools(
+            decision = select_mcp_tools_with_metadata(
                 query_vector,
                 tool_vectors,
                 top_k,
                 getattr(self, "_retrieved_mcp_names", set()),
             )
-            if selected is None:
+            if decision is None or decision.fallback_reason is not None:
                 # No provider / empty index / error → full injection.
+                self._emit_tool_retrieval_event(
+                    mcp_tools,
+                    builtin_tools,
+                    top_k,
+                    decision=decision,
+                    mode="fallback",
+                )
                 return all_tools
 
             # Persist the accumulated selection for subsequent turns.
-            self._retrieved_mcp_names = selected
+            self._retrieved_mcp_names = decision.selected
 
-            selected_mcp = [t for t in mcp_tools if t.name in selected]
+            selected_mcp = [t for t in mcp_tools if t.name in decision.selected]
+            self._emit_tool_retrieval_event(
+                mcp_tools,
+                builtin_tools,
+                top_k,
+                decision=decision,
+                mode="retrieved",
+            )
             logger.info(
                 f"[ToolRetrieval] Injecting {len(builtin_tools)} built-in + "
                 f"{len(selected_mcp)}/{len(mcp_tools)} MCP tool(s) (top_k={top_k})"
@@ -770,21 +1216,150 @@ class AgentStreamExecutor:
             return builtin_tools + selected_mcp
         except Exception as e:
             logger.debug(f"[ToolRetrieval] full injection (retrieval skipped): {e}")
+            self._emit_tool_retrieval_event(
+                mcp_tools if "mcp_tools" in locals() else [],
+                builtin_tools if "builtin_tools" in locals() else [],
+                top_k if "top_k" in locals() else 0,
+                mode="fallback",
+                fallback_reason="retrieval_error",
+            )
             return all_tools
 
+    def _emit_tool_retrieval_event(
+        self,
+        mcp_tools: List[BaseTool],
+        builtin_tools: List[BaseTool],
+        top_k: int,
+        decision=None,
+        mode: str = "fallback",
+        fallback_reason: Optional[str] = None,
+    ) -> None:
+        """Expose sanitized MCP retrieval metadata to streaming consumers."""
+        if not callable(getattr(self, "_emit_event", None)):
+            return
+
+        try:
+            fallback_reason = fallback_reason or (
+                decision.fallback_reason
+                if decision is not None
+                else "selection_unavailable"
+            )
+            selected = decision.selected if decision is not None else set()
+            ranked = decision.ranked if decision is not None else []
+            candidate_count = decision.candidate_count if decision is not None else 0
+            rank_limit = max(top_k, 0)
+            injected_names = (
+                sorted(tool.name for tool in mcp_tools)
+                if mode == "fallback" else sorted(selected)
+            )
+            self._emit_event("tool_retrieval", {
+                "enabled": True,
+                "mode": mode,
+                "total_mcp_tools": len(mcp_tools),
+                "selected_mcp_tools": (
+                    len([tool for tool in mcp_tools if tool.name in selected])
+                    if mode == "retrieved" else len(mcp_tools)
+                ),
+                "builtin_tools": len(builtin_tools),
+                "top_k": top_k,
+                "candidate_count": candidate_count,
+                "selected_tools": injected_names,
+                "ranked_tools": [
+                    {"name": name, "score": round(float(score), 6)}
+                    for name, score in ranked[:rank_limit]
+                ],
+                "fallback_reason": fallback_reason,
+            })
+        except Exception as e:
+            # Observability must never turn a safe retrieval fallback into an
+            # agent failure, even when a custom event consumer is malformed.
+            logger.debug(f"[ToolRetrieval] event emission skipped: {e}")
+
+    def _reset_model_fallback(self, nested_run: bool = False) -> None:
+        """Drop any fallback routing so the next call uses the primary model.
+
+        ``nested_run`` marks a run that inherited its run id from an outer
+        scope — a sub agent spawn or a delegated task. Those must leave the
+        parent's routing alone: a sub agent is built with the parent's *same*
+        model object, so resetting here would clear the fallback the parent is
+        mid-way through relying on and send both of them back to the provider
+        that just failed.
+
+        Fallback is opt-in and this is a no-op on models that don't support it,
+        so it is safe to call unconditionally at the top of a run.
+        """
+        # The caller captures this *before* minting its own run id — once that
+        # id is set, nothing downstream can tell a nested run from a top-level
+        # one, so the distinction has to be passed in.
+        if nested_run:
+            return
+
+        model = getattr(self, "model", None)
+        reset = getattr(model, "reset_fallback", None)
+        if not callable(reset):
+            return
+        try:
+            reset()
+        except Exception as e:
+            logger.debug(f"[Agent] fallback reset skipped: {e}")
+
+    def _switch_to_fallback(self, fallback_reason: str = "") -> bool:
+        """Advance this turn to the next link in the configured fallback chain.
+
+        Returns True only when the switch actually happened, so the caller can
+        retry the turn on the new model. Every guard lives in
+        ``AgentLLMModel.use_fallback``; this wrapper only covers the cases
+        where there is no such model to ask (tests pass doubles, and the
+        fallback is opt-in so a plain LLMModel simply has no support for it).
+
+        Calling it again after a link has failed advances one more step along
+        the chain, which is what turns a single backup into an ordered list of
+        them; it returns False once the chain is spent.
+
+        Context-overflow and message-format errors are deliberately NOT
+        candidates: they are caused by the conversation, not the provider, and
+        the recovery paths above already rewrite the history for them.
+        """
+        model = getattr(self, "model", None)
+        use_fallback = getattr(model, "use_fallback", None)
+        if not callable(use_fallback):
+            return False
+        try:
+            return bool(use_fallback())
+        except Exception as e:
+            logger.warning(f"[Agent] chat fallback unavailable: {e}")
+            return False
+
     def _call_llm_stream(self, retry_on_empty=True, retry_count=0, max_retries=3,
-                         _overflow_retry: bool = False) -> Tuple[str, List[Dict]]:
+                         _overflow_stage: int = 0,
+                         _on_fallback: bool = False,
+                         _exhausted: Optional[List[str]] = None) -> Tuple[str, List[Dict], Optional[str]]:
         """
         Call LLM with streaming and automatic retry on errors
-        
+
         Args:
             retry_on_empty: Whether to retry once if empty response is received
             retry_count: Current retry attempt (internal use)
             max_retries: Maximum number of retries for API errors
-            _overflow_retry: Internal flag indicating this is a retry after context overflow
-        
+            _overflow_stage: Context-overflow recovery escalation level (internal):
+                0 = first hit, 1 = after aggressive trim, 2 = after hard compaction.
+            _on_fallback: Whether this attempt is already running on a fallback
+                link from the chain. A link gets one attempt, not the primary's
+                full retry budget: walking a long chain with full backoff each
+                would outlast the web channel's SSE idle timeout before the
+                last link is even reached.
+            _exhausted: Errors already collected from models this turn has
+                given up on. Reported together when the whole chain is spent,
+                so the failure reads as "every backup is down" rather than
+                blaming whichever link happened to be last.
+
         Returns:
-            (response_text, tool_calls)
+            (response_text, tool_calls, stop_reason), where stop_reason is the
+            provider's finish_reason for this generation, or None when it
+            reported none. A turn that returns text and no tool calls looks
+            finished either way, so stop_reason is the only thing separating a
+            model that chose to stop from one cut off at the output token limit
+            ("length" / "max_tokens").
         """
         # Validate and fix message history (e.g. orphaned tool_result blocks).
         # Context trimming is done once in run_stream() before the loop starts,
@@ -806,25 +1381,11 @@ class AgentStreamExecutor:
         except Exception as e:
             logger.debug(f"[Agent] MCP sync skipped: {e}")
 
-        # Prepare tool definitions. Prefer get_json_schema() when it yields
-        # real properties (lets tools augment schema at runtime), otherwise
-        # fall back to the static `tool.params` (MCP tools rely on this).
+        # Prepare tool definitions. Kept as None (rather than []) when the agent
+        # has no tools at all, which is what LLMRequest expects.
         tools_schema = None
         if self.tools:
-            tools_schema = []
-            for tool in self._select_tools_for_injection():
-                input_schema = tool.params
-                try:
-                    dynamic = (tool.get_json_schema() or {}).get("parameters") or {}
-                    if dynamic.get("properties"):
-                        input_schema = dynamic
-                except Exception:
-                    pass
-                tools_schema.append({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": input_schema,
-                })
+            tools_schema = build_tools_schema(self._select_tools_for_injection())
 
         # Debug: dump the full system prompt and messages sent to the LLM.
         # Gated behind `debug` config to avoid flooding normal logs.
@@ -848,6 +1409,7 @@ class AgentStreamExecutor:
             temperature=0,
             stream=True,
             tools=tools_schema,
+            max_tokens=self._catalog_max_output_tokens(),
             system=self.system_prompt  # Pass system prompt separately for Claude API
         )
 
@@ -859,6 +1421,7 @@ class AgentStreamExecutor:
         tool_calls_buffer = {}  # {index: {id, name, arguments}}
         gemini_raw_parts = None  # Preserve Gemini thoughtSignature for round-trip
         stop_reason = None  # Track why the stream stopped
+        stream_usage = None  # Real token usage from the provider, if reported
 
         try:
             stream = self.model.call_stream(request)
@@ -912,21 +1475,31 @@ class AgentStreamExecutor:
                     logger.error(f"   Error Type: {error_type}")
                     logger.error(f"   Full chunk: {chunk}")
                     
-                    # Check if this is a context overflow error (keyword-based, works for all models)
-                    # Don't rely on specific status codes as different providers use different codes
+                    # Check if this is a context overflow error. Use the single
+                    # shared classifier (_is_context_overflow) so the markers stay
+                    # in one place and never drift. Deliberately NOT a bare
+                    # "too large": an oversized upload (413 "file too large" /
+                    # "image too large") must NOT be treated as context overflow,
+                    # or we would compact/clear a healthy conversation to "recover"
+                    # from a problem that has nothing to do with context length.
+                    # Don't rely on specific status codes — providers differ.
                     error_msg_lower = error_msg.lower()
-                    is_overflow = any(keyword in error_msg_lower for keyword in [
-                        'context length exceeded', 'maximum context length', 'prompt is too long',
-                        'context overflow', 'context window', 'too large', 'exceeds model context',
-                        'request_too_large', 'request exceeds the maximum size', 'tokens exceed'
-                    ])
-                    
+                    is_overflow = _is_context_overflow(error_msg_lower)
+
                     if is_overflow:
                         # Mark as context overflow for special handling
                         raise Exception(f"[CONTEXT_OVERFLOW] {error_msg} (Status: {status_code})")
                     else:
                         # Raise exception with full error message for retry logic
                         raise Exception(f"{error_msg} (Status: {status_code}, Code: {error_code}, Type: {error_type})")
+
+                # Capture the provider-reported token usage when present. With
+                # stream_options.include_usage the OpenAI-compatible path emits a
+                # final chunk carrying `usage` (often with an empty `choices`),
+                # but some providers attach it to a normal chunk — so read it
+                # whenever it appears, independent of the choices branch below.
+                if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
+                    stream_usage = chunk["usage"]
 
                 # Parse chunk
                 if isinstance(chunk, dict) and chunk.get("choices"):
@@ -944,8 +1517,18 @@ class AgentStreamExecutor:
                         if self._is_thinking_enabled():
                             self._emit_event("reasoning_update", {"delta": reasoning_delta})
 
-                    # Handle text content
+                    # Handle text content. Some providers (Anthropic-shaped
+                    # adapters, MiMo sync wrappers) stream a list of content
+                    # blocks instead of a string. Thinking/reasoning blocks
+                    # must never be treated as the visible reply — that is
+                    # what leaked CoT into WeChat as "Agent Reply".
                     content_delta = delta.get("content") or ""
+                    if isinstance(content_delta, list):
+                        content_delta, thinking_text = self._split_content_blocks(content_delta)
+                        if thinking_text:
+                            full_reasoning += thinking_text
+                            if self._is_thinking_enabled():
+                                self._emit_event("reasoning_update", {"delta": thinking_text})
                     if content_delta:
                         # Filter out <think> tags from content
                         filtered_delta = self._filter_think_tags(content_delta)
@@ -990,33 +1573,13 @@ class AgentStreamExecutor:
             error_str = str(e)
             error_str_lower = error_str.lower()
             
-            # Check if error is context overflow (non-retryable, needs session reset)
-            # Method 1: Check for special marker (set in stream error handling above)
-            is_context_overflow = '[context_overflow]' in error_str_lower
-            
-            # Method 2: Fallback to keyword matching for non-stream errors
-            if not is_context_overflow:
-                is_context_overflow = any(keyword in error_str_lower for keyword in [
-                    'context length exceeded', 'maximum context length', 'prompt is too long',
-                    'context overflow', 'context window', 'too large', 'exceeds model context',
-                    'request_too_large', 'request exceeds the maximum size'
-                ])
-            
-            # Check if error is message format error (incomplete tool_use/tool_result pairs)
-            # This happens when previous conversation had tool failures or context trimming
-            # broke tool_use/tool_result pairs.
-            # Note: MiniMax returns error 2013 "tool result's tool id(...) not found" for
-            # tool_call_id mismatches — the keywords below are intentionally broad to catch
-            # both standard (Claude/OpenAI) and provider-specific (MiniMax) variants.
-            is_message_format_error = any(keyword in error_str_lower for keyword in [
-                'tool_use', 'tool_result', 'tool result', 'without', 'immediately after',
-                'corresponding', 'must have', 'each',
-                'tool_call_id', 'tool id', 'is not found', 'not found', 'tool_calls',
-                'must be a response to a preceeding message',
-                '2013',  # MiniMax error code for tool_call_id mismatch
-            ]) and ('400' in error_str_lower or 'status: 400' in error_str_lower
-                     or 'invalid_request' in error_str_lower
-                     or 'invalidparameter' in error_str_lower)
+            # Context overflow is non-retryable and needs the working context reset.
+            is_context_overflow = _is_context_overflow(error_str_lower)
+
+            # Incomplete tool_use/tool_result pairs rejected by the provider.
+            # MiniMax's "tool result's tool id(...) not found" (code 2013) is
+            # covered by the "tool result" / "tool id" markers.
+            is_message_format_error = _is_message_format_error(error_str_lower)
             
             if is_context_overflow or is_message_format_error:
                 error_type = "context overflow" if is_context_overflow else "message format error"
@@ -1030,32 +1593,41 @@ class AgentStreamExecutor:
                         reason="overflow", max_messages=0
                     )
 
-                # Strategy: try aggressive trimming first, only clear as last resort
-                if is_context_overflow and not _overflow_retry:
-                    trimmed = self._aggressive_trim_for_overflow()
-                    if trimmed:
-                        logger.warning("🔄 Aggressively trimmed context, retrying...")
+                # Smart-compaction recovery — reuse the same strategy as the
+                # proactive _trim_messages (discard the older half + inject an
+                # LLM summary, or compress to text-only when turns are few),
+                # but drive it by the real limit the provider reported so we
+                # shrink toward the exact ceiling instead of hammering the same
+                # oversized request (the loop the user saw on the LinkAI backend).
+                # Message-format errors have no token budget to hit, so they skip
+                # straight to the context reset below.
+                if is_context_overflow and _overflow_stage == 0:
+                    if self._smart_compact_to_budget(error_str):
+                        logger.warning("🔄 Smart-compacted context to fit the reported limit, retrying...")
                         return self._call_llm_stream(
                             retry_on_empty=retry_on_empty,
                             retry_count=retry_count,
                             max_retries=max_retries,
-                            _overflow_retry=True
+                            _overflow_stage=1,
+                            _on_fallback=_on_fallback,
+                            _exhausted=_exhausted,
                         )
 
-                # Aggressive trim didn't help or this is a message format error
-                # -> clear everything and also purge DB to prevent reload of dirty data
-                logger.warning("🔄 Clearing conversation history to recover")
+                # Trimming exhausted, or this is a message format error.
+                # Reset the working context only: the persisted history is
+                # irreplaceable, and it can never reintroduce broken tool pairs
+                # because every load path strips tool_use/tool_result blocks.
+                logger.warning("🔄 Resetting in-memory context to recover (stored history kept)")
                 self.messages.clear()
-                self._clear_session_db()
                 if is_context_overflow:
                     raise Exception(_t(
-                        "抱歉，对话历史过长导致上下文溢出。我已清空历史记录，请重新描述你的需求。",
-                        "Sorry, the conversation history got too long and overflowed the context. I've cleared the history — please describe your request again.",
+                        "抱歉，对话历史过长导致上下文溢出。我已重置当前上下文（历史记录仍然保留），请重新描述你的需求。",
+                        "Sorry, the conversation history got too long and overflowed the context. I've reset the current context (your history is kept) — please describe your request again.",
                     ))
                 else:
                     raise Exception(_t(
-                        "抱歉，之前的对话出现了问题。我已清空历史记录，请重新发送你的消息。",
-                        "Sorry, something went wrong with the earlier conversation. I've cleared the history — please send your message again.",
+                        "抱歉，之前的对话出现了问题。我已重置当前上下文（历史记录仍然保留），请重新发送你的消息。",
+                        "Sorry, something went wrong with the earlier conversation. I've reset the current context (your history is kept) — please send your message again.",
                     ))
             
             # Check if error is rate limit (429)
@@ -1068,27 +1640,157 @@ class AgentStreamExecutor:
                 '429', '500', '502', '503', '504', '512'
             ])
             
-            if is_retryable and retry_count < max_retries:
-                # Rate limit needs longer wait time
+            # A fallback link gets a single attempt. Giving every link the
+            # primary's full retry budget would multiply the wait by the chain
+            # length — three rate-limited links alone would sleep past the web
+            # channel's SSE idle timeout (see RATE_LIMIT_MAX_WAIT above) and
+            # the user would see a dropped connection instead of a reply.
+            # Links are tried in order precisely because the whole point is to
+            # move on to a different provider, not to wait out this one.
+            link_retries = 0 if _on_fallback else max_retries
+
+            # A rate limit is the one error where waiting is the wrong move
+            # *when a backup exists*: the backup is a different provider with
+            # its own quota, so switching can answer now instead of after a
+            # 30-60s sleep. With no chain configured there is nothing to switch
+            # to, so keep the old behaviour and wait it out rather than
+            # failing the turn outright.
+            switch_now = False
+            if is_rate_limit and not _on_fallback:
+                available = getattr(self.model, "fallback_available", None)
+                if callable(available):
+                    try:
+                        switch_now = bool(available())
+                    except Exception:
+                        switch_now = False
+                if switch_now:
+                    logger.warning(
+                        "⚠️ Rate limited (429) and a fallback is configured: "
+                        "switching now instead of waiting it out"
+                    )
+
+            # Retrying is only worth it when we are going to wait: either a
+            # plain retryable error, or a rate limit with no backup to move to.
+            # (A rate limit WITH a backup skips straight to the chain below.)
+            should_retry = (is_retryable and not switch_now
+                            and retry_count < link_retries)
+
+            if should_retry:
+                # Rate limit needs longer wait time, but capped so the cumulative
+                # backoff stays within the web stream's idle timeout (see the
+                # RATE_LIMIT_MAX_WAIT note above).
                 if is_rate_limit:
-                    wait_time = 30 + (retry_count * 15)  # 30s, 45s, 60s for rate limit
+                    wait_time = min(30 + (retry_count * 15), RATE_LIMIT_MAX_WAIT)  # 30s..60s
                 else:
                     wait_time = (retry_count + 1) * 2  # 2s, 4s, 6s for other errors
                 
-                logger.warning(f"⚠️ LLM API error (attempt {retry_count + 1}/{max_retries}): {e}")
+                logger.warning(f"⚠️ LLM API error (attempt {retry_count + 1}/{link_retries}): {e}")
                 logger.info(f"Retrying in {wait_time}s...")
                 time.sleep(wait_time)
                 return self._call_llm_stream(
                     retry_on_empty=retry_on_empty, 
                     retry_count=retry_count + 1,
-                    max_retries=max_retries
+                    max_retries=max_retries,
+                    _overflow_stage=_overflow_stage,
+                    _on_fallback=_on_fallback,
+                    _exhausted=_exhausted,
+                )
+
+            # Retries are exhausted (or the error was never retryable). Before
+            # surfacing the failure, advance to the next link in the configured
+            # fallback chain — a provider-wide outage is exactly what retrying
+            # the same endpoint can never fix, and a backup that is also down
+            # earns the link after it.
+            model_label = getattr(self.model, "model", "") or "primary"
+            spent = list(_exhausted or [])
+            spent.append(f"{model_label}: {error_str}")
+            if self._switch_to_fallback(fallback_reason=error_str):
+                self._emit_event("model_fallback", {
+                    "reason": error_str,
+                    "model": getattr(self.model, "model", ""),
+                })
+                return self._call_llm_stream(
+                    retry_on_empty=retry_on_empty,
+                    retry_count=0,          # fresh attempt on the new model
+                    max_retries=max_retries,
+                    _on_fallback=True,      # one attempt, then the next link
+                    _exhausted=spent,
+                )
+
+            # Every link is spent (or none was configured). Report the whole
+            # chain rather than the last error: naming only the final link
+            # reads as "that one model is broken" when in fact each one was
+            # tried and each one failed.
+            if spent and len(spent) > 1:
+                detail = " | ".join(spent)
+                logger.error(
+                    f"❌ LLM call failed across {len(spent)} models "
+                    f"(primary + fallback chain): {detail}"
+                )
+                raise Exception(_t(
+                    "抱歉，主模型与全部兜底模型均调用失败，请检查模型配置或供应商状态。",
+                    "Sorry, the main model and every fallback model failed. "
+                    "Please check your model configuration or provider status.",
+                ) + f"\n{detail}")
+
+            if retry_count >= max_retries:
+                logger.error(f"❌ LLM API error after {max_retries} retries: {e}", exc_info=True)
+            else:
+                logger.error(f"❌ LLM call error (non-retryable): {e}", exc_info=True)
+            raise
+
+        # Persist the provider-reported usage (if any) so the context-usage
+        # indicator can show a real prompt_tokens count instead of the estimate.
+        # prompt_tokens is the whole input the model saw this turn — system +
+        # tools + history — which is exactly the "used" the chart wants.
+        if stream_usage is not None:
+            try:
+                # Fingerprint the history this usage describes. get_context_usage
+                # compares it against the live history estimate: if trimming /
+                # compaction (or new turns) has since changed the history, the
+                # real prompt_tokens is stale and it falls back to the estimate.
+                est_history = sum(
+                    self.agent._estimate_message_tokens(m) for m in self.messages
+                )
+                self.agent.last_usage = {
+                    "prompt_tokens": int(stream_usage.get("prompt_tokens") or 0),
+                    "completion_tokens": int(stream_usage.get("completion_tokens") or 0),
+                    "total_tokens": int(stream_usage.get("total_tokens") or 0),
+                    # History estimate at capture time (freshness fingerprint).
+                    "_est_history": est_history,
+                }
+            except (TypeError, ValueError):
+                pass
+
+        # Log real provider token usage vs our char-based estimate, so the
+        # accuracy of the context-usage indicator can be judged from the logs.
+        try:
+            if self.agent.last_usage:
+                real_in = self.agent.last_usage.get("prompt_tokens", 0)
+                real_out = self.agent.last_usage.get("completion_tokens", 0)
+                # Rough estimate of what we sent this turn (system + tools +
+                # history), the same numbers the usage chart shows.
+                est_sys = self.agent._estimate_text_tokens(self.system_prompt or "")
+                est_hist = sum(
+                    self.agent._estimate_message_tokens(m) for m in self.messages
+                )
+                est_in = est_sys + est_hist
+                ratio = (est_in / real_in) if real_in else 0
+                logger.info(
+                    f"[Usage] real input={real_in} output={real_out} | "
+                    f"estimate input~={est_in} (sys~={est_sys} hist~={est_hist}) | "
+                    f"est/real={ratio:.2f}"
                 )
             else:
-                if retry_count >= max_retries:
-                    logger.error(f"❌ LLM API error after {max_retries} retries: {e}", exc_info=True)
-                else:
-                    logger.error(f"❌ LLM call error (non-retryable): {e}", exc_info=True)
-                raise
+                model_name = getattr(self.agent.model, "model", "?") if getattr(self.agent, "model", None) else "?"
+                logger.info(
+                    f"[Usage] model={model_name} did NOT return token usage this "
+                    "turn — its streaming path needs stream_options.include_usage "
+                    "or a trailing usage chunk; context indicator falls back to "
+                    "the char estimate"
+                )
+        except Exception as e:
+            logger.debug(f"[Usage] usage log skipped: {e}")
 
         # Parse tool calls
         tool_calls = []
@@ -1102,7 +1804,7 @@ class AgentStreamExecutor:
                 tool_id = f"call_{uuid.uuid4().hex[:24]}"
 
             args_str = tc.get("arguments") or ""
-            arguments, parse_err = _parse_tool_args(args_str, stop_reason)
+            arguments, parse_err = _parse_tool_args(args_str, stop_reason, tc["name"])
             if parse_err:
                 logger.error(
                     f"Tool args parse failed for {tc['name']} ({len(args_str)} chars): {parse_err}"
@@ -1134,7 +1836,10 @@ class AgentStreamExecutor:
             return self._call_llm_stream(
                 retry_on_empty=False, 
                 retry_count=retry_count,
-                max_retries=max_retries
+                max_retries=max_retries,
+                _overflow_stage=_overflow_stage,
+                _on_fallback=_on_fallback,
+                _exhausted=_exhausted,
             )
 
         # Filter full_content one more time (in case tags were split across chunks)
@@ -1180,18 +1885,67 @@ class AgentStreamExecutor:
 
         self._emit_event("message_end", {
             "content": full_content,
-            "tool_calls": tool_calls
+            "tool_calls": tool_calls,
+            "stop_reason": stop_reason
         })
 
-        return full_content, tool_calls
+        return full_content, tool_calls, stop_reason
 
-    def _execute_tool(self, tool_call: Dict) -> Dict[str, Any]:
+    def _required_params(self, tool_name: str) -> list:
+        """Parameter names a tool's schema declares as required."""
+        tool = self.tools.get(tool_name)
+        params = getattr(tool, "params", None)
+        required = params.get("required") if isinstance(params, dict) else None
+        return list(required) if isinstance(required, list) else []
+
+    def _run_parallel_calls(self, tool_calls: List[Dict]) -> Dict[str, Dict[str, Any]]:
+        """Start every parallel-safe call of this turn at once, keyed by call id.
+
+        Tools otherwise run strictly in the order the model asked for them.
+        That is the right default, but a model that splits independent work
+        across several calls - the usual way of expressing it - would then have
+        the second wait out the first. For a tool that declares itself
+        parallel_safe the wait buys nothing, so those calls are run together
+        here and the loop below picks up the finished results in place.
+
+        Each call gets its own copy of the tool: the loop drives tools by
+        assigning `cancel_event` and `progress_callback` before a call and
+        clearing them after, which two concurrent calls on one instance would
+        do to each other.
+        """
+        eligible = [
+            call for call in tool_calls
+            if getattr(self.tools.get(call["name"]), "parallel_safe", False)
+        ]
+        if len(eligible) < 2:
+            return {}
+
+        logger.info(f"[Agent] Running {len(eligible)} tool calls in parallel")
+        pool = ThreadPoolExecutor(
+            max_workers=len(eligible), thread_name_prefix="parallel-tool"
+        )
+        try:
+            futures = {}
+            for call in eligible:
+                # copy_context carries the runtime identity - which agent, which
+                # session - into the worker thread, so anything the tool writes
+                # lands where the same call would have landed on this thread.
+                ctx = contextvars.copy_context()
+                futures[call["id"]] = pool.submit(
+                    ctx.run, self._execute_tool, call, copy.copy(self.tools[call["name"]])
+                )
+            return {call_id: future.result() for call_id, future in futures.items()}
+        finally:
+            pool.shutdown(wait=False)
+
+    def _execute_tool(self, tool_call: Dict, tool_override: Optional[BaseTool] = None) -> Dict[str, Any]:
         """
         Execute tool
-        
+
         Args:
             tool_call: {"id": str, "name": str, "arguments": dict}
-            
+            tool_override: run against this instance instead of the shared one
+
         Returns:
             Tool execution result
         """
@@ -1206,6 +1960,57 @@ class AgentStreamExecutor:
                 "execution_time": 0,
             }
             self._record_tool_result(tool_name, arguments, False)
+            return result
+
+        # A call whose arguments never arrived parses into an empty dict, which
+        # would otherwise reach the tool and be reported as one missing field -
+        # sending the model off to fix a parameter it never got to send.
+        missing = self._required_params(tool_name) if not arguments else []
+        if missing:
+            result = {
+                "status": "error",
+                "result": (
+                    f"Your {tool_name} call arrived with no arguments at all, so it did not "
+                    f"run and nothing was written. It requires: {', '.join(missing)}. "
+                    "The arguments were most likely cut off before they were sent."
+                    + (" " + _SPLIT_WRITE_ADVICE if tool_name in ("write", "edit") else "")
+                ),
+                "execution_time": 0,
+            }
+            logger.error(f"Tool {tool_name} called with no arguments (required: {missing})")
+            self._record_tool_result(tool_name, arguments, False)
+            return result
+
+        # Permission gate. Resolved per call so switching mode mid-conversation
+        # applies to the very next tool call. A refusal is reported as a normal
+        # tool error: the model reads why, and can either take an allowed route
+        # or tell the user which mode the task needs.
+        denial = self._permission_denial(tool_name, arguments)
+        if denial:
+            logger.info(f"🔐 Permission denied for tool {tool_name}: {denial}")
+            result = {"status": "error", "result": denial, "execution_time": 0}
+            self._emit_event("tool_execution_start", {
+                "tool_call_id": tool_id,
+                "tool_name": tool_name,
+                "arguments": arguments,
+            })
+            # Flag this as a permission refusal (not an ordinary tool error) and
+            # carry the mode that refused, so the UI can render an actionable
+            # "switch permission" hint instead of a generic failure.
+            try:
+                denied_mode = self.agent.effective_permission_mode()
+            except Exception:
+                denied_mode = None
+            self._emit_event("tool_execution_end", {
+                "tool_call_id": tool_id,
+                "tool_name": tool_name,
+                "permission_denied": True,
+                "permission_mode": denied_mode,
+                **result,
+            })
+            # Deliberately not recorded as a tool failure: a refusal is not the
+            # tool misbehaving, and it must not count toward the consecutive
+            # failure limit that aborts the conversation.
             return result
 
         # Check for consecutive failures (retry protection)
@@ -1230,20 +2035,36 @@ class AgentStreamExecutor:
                 }
             return result
 
-        self._emit_event("tool_execution_start", {
+        tool = tool_override or self.tools.get(tool_name)
+        start_event = {
             "tool_call_id": tool_id,
             "tool_name": tool_name,
-            "arguments": arguments
-        })
+            "arguments": arguments,
+        }
+        # A call that puts up its own cards gets no card of its own, or the
+        # same work is on screen twice. Trust but verify: a tool that turns
+        # back at its own front door - a setting is off, an argument is out of
+        # range - emits nothing, and its refusal has to appear somewhere.
+        own_cards = renders_own_cards(tool, arguments)
+        emitted_own = False
+
+        def emit_from_tool(event_type, data):
+            nonlocal emitted_own
+            if event_type == "tool_execution_start":
+                emitted_own = True
+            self._emit_event(event_type, data)
+
+        if not own_cards:
+            self._emit_event("tool_execution_start", start_event)
 
         try:
-            tool = self.tools.get(tool_name)
             if not tool:
                 raise ValueError(self._build_tool_not_found_message(tool_name))
 
             # Set tool context
             tool.model = self.model
             tool.context = self.agent
+            tool.cancel_event = self.cancel_event
             tool.progress_callback = lambda message: self._emit_event(
                 "tool_execution_progress",
                 {
@@ -1252,6 +2073,8 @@ class AgentStreamExecutor:
                     "message": message,
                 }
             )
+            tool.event_callback = emit_from_tool if own_cards else self._emit_event
+            tool.tool_call_id = tool_id
 
             # Execute tool
             start_time = time.time()
@@ -1259,6 +2082,9 @@ class AgentStreamExecutor:
                 result: ToolResult = tool.execute_tool(arguments)
             finally:
                 tool.progress_callback = None
+                tool.cancel_event = None
+                tool.event_callback = None
+                tool.tool_call_id = None
             execution_time = time.time() - start_time
 
             result_dict = {
@@ -1279,11 +2105,17 @@ class AgentStreamExecutor:
                     self.agent.refresh_skills()
                     logger.info(f"Skills refreshed! Now have {len(self.agent.skill_manager.skills)} skills")
 
-            self._emit_event("tool_execution_end", {
-                "tool_call_id": tool_id,
-                "tool_name": tool_name,
-                **result_dict
-            })
+            # `display` rides on the event only: result_dict becomes the
+            # tool_result the model reads, and a second rendering of the same
+            # outcome there would just cost context.
+            end_event = {"tool_call_id": tool_id, "tool_name": tool_name, **result_dict}
+            if getattr(result, "display", None):
+                end_event["display"] = result.display
+            if not own_cards:
+                self._emit_event("tool_execution_end", end_event)
+            elif not emitted_own:
+                self._emit_event("tool_execution_start", start_event)
+                self._emit_event("tool_execution_end", end_event)
 
             return result_dict
 
@@ -1296,13 +2128,46 @@ class AgentStreamExecutor:
             }
             # Record failure
             self._record_tool_result(tool_name, arguments, False)
-            
+
+            # The tool was trusted to put up its own cards and then threw.
+            # Whatever it had already drawn is now stranded mid-spin, so a
+            # card saying what went wrong is worth the small duplication.
+            if own_cards:
+                self._emit_event("tool_execution_start", start_event)
             self._emit_event("tool_execution_end", {
                 "tool_call_id": tool_id,
                 "tool_name": tool_name,
                 **error_result
             })
             return error_result
+
+    def _permission_denial(self, tool_name: str, arguments: Dict) -> Optional[str]:
+        """Reason this call is not allowed, or None when it may run.
+
+        Never raises: a broken permission check must not take the conversation
+        down with it, so an error here falls through to the historical
+        unrestricted behavior.
+        """
+        agent = self.agent
+        if agent is None:
+            return None
+        try:
+            from agent.permission import FULL_ACCESS, check_tool_call
+
+            mode = agent.effective_permission_mode()
+            if mode == FULL_ACCESS:
+                return None
+            decision = check_tool_call(
+                mode,
+                tool_name,
+                arguments,
+                cwd=agent.effective_cwd(),
+                write_roots=agent.write_roots(),
+            )
+            return None if decision.allowed else decision.reason
+        except Exception as e:
+            logger.warning(f"[Permission] Check skipped for {tool_name}: {e}")
+            return None
 
     def _build_tool_not_found_message(self, tool_name: str) -> str:
         """Build a helpful error message when a tool is not found.
@@ -1362,48 +2227,7 @@ class AgentStreamExecutor:
         Returns:
             List of turns, each turn is a dict with 'messages' list
         """
-        turns = []
-        current_turn = {'messages': []}
-        
-        for msg in self.messages:
-            role = msg.get('role')
-            content = msg.get('content', [])
-            
-            if role == 'user':
-                # Determine if this is a real user query (not a tool_result injection
-                # or an internal hint message injected by the agent loop).
-                is_user_query = False
-                has_tool_result = False
-                if isinstance(content, list):
-                    has_text = any(
-                        isinstance(block, dict) and block.get('type') == 'text'
-                        for block in content
-                    )
-                    has_tool_result = any(
-                        isinstance(block, dict) and block.get('type') == 'tool_result'
-                        for block in content
-                    )
-                    # A message with tool_result is always internal, even if it
-                    # also contains text blocks (shouldn't happen, but be safe).
-                    is_user_query = has_text and not has_tool_result
-                elif isinstance(content, str):
-                    is_user_query = True
-                
-                if is_user_query:
-                    if current_turn['messages']:
-                        turns.append(current_turn)
-                    current_turn = {'messages': [msg]}
-                else:
-                    current_turn['messages'].append(msg)
-            else:
-                # AI 回复，属于当前轮次
-                current_turn['messages'].append(msg)
-        
-        # 添加最后一个轮次
-        if current_turn['messages']:
-            turns.append(current_turn)
-        
-        return turns
+        return identify_complete_turns(self.messages)
     
     def _estimate_turn_tokens(self, turn: Dict) -> int:
         """估算一个轮次的 tokens"""
@@ -1464,107 +2288,136 @@ class AgentStreamExecutor:
         if truncated_count > 0:
             logger.info(f"📎 Truncated {truncated_count} historical tool result(s) to {MAX_HISTORY_RESULT_CHARS} chars")
 
-    def _aggressive_trim_for_overflow(self) -> bool:
+    # Parse "... maximum context length is 1048576 tokens. However, you requested
+    # 1276733 tokens (892733 in the messages, 384000 in the completion) ..." so
+    # the retry aims at the real numbers the provider reported rather than a guess.
+    _RE_OVERFLOW_LIMIT = re.compile(r"maximum context length is\s+(\d+)\s*tokens", re.I)
+    _RE_OVERFLOW_COMPLETION = re.compile(r"(\d+)\s+in the completion", re.I)
+
+    def _overflow_input_budget(self, error_str: str) -> int:
         """
-        Aggressively trim context when a real overflow error is returned by the API.
+        Compute the input-token budget to compact toward after an overflow.
 
-        This method goes beyond normal _trim_messages by:
-        1. Truncating all tool results (including current turn) to a small limit
-        2. Keeping only the last 5 complete conversation turns
-        3. Truncating overly long user messages
-
-        Returns:
-            True if messages were trimmed (worth retrying), False if nothing left to trim
+        Prefer the concrete numbers the provider reported in the error
+        ("maximum context length is X ... N in the completion"); fall back to
+        the model window minus our output reserve. A 10% safety margin absorbs
+        the gap between our estimate and the provider's real tokenizer.
         """
-        if not self.messages:
-            return False
+        window = self.agent._get_model_context_window()
+        limit_match = self._RE_OVERFLOW_LIMIT.search(error_str or "")
+        if limit_match:
+            window = int(limit_match.group(1))
 
+        completion = None
+        comp_match = self._RE_OVERFLOW_COMPLETION.search(error_str or "")
+        if comp_match:
+            completion = int(comp_match.group(1))
+        if completion is None:
+            completion = self.agent._get_output_reserve_tokens()
+
+        system_tokens = self.agent._estimate_message_tokens(
+            {"role": "system", "content": self.system_prompt}
+        )
+        budget = int((window - completion - system_tokens) * 0.9)
+        return max(2000, budget)
+
+    def _smart_compact_to_budget(self, error_str: str) -> bool:
+        """
+        Compact the working context toward the provider's reported limit using
+        the SAME smart strategy as the proactive _trim_messages, just repeated
+        until the estimate fits:
+
+          - Many turns (>= COMPRESS_THRESHOLD): discard the older half and flush
+            them to daily memory + inject an LLM summary into the kept turns.
+          - Few turns (< COMPRESS_THRESHOLD): compress every turn to text-only
+            (strip tool chains, keep user query + final reply), never discard.
+
+        Keeps at least the most recent turn so the user's latest request is not
+        lost. Returns True if it reduced the context (worth retrying), else
+        False (nothing left to shrink -> caller resets).
+        """
+        COMPRESS_THRESHOLD = 5
+
+        input_budget = self._overflow_input_budget(error_str)
         original_count = len(self.messages)
 
-        # Step 1: Aggressively truncate ALL tool results to 5K chars
-        AGGRESSIVE_LIMIT = 10000
-        truncated = 0
-        for msg in self.messages:
-            content = msg.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                # Truncate tool_result blocks
-                if block.get("type") == "tool_result":
-                    result_str = block.get("content", "")
-                    if isinstance(result_str, str) and len(result_str) > AGGRESSIVE_LIMIT:
-                        block["content"] = (
-                            result_str[:AGGRESSIVE_LIMIT]
-                            + f"\n\n[Truncated for context recovery: "
-                            f"{len(result_str)} -> {AGGRESSIVE_LIMIT} chars]"
-                        )
-                        truncated += 1
-                # Truncate tool_use input blocks (e.g. large write content)
-                if block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
-                    input_str = json.dumps(block["input"], ensure_ascii=False)
-                    if len(input_str) > AGGRESSIVE_LIMIT:
-                        # Keep only a summary of the input
-                        for key, val in block["input"].items():
-                            if isinstance(val, str) and len(val) > 1000:
-                                block["input"][key] = (
-                                    val[:1000]
-                                    + f"... [truncated {len(val)} chars]"
-                                )
-                        truncated += 1
-
-        # Step 2: Truncate overly long user text messages (e.g. pasted content)
-        USER_MSG_LIMIT = 10000
-        for msg in self.messages:
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "")
-                        if len(text) > USER_MSG_LIMIT:
-                            block["text"] = (
-                                text[:USER_MSG_LIMIT]
-                                + f"\n\n[Message truncated for context recovery: "
-                                f"{len(text)} -> {USER_MSG_LIMIT} chars]"
-                            )
-                            truncated += 1
-            elif isinstance(content, str) and len(content) > USER_MSG_LIMIT:
-                msg["content"] = (
-                    content[:USER_MSG_LIMIT]
-                    + f"\n\n[Message truncated for context recovery: "
-                    f"{len(content)} -> {USER_MSG_LIMIT} chars]"
-                )
-                truncated += 1
-
-        # Step 3: Keep only the last 5 complete turns
         turns = self._identify_complete_turns()
-        if len(turns) > 5:
-            kept_turns = turns[-5:]
-            new_messages = []
-            for turn in kept_turns:
-                new_messages.extend(turn["messages"])
-            removed = len(turns) - 5
-            self.messages[:] = new_messages
-            logger.info(
-                f"🔧 Aggressive trim: removed {removed} old turns, "
-                f"truncated {truncated} large blocks, "
-                f"{original_count} -> {len(self.messages)} messages"
-            )
-            return True
+        if not turns:
+            return False
 
-        if truncated > 0:
-            logger.info(
-                f"🔧 Aggressive trim: truncated {truncated} large blocks "
-                f"(no turns removed, only {len(turns)} turn(s) left)"
-            )
-            return True
+        current = sum(self._estimate_turn_tokens(t) for t in turns)
+        logger.warning(
+            f"🔄 Context overflow recovery: compacting toward ~{input_budget} "
+            f"input tokens (currently ~{current} over {len(turns)} turns)"
+        )
 
-        # Nothing left to trim
-        logger.warning("🔧 Aggressive trim: nothing to trim, will clear history")
-        return False
+        # Repeatedly apply the smart strategy until we fit or can't shrink more.
+        # Each iteration removes the older half (with summary) when there are
+        # enough turns, otherwise compresses the survivors to plain text.
+        guard = 0
+        while turns and guard < 32:
+            guard += 1
+            current = sum(self._estimate_turn_tokens(t) for t in turns)
+            if current <= input_budget:
+                break
+
+            if len(turns) >= COMPRESS_THRESHOLD:
+                # Discard older half + summarize, mirroring _trim_messages.
+                removed_count = len(turns) // 2
+                discarded_turns = turns[:removed_count]
+                kept_turns = turns[removed_count:]
+
+                if self.agent.memory_manager:
+                    discarded_messages = []
+                    for turn in discarded_turns:
+                        discarded_messages.extend(turn["messages"])
+                    if discarded_messages:
+                        user_id = getattr(self.agent, "_current_user_id", None)
+                        cb = self._build_context_summary_callback(discarded_turns, kept_turns)
+                        self.agent.memory_manager.flush_memory(
+                            messages=discarded_messages, user_id=user_id,
+                            reason="overflow", max_messages=0,
+                            context_summary_callback=cb,
+                        )
+                turns = kept_turns
+            else:
+                # Few turns: compress all to text-only. If that still doesn't
+                # fit, drop the oldest one but always keep the last turn.
+                compressed = []
+                for t in turns:
+                    c = compress_turn_to_text_only(t)
+                    if c["messages"]:
+                        compressed.append(c)
+                if compressed and sum(self._estimate_turn_tokens(t) for t in compressed) < current:
+                    turns = compressed
+                elif len(turns) > 1:
+                    turns = turns[1:]
+                else:
+                    # A single turn that still overflows even as plain text —
+                    # nothing more this strategy can do.
+                    turns = compressed or turns
+                    break
+
+        new_messages = []
+        for turn in turns:
+            new_messages.extend(turn["messages"])
+
+        if not new_messages or len(new_messages) >= original_count:
+            # Couldn't reduce anything (single oversized turn) -> let caller reset.
+            if not new_messages:
+                logger.warning("🧹 Smart compaction produced no messages, will clear history")
+                return False
+            if len(new_messages) >= original_count:
+                logger.warning("🧹 Smart compaction could not reduce the context, will clear history")
+                return False
+
+        self.messages[:] = new_messages
+        new_tokens = sum(self._estimate_turn_tokens(t) for t in turns)
+        logger.info(
+            f"🔄 Smart compaction: {original_count} -> {len(self.messages)} messages "
+            f"(~{new_tokens} tokens, target ~{input_budget})"
+        )
+        return True
 
     def _build_context_summary_callback(self, discarded_turns: list, kept_turns: list):
         """
@@ -1578,21 +2431,7 @@ class AgentStreamExecutor:
             return None
 
         # Find the first user text block in kept_turns as injection target
-        target_block = None
-        for turn in kept_turns:
-            for msg in turn["messages"]:
-                if msg.get("role") == "user":
-                    content = msg.get("content", [])
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                target_block = block
-                                break
-                    if target_block:
-                        break
-            if target_block:
-                break
-
+        target_block = find_first_user_text_block(kept_turns)
         if not target_block:
             return None
 
@@ -1602,12 +2441,8 @@ class AgentStreamExecutor:
         def _on_summary_ready(summary: str):
             if not summary or not summary.strip():
                 return
-            target_block["text"] = (
-                f"[System: Previous conversation summary — "
-                f"{turn_count} turns were compacted]\n\n"
-                f"{summary.strip()}\n\n"
-                f"The recent conversation continues below.\n\n---\n\n"
-                f"{original_text}"
+            target_block["text"] = build_compaction_summary_text(
+                summary, turn_count, original_text
             )
             logger.info(
                 f"📝 Context summary injected "
@@ -1668,13 +2503,21 @@ class AgentStreamExecutor:
         # Get context window from agent (based on model)
         context_window = self.agent._get_model_context_window()
 
-        # Use configured max_context_tokens if available
+        # The window is shared by prompt + completion. Always keep the input
+        # budget below (window - output reserve) so a full prompt plus the
+        # provider's default completion budget can't overflow the window and
+        # trigger the "maximum context length ... you requested N tokens" 400
+        # (which otherwise loops). The window follows the effective model:
+        # a session override uses that model, message channels the global one.
+        output_reserve = self.agent._get_output_reserve_tokens()
+        input_ceiling = max(1, context_window - output_reserve)
+
+        # An explicit agent cap (sub agents inherit one so they cannot widen
+        # the session's reach) applies, but never above the input ceiling.
         if hasattr(self.agent, 'max_context_tokens') and self.agent.max_context_tokens:
-            max_tokens = self.agent.max_context_tokens
+            max_tokens = min(self.agent.max_context_tokens, input_ceiling)
         else:
-            # Reserve 10% for response generation
-            reserve_tokens = int(context_window * 0.1)
-            max_tokens = context_window - reserve_tokens
+            max_tokens = input_ceiling
 
         # Estimate system prompt tokens
         system_tokens = self.agent._estimate_message_tokens({"role": "system", "content": self.system_prompt})
@@ -1773,24 +2616,6 @@ class AgentStreamExecutor:
             f"({old_count} -> {len(self.messages)} messages, "
             f"~{current_tokens + system_tokens} -> ~{kept_tokens + system_tokens} tokens)"
         )
-
-    def _clear_session_db(self):
-        """
-        Clear the current session's persisted messages from SQLite DB.
-
-        This prevents dirty data (broken tool_use/tool_result pairs) from being
-        reloaded on the next request or after a restart.
-        """
-        try:
-            session_id = getattr(self.agent, '_current_session_id', None)
-            if not session_id:
-                return
-            from agent.memory import get_conversation_store
-            store = get_conversation_store()
-            store.clear_session(session_id)
-            logger.info(f"🗑️ Cleared dirty session data from DB: {session_id}")
-        except Exception as e:
-            logger.warning(f"Failed to clear session DB: {e}")
 
     def _prepare_messages(self) -> List[Dict[str, Any]]:
         """

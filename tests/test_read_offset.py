@@ -51,7 +51,8 @@ class TestReadNegativeOffset(unittest.TestCase):
         path = self._write("f.txt", "a\nb\nc")  # no trailing newline
         result = self.tool.execute({"path": path, "offset": -1})
         self.assertEqual(result.status, "success", result.result)
-        self.assertEqual(result.result["content"].strip(), "c")
+        # Output carries a `n|` line-number gutter numbered against the file.
+        self.assertEqual(result.result["content"].strip(), "3|c")
 
 
 if __name__ == "__main__":

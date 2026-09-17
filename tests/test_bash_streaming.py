@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import threading
 import time
 from unittest.mock import patch
 
@@ -61,6 +62,21 @@ def test_timeout_returns_promptly(tmp_path):
     assert result.status == "error"
     assert "timed out after 1 seconds" in result.result
     assert time.monotonic() - started < 3
+
+
+@posix_only
+def test_cancel_stops_a_running_command(tmp_path):
+    """A user cancel must not wait out the remaining timeout."""
+    tool = Bash({"cwd": str(tmp_path)})
+    tool.cancel_event = threading.Event()
+    threading.Timer(0.5, tool.cancel_event.set).start()
+    started = time.monotonic()
+
+    result = tool.execute({"command": "sleep 30", "timeout": 60})
+
+    assert result.status == "error"
+    assert "cancelled" in result.result
+    assert time.monotonic() - started < 5
 
 
 @posix_only

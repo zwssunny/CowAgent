@@ -1,12 +1,21 @@
+const path = require('path')
+
+// When '@product' points outside this project (COW_PRODUCT_DIR), scan that
+// directory too so classes used only there still get generated.
+const productContent = process.env.COW_PRODUCT_DIR
+  ? [path.join(process.env.COW_PRODUCT_DIR, '**/*.{tsx,ts}')]
+  : []
+
 /** @type {import('tailwindcss').Config} */
 module.exports = {
-  content: ['./src/renderer/**/*.{html,tsx,ts}'],
+  content: ['./src/renderer/**/*.{html,tsx,ts}', ...productContent],
   darkMode: 'class',
   theme: {
     extend: {
       fontFamily: {
-        sans: ['Inter', 'system-ui', '-apple-system', '"PingFang SC"', '"Hiragino Sans GB"', '"Microsoft YaHei"', 'sans-serif'],
-        mono: ['"JetBrains Mono"', '"Fira Code"', 'Consolas', 'monospace'],
+        // Driven by CSS variables so a skin can restyle typography.
+        sans: 'var(--font-sans)',
+        mono: 'var(--font-mono)',
       },
       colors: {
         'danger-soft': 'var(--danger-soft)',
@@ -32,13 +41,19 @@ module.exports = {
           soft: 'var(--accent-soft)',
           contrast: 'var(--accent-contrast)',
         },
+        // User message bubble (theme-overridable, falls back to accent)
+        'bubble-user': 'var(--bubble-user-bg)',
+        'bubble-user-text': 'var(--bubble-user-text)',
         base: 'var(--bg-base)',
         surface: {
           DEFAULT: 'var(--bg-surface)',
           2: 'var(--bg-surface-2)',
         },
         elevated: 'var(--bg-elevated)',
-        inset: 'var(--bg-inset)',
+        inset: {
+          DEFAULT: 'var(--bg-inset)',
+          2: 'var(--bg-inset-2)',
+        },
         content: {
           DEFAULT: 'var(--text-primary)',
           secondary: 'var(--text-secondary)',
@@ -62,8 +77,9 @@ module.exports = {
         lg: 'var(--shadow-lg)',
       },
       borderRadius: {
-        card: '12px',
-        btn: '8px',
+        card: 'var(--radius-card)',
+        btn: 'var(--radius-btn)',
+        sm: 'var(--radius-sm)',
       },
       animation: {
         'pulse-dot': 'pulseDot 1.4s infinite ease-in-out both',

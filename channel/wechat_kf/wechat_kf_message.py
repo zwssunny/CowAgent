@@ -11,8 +11,7 @@ from wechatpy.enterprise import WeChatClient
 from bridge.context import ContextType
 from channel.chat_message import ChatMessage
 from common.log import logger
-from common.utils import expand_path
-from config import conf
+from common import state_dir
 
 
 def _get_tmp_dir() -> str:
@@ -20,10 +19,7 @@ def _get_tmp_dir() -> str:
     resolve a relative path like `tmp/xxx.pdf` against their own
     workspace root. Mirrors the convention used by weixin / wecom_bot.
     """
-    ws_root = expand_path(conf().get("agent_workspace", "~/cow"))
-    tmp_dir = os.path.join(ws_root, "tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    return tmp_dir
+    return str(state_dir.tmp_dir())
 
 
 def _extract_filename(content_disposition: str) -> str:

@@ -15,11 +15,11 @@ metadata:
 
 # Image Generation
 
-Generate and edit images using AI models. The script automatically picks a backend based on which API keys are configured — **you don't need to specify a model unless the user explicitly names one**.
+Generate and edit images using AI models. The script automatically picks a backend based on which API keys are configured — **you don't need to specify a model unless the user explicitly names one**. Never guess or invent a `model`: when the user doesn't name one, omit `model` entirely so the configured default/provider is used.
 
 Supported models (passed via `model` only when the user asks for a specific one):
 
-- **OpenAI** — `gpt-image-2`, `gpt-image-1`
+- **OpenAI** — `gpt-image-2.5-flare` (recommended default: best quality/latency trade-off), `gpt-image-2.5-sunburst` (highest editing precision), `gpt-image-2`, `gpt-image-1`
 - **Gemini Nano Banana** — `nano-banana-2`, `nano-banana-pro`, `nano-banana`
 - **Seedream (Volcengine Ark)** — `seedream-5.0-lite`, `seedream-4.5`
 - **Qwen (DashScope)** — `qwen-image-2.0`, `qwen-image-2.0-pro`
@@ -27,13 +27,15 @@ Supported models (passed via `model` only when the user asks for a specific one)
 
 ## Usage
 
-Run `scripts/generate.py` with a JSON argument. The path is relative to this skill's `base_dir`.
+Run `scripts/generate.py` with a JSON argument. Use the absolute `<base_dir>` path — **do NOT `cd` into the skill directory**, since it is a builtin skill and gets reset on restart (anything written there is lost).
 
 ```bash
 python <base_dir>/scripts/generate.py '<json_args>'
 ```
 
-**Set bash timeout to at least 600 seconds**, as image generation can take 30–200s per provider, and the script may try multiple providers sequentially.
+Images are saved to the workspace (or the open project dir) under `images/`, so they persist and stay reachable to the client.
+
+**Set bash timeout to at least 600 seconds**, as image generation can take 30–200s per provider, and the script may try multiple providers sequentially. Call it synchronously (do not run it in the background) and wait for its output in the same turn.
 
 ### Parameters
 

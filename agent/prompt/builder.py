@@ -43,6 +43,8 @@ class PromptBuilder:
         skill_manager: Any = None,
         memory_manager: Any = None,
         runtime_info: Optional[Dict[str, Any]] = None,
+        project_dir: Optional[str] = None,
+        permission_mode: Optional[str] = None,
         **kwargs
     ) -> str:
         """
@@ -71,6 +73,8 @@ class PromptBuilder:
             skill_manager=skill_manager,
             memory_manager=memory_manager,
             runtime_info=runtime_info,
+            project_dir=project_dir,
+            permission_mode=permission_mode,
             **kwargs
         )
 
@@ -85,6 +89,8 @@ def build_agent_system_prompt(
     skill_manager: Any = None,
     memory_manager: Any = None,
     runtime_info: Optional[Dict[str, Any]] = None,
+    project_dir: Optional[str] = None,
+    permission_mode: Optional[str] = None,
     **kwargs
 ) -> str:
     """
@@ -96,6 +102,7 @@ def build_agent_system_prompt(
     3. Memory - memory recall and writing guidance
     3.5 Knowledge - structured knowledge base (injects knowledge/index.md)
     4. Workspace - working environment description
+    4.5 Permissions - what this session may change (omitted for full access)
     5. User identity - user info (optional)
     6. Project context - AGENT.md, USER.md, RULE.md, MEMORY.md, BOOTSTRAP.md
     7. Runtime info - meta info (time, model, etc.)
@@ -127,14 +134,38 @@ def build_agent_system_prompt(
 
     # 3. Memory (standalone memory capability)
     if memory_manager:
-        sections.extend(_build_memory_section(memory_manager, tools, language))
+        sections.extend(
+            _build_memory_section(memory_manager, tools, language, workspace_dir, project_dir)
+        )
 
     # 3.5 Knowledge (structured knowledge base)
     if conf().get("knowledge", True):
-        sections.extend(_build_knowledge_section(workspace_dir, language))
+        sections.extend(_build_knowledge_section(workspace_dir, language, project_dir))
 
-    # 4. Workspace (working environment description)
-    sections.extend(_build_workspace_section(workspace_dir, language))
+    # 4. Workspace (working environment description). Two of its blocks only
+    # hold when the context files were actually loaded, which sub agents skip.
+    sections.extend(
+        _build_workspace_section(
+            workspace_dir, language, bool(context_files), project_dir=project_dir
+        )
+    )
+
+    # 4.5 Permissions. Right after the workspace, because what the model may
+    # change only means something once it knows where it is working. Emits
+    # nothing in full-access mode, leaving the prompt as it has always been.
+    if permission_mode:
+        try:
+            from agent.permission import describe_mode
+
+            sections.extend(
+                describe_mode(
+                    permission_mode,
+                    language,
+                    cwd=project_dir or workspace_dir,
+                )
+            )
+        except Exception as e:
+            logger.debug(f"Permission prompt section skipped: {e}")
 
     # 5. User identity (if present)
     if user_identity:
@@ -147,6 +178,7 @@ def build_agent_system_prompt(
     # 7. Runtime info (meta info, goes last)
     if runtime_info:
         sections.extend(_build_runtime_section(runtime_info, language))
+        sections.extend(_build_team_section(runtime_info, language))
 
     # 8. Response language (always appended, independent of the skeleton language)
     sections.extend(_build_response_language_section(language))
@@ -192,8 +224,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "write": "create or overwrite a file",
             "edit": "make precise edits to a file",
             "ls": "list directory contents",
-            "grep": "search file contents",
-            "find": "find files by pattern",
+            "search_files": "search inside files by regex, or find files by name",
             "bash": "run shell commands",
             "terminal": "manage background processes",
             "web_search": "web search",
@@ -205,6 +236,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "scheduler": "manage scheduled tasks and reminders",
             "send": "send a local file to the user (local files only; put URLs directly in the reply text)",
             "vision": "analyze images (recognition, description, OCR, etc.)",
+            "subagent": "hand a self-contained task to a sub agent and get back only its conclusion",
         }
     else:
         core_summaries = {
@@ -212,8 +244,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "write": "创建或覆盖文件",
             "edit": "精确编辑文件",
             "ls": "列出目录内容",
-            "grep": "搜索文件内容",
-            "find": "按模式查找文件",
+            "search_files": "按正则搜索文件内容，或按文件名查找文件",
             "bash": "执行shell命令",
             "terminal": "管理后台进程",
             "web_search": "网络搜索",
@@ -225,15 +256,16 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "scheduler": "管理定时任务和提醒",
             "send": "发送本地文件给用户（仅限本地文件，URL直接放在回复文本中）",
             "vision": "分析图片内容（识别、描述、OCR文字提取等）",
+            "subagent": "把一件自成一体的任务交给子 Agent，只拿回它的结论",
         }
 
     # Preferred display order
     tool_order = [
-        "read", "write", "edit", "ls", "grep", "find",
+        "read", "write", "edit", "ls", "search_files",
         "bash", "terminal",
         "web_search", "web_fetch", "browser",
         "memory_search", "memory_get",
-        "env_config", "scheduler", "send", "vision",
+        "env_config", "scheduler", "send", "vision", "subagent",
     ]
 
     # Build name -> summary mapping for available tools
@@ -252,6 +284,13 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
         summary = available[name]
         tool_lines.append(f"- {name}: {summary}" if summary else f"- {name}")
 
+    # The delegation rule earns its place in the prompt only when the tool is
+    # there. Left to the tool description alone it competes with ~30 others and
+    # loses: the model reaches for search directly and fills its own context.
+    has_subagent = "subagent" in {
+        tool.name if hasattr(tool, "name") else str(tool) for tool in tools
+    }
+
     if is_en:
         lines = [
             "## 🔧 Tooling",
@@ -262,11 +301,20 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "Tool-calling style:",
             "",
             "- For multi-step tasks, complex decisions or sensitive operations, briefly explain what you are doing and why, so the user follows key progress",
+            "- Never just announce intent and stop: if you say you will do something, actually call the tool in the same turn. A text-only reply ends the turn, so only reply with plain text once the work is genuinely finished",
             "- Keep going until the task is done, then report the result to the user",
             "- Always redact secrets, tokens and other sensitive info in replies",
             "- Put URLs directly in the reply text; the system handles and renders them. Don't download and re-send them via the send tool",
             "",
         ]
+        if has_subagent:
+            # One line, and only the part the tool description cannot do for
+            # itself: get the model to consider delegating at all. When and how
+            # belong in the description, which it reads once it looks.
+            lines.insert(
+                -1,
+                "- Hand a self-contained task that needs research, search or information gathering to `subagent`: one task, or several at once via tasks running in parallel; it brings back the conclusion",
+            )
     else:
         lines = [
             "## 🔧 工具系统",
@@ -277,11 +325,17 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "工具调用风格：",
             "",
             "- 多步骤任务、复杂决策、敏感操作时，应简要说明当前在做什么、为什么这样做，让用户了解关键进展",
+            "- 不要只宣告意图就停下：一旦你说要做某事，就必须在同一轮真正发起工具调用。纯文本回复会立即结束本轮，因此只有在任务真正完成后才用纯文本收尾",
             "- 持续推进直到任务完成，完成后向用户报告结果",
             "- 回复中涉及密钥、令牌等敏感信息必须脱敏",
             "- URL链接直接放在回复文本中即可，系统会自动处理和渲染。无需下载后使用send工具发送",
             "",
         ]
+        if has_subagent:
+            lines.insert(
+                -1,
+                "- 需要深入调研、搜索或信息采集的独立任务，交给 `subagent`：可以单个任务，也可以用 tasks 同时执行多个任务，`subagent` 负责把结论带回来",
+            )
 
     return lines
 
@@ -350,10 +404,43 @@ def _build_skills_section(skill_manager: Any, tools: Optional[List[Any]], langua
     return lines
 
 
-def _build_memory_section(memory_manager: Any, tools: Optional[List[Any]], language: str) -> List[str]:
-    """Build the memory section."""
+def _state_path_prefix(workspace_dir: str, project_dir: Optional[str]) -> str:
+    """Absolute prefix for state files (memory/knowledge) under ``workspace_dir``.
+
+    In project mode the cwd is the project, so a bare ``MEMORY.md`` would resolve
+    into the project. Memory and knowledge must stay in ``workspace_dir``, so we
+    prefix them with its absolute path. Default mode returns "" (paths unchanged).
+    """
+    if not project_dir:
+        return ""
+    import os as _os
+    if _os.path.realpath(_os.path.expanduser(project_dir)) == _os.path.realpath(
+        _os.path.expanduser(workspace_dir)
+    ):
+        return ""
+    return workspace_dir.rstrip("/") + "/"
+
+
+def _build_memory_section(
+    memory_manager: Any,
+    tools: Optional[List[Any]],
+    language: str,
+    workspace_dir: str = "",
+    project_dir: Optional[str] = None,
+) -> List[str]:
+    """Build the memory section.
+
+    ``workspace_dir``/``project_dir`` let project-mode sessions keep memory paths
+    anchored to ``workspace_dir`` (absolute) instead of the project cwd.
+    """
     if not memory_manager:
         return []
+
+    # In project mode, memory files must be addressed absolutely under ~/cow.
+    p = _state_path_prefix(workspace_dir, project_dir)
+    mem_md = f"{p}MEMORY.md"
+    mem_dir = f"{p}memory"
+    kb_dir = f"{p}knowledge"
 
     has_memory_tools = False
     if tools:
@@ -379,10 +466,10 @@ def _build_memory_section(memory_manager: Any, tools: Optional[List[Any]], langu
             "2. Location known → `memory_get` to read the exact lines",
             "3. Search returns nothing → `memory_get` to read the last two days of memory",
             "",
-            "**Memory file structure**:",
-            "- `MEMORY.md`: long-term memory index (already auto-loaded into context: core info, preferences, decisions, etc.)",
-            f"- `memory/YYYY-MM-DD.md`: daily memory; today is `memory/{today_file}`",
-            "- `knowledge/`: structured knowledge base (see the knowledge system below)",
+        "**Memory file structure**:",
+        f"- `{mem_md}`: long-term memory index (already auto-loaded into context: core info, preferences, decisions, etc.)",
+        f"- `{mem_dir}/YYYY-MM-DD.md`: daily memory; today is `{mem_dir}/{today_file}`",
+        f"- `{kb_dir}/`: structured knowledge base (see the knowledge system below)",
             "",
             "### Writing memory",
             "",
@@ -393,10 +480,10 @@ def _build_memory_section(memory_manager: Any, tools: Optional[List[Any]], langu
             "- The conversation produces an important conclusion, plan or agreement",
             "- A complex task is completed and the key steps and results are worth recording",
             "",
-            "**Storage rules**:",
-            "- Long-term core info → `MEMORY.md`",
-            f"- Today's events/progress → `memory/{today_file}`",
-            "- Structured knowledge → `knowledge/` (see the knowledge system)",
+        "**Storage rules**:",
+        f"- Long-term core info → `{mem_md}`",
+        f"- Today's events/progress → `{mem_dir}/{today_file}`",
+        f"- Structured knowledge → `{kb_dir}/` (see the knowledge system)",
             "- Append → `edit` tool with empty oldText",
             "- Modify → `edit` tool with oldText set to the text to replace",
             "- **Never write sensitive info** (API keys, tokens, etc.)",
@@ -418,9 +505,9 @@ def _build_memory_section(memory_manager: Any, tools: Optional[List[Any]], langu
             "3. search 无结果 → `memory_get` 读最近两天记忆",
             "",
             "**记忆文件结构**:",
-            "- `MEMORY.md`: 长期记忆索引（已自动加载到上下文，核心信息、偏好、决策等）",
-            f"- `memory/YYYY-MM-DD.md`: 每日记忆，今天是 `memory/{today_file}`",
-            "- `knowledge/`: 结构化知识库（见下方知识系统）",
+            f"- `{mem_md}`: 长期记忆索引（已自动加载到上下文，核心信息、偏好、决策等）",
+            f"- `{mem_dir}/YYYY-MM-DD.md`: 每日记忆，今天是 `{mem_dir}/{today_file}`",
+            f"- `{kb_dir}/`: 结构化知识库（见下方知识系统）",
             "",
             "### 写入记忆",
             "",
@@ -432,9 +519,9 @@ def _build_memory_section(memory_manager: Any, tools: Optional[List[Any]], langu
             "- 完成了复杂任务，值得记录关键步骤和结果",
             "",
             "**存储规则**:",
-            f"- 长期核心信息 → `MEMORY.md`",
-            f"- 当天事件/进展 → `memory/{today_file}`",
-            "- 结构化知识 → `knowledge/`（见知识系统）",
+            f"- 长期核心信息 → `{mem_md}`",
+            f"- 当天事件/进展 → `{mem_dir}/{today_file}`",
+            f"- 结构化知识 → `{kb_dir}/`（见知识系统）",
             "- 追加 → `edit` 工具，oldText 留空",
             "- 修改 → `edit` 工具，oldText 填写要替换的文本",
             "- **禁止写入敏感信息**（API密钥、令牌等）",
@@ -446,9 +533,19 @@ def _build_memory_section(memory_manager: Any, tools: Optional[List[Any]], langu
     return lines
 
 
-def _build_knowledge_section(workspace_dir: str, language: str) -> List[str]:
-    """Build knowledge wiki section. Injects knowledge/index.md when present."""
-    index_path = os.path.join(workspace_dir, "knowledge", "index.md")
+def _build_knowledge_section(
+    workspace_dir: str, language: str, project_dir: Optional[str] = None
+) -> List[str]:
+    """Build knowledge wiki section. Injects knowledge/index.md when present.
+
+    In project mode ``project_dir`` anchors knowledge paths to ``workspace_dir``
+    (absolute) so writes don't leak into the project cwd.
+    """
+    # Resolve through state_dir so an Agent on the shared base (no knowledge/ of
+    # its own) still gets the shared index injected, not an empty local one.
+    from common import state_dir
+    knowledge_root = str(state_dir.knowledge_dir(base=workspace_dir))
+    index_path = os.path.join(knowledge_root, "index.md")
     if not os.path.exists(index_path):
         return []
 
@@ -458,22 +555,25 @@ def _build_knowledge_section(workspace_dir: str, language: str) -> List[str]:
     except Exception:
         return []
 
+    # Anchor knowledge paths to ~/cow when a project cwd is active.
+    kb = f"{_state_path_prefix(workspace_dir, project_dir)}knowledge"
+
     if language == "en":
         lines = [
             "## 📚 Knowledge",
             "",
-            "You have a continuously growing personal knowledge base `knowledge/` — your long-term structured knowledge store.",
+            f"You have a continuously growing personal knowledge base `{kb}/` — your long-term structured knowledge store.",
             "",
             "### Auto-write rules (mandatory)",
             "",
             "In the following cases you **must** write to the knowledge base alongside your reply, **directly, without asking the user**:",
             "",
-            "1. **User shares an article / link / document** → after reading and understanding, write the key points to `knowledge/sources/<slug>.md` in the same turn",
-            "2. **An in-depth discussion produces a conclusion / plan** → organize it into `knowledge/analysis/<slug>.md`",
-            "3. **The conversation involves an important entity** (person / company / project) → create or update `knowledge/entities/<name>.md`",
-            "4. **A technical concept / methodology is discussed** → organize it into `knowledge/concepts/<topic>.md`",
+            f"1. **User shares an article / link / document** → after reading and understanding, write the key points to `{kb}/sources/<slug>.md` in the same turn",
+            f"2. **An in-depth discussion produces a conclusion / plan** → organize it into `{kb}/analysis/<slug>.md`",
+            f"3. **The conversation involves an important entity** (person / company / project) → create or update `{kb}/entities/<name>.md`",
+            f"4. **A technical concept / methodology is discussed** → organize it into `{kb}/concepts/<topic>.md`",
             "",
-            "After writing any knowledge page, you **must update** `knowledge/index.md` with a new index line in sync.",
+            f"After writing any knowledge page, you **must update** `{kb}/index.md` with a new index line in sync.",
             "For detailed page format and conventions, read the SKILL.md of the `knowledge-wiki` skill.",
             "",
             "⚠️ Don't ask \"should I save this to the knowledge base?\" — if a case above matches, just write it. This is instinctive.",
@@ -483,18 +583,18 @@ def _build_knowledge_section(workspace_dir: str, language: str) -> List[str]:
         lines = [
             "## 📚 知识系统",
             "",
-            "你拥有一个持续积累的个人知识库 `knowledge/`，这是你的长期结构化知识存储。",
+            f"你拥有一个持续积累的个人知识库 `{kb}/`，这是你的长期结构化知识存储。",
             "",
             "### 自动写入规则（mandatory）",
             "",
             "以下场景**必须**在回复的同时写入知识库，**直接写入，不要询问用户是否需要**：",
             "",
-            "1. **用户分享了文章/链接/文档** → 阅读理解后，在同一轮回复中将要点写入 `knowledge/sources/<slug>.md`",
-            "2. **深度讨论产生了结论/方案** → 整理为 `knowledge/analysis/<slug>.md`",
-            "3. **对话涉及重要实体**（人物/公司/项目）→ 创建或更新 `knowledge/entities/<name>.md`",
-            "4. **讨论了技术概念/方法论** → 整理为 `knowledge/concepts/<topic>.md`",
+            f"1. **用户分享了文章/链接/文档** → 阅读理解后，在同一轮回复中将要点写入 `{kb}/sources/<slug>.md`",
+            f"2. **深度讨论产生了结论/方案** → 整理为 `{kb}/analysis/<slug>.md`",
+            f"3. **对话涉及重要实体**（人物/公司/项目）→ 创建或更新 `{kb}/entities/<name>.md`",
+            f"4. **讨论了技术概念/方法论** → 整理为 `{kb}/concepts/<topic>.md`",
             "",
-            "每次写入知识页面后，**必须同步更新** `knowledge/index.md` 添加一行索引。",
+            f"每次写入知识页面后，**必须同步更新** `{kb}/index.md` 添加一行索引。",
             "详细的页面格式和操作规范，请读取技能 `knowledge-wiki` 的 SKILL.md。",
             "",
             "⚠️ 不要问「要不要存到知识库」——符合上述场景就直接写入，这是你的本能行为。",
@@ -550,8 +650,35 @@ def _build_docs_section(workspace_dir: str, language: str) -> List[str]:
     return []
 
 
-def _build_workspace_section(workspace_dir: str, language: str) -> List[str]:
-    """Build the workspace section."""
+def _build_workspace_section(
+    workspace_dir: str, language: str, context_files_loaded: bool = True,
+    project_dir: Optional[str] = None,
+) -> List[str]:
+    """Build the workspace section.
+
+    ``context_files_loaded`` gates the two blocks that are only true for an
+    Agent serving a user directly. A sub agent gets neither the context files
+    nor a user to talk to, so telling it that AGENT.md is already loaded would
+    both misinform it and talk it out of reading the workspace rules itself.
+
+    ``project_dir`` switches the section to the dual-directory layout used when
+    the user has pointed the session at a project: the *project* is the working
+    directory (relative paths, artifacts) while the Agent's workspace stays the
+    *system* directory (memory/skills), reached with absolute paths.
+    """
+    normalized_project = None
+    if project_dir:
+        import os as _os
+        if _os.path.realpath(_os.path.expanduser(project_dir)) != _os.path.realpath(
+            _os.path.expanduser(workspace_dir or "")
+        ):
+            normalized_project = project_dir
+
+    if normalized_project:
+        return _build_project_workspace_section(
+            workspace_dir, normalized_project, language, context_files_loaded
+        )
+
     if language == "en":
         lines = [
             "## 📂 Workspace",
@@ -574,24 +701,27 @@ def _build_workspace_section(workspace_dir: str, language: str) -> List[str]:
             "",
             "4. **When unsure**: run `bash pwd` to confirm the current directory, or `ls .` to see where you are",
             "",
-            "**Important - files already auto-loaded**:",
-            "",
-            "The following files are **already auto-loaded** into the system prompt at session start, so you **don't need to read them again with the read tool**:",
-            "",
-            "- ✅ `AGENT.md`: loaded - your persona and soul; follow it strictly. When your name, personality or style changes, proactively `edit` this file",
-            "- ✅ `USER.md`: loaded - the user's identity info. When the user changes how they're addressed, their name, etc., `edit` this file",
-            "- ✅ `RULE.md`: loaded - workspace guide and rules; follow them strictly",
-            "- ✅ `MEMORY.md`: loaded - long-term memory index",
-            "",
-            "**💬 Communication norms**:",
-            "",
-            "- No need to expose file names for memory operations; use natural language. Say \"I'll remember that\" rather than \"updated MEMORY.md\"",
-            "- Tell the user about key decisions and steps during a task, so they know what you're doing and why",
-            "- Be genuinely helpful rather than performatively polite; solve the problem as much as you can",
-            "- Keep replies well-structured and focused. Use **bold**, lists and sections to make info clear at a glance",
-            "- Use emoji to make expression lively 🎯, but don't overdo it",
-            "",
         ]
+        if context_files_loaded:
+            lines += [
+                "**Important - files already auto-loaded**:",
+                "",
+                "The following files are **already auto-loaded** into the system prompt at session start, so you **don't need to read them again with the read tool**:",
+                "",
+                "- ✅ `AGENT.md`: loaded - your persona and soul; follow it strictly. When your name, personality or style changes, proactively `edit` this file",
+                "- ✅ `USER.md`: loaded - the user's identity info. When the user changes how they're addressed, their name, etc., `edit` this file",
+                "- ✅ `RULE.md`: loaded - workspace guide and rules; follow them strictly",
+                "- ✅ `MEMORY.md`: loaded - long-term memory index",
+                "",
+                "**💬 Communication norms**:",
+                "",
+                "- No need to expose file names for memory operations; use natural language. Say \"I'll remember that\" rather than \"updated MEMORY.md\"",
+                "- Tell the user about key decisions and steps during a task, so they know what you're doing and why",
+                "- Be genuinely helpful rather than performatively polite; solve the problem as much as you can",
+                "- Keep replies well-structured and focused. Use **bold**, lists and sections to make info clear at a glance",
+                "- Use emoji to make expression lively 🎯, but don't overdo it",
+                "",
+            ]
     else:
         lines = [
             "## 📂 工作空间",
@@ -614,30 +744,109 @@ def _build_workspace_section(workspace_dir: str, language: str) -> List[str]:
             "",
             "4. **不确定时**: 先用 `bash pwd` 确认当前目录，或用 `ls .` 查看当前位置",
             "",
-            "**重要说明 - 文件已自动加载**:",
-            "",
-            "以下文件在会话启动时**已经自动加载**到系统提示词中，你**无需再用 read 工具读取**：",
-            "",
-            "- ✅ `AGENT.md`: 已加载 - 你的人格和灵魂设定，请严格遵循。当你的名字、性格或交流风格发生变化时，主动用 `edit` 更新此文件",
-            "- ✅ `USER.md`: 已加载 - 用户的身份信息。当用户修改称呼、姓名等身份信息时，用 `edit` 更新此文件",
-            "- ✅ `RULE.md`: 已加载 - 工作空间使用指南和规则，请严格遵循",
-            "- ✅ `MEMORY.md`: 已加载 - 长期记忆索引",
-            "",
-            "**💬 交流规范**:",
-            "",
-            "- 记忆相关操作无需暴露文件名，用自然语言表达即可。例如说「我已记住」而非「已更新 MEMORY.md」",
-            "- 任务执行过程中的关键决策和步骤应该告知用户，让用户了解你在做什么、为什么这么做",
-            "- 做真正有帮助的助手，而不是表演式的客套，尽可能帮忙解决问题",
-            "- 回复应结构清晰、重点突出。善用 **加粗**、列表、分段等格式让信息一目了然",
-            "- 适当使用 emoji 让表达更生动自然 🎯，但不要过度堆砌",
-            "",
         ]
+        if context_files_loaded:
+            lines += [
+                "**重要说明 - 文件已自动加载**:",
+                "",
+                "以下文件在会话启动时**已经自动加载**到系统提示词中，你**无需再用 read 工具读取**：",
+                "",
+                "- ✅ `AGENT.md`: 已加载 - 你的人格和灵魂设定，请严格遵循。当你的名字、性格或交流风格发生变化时，主动用 `edit` 更新此文件",
+                "- ✅ `USER.md`: 已加载 - 用户的身份信息。当用户修改称呼、姓名等身份信息时，用 `edit` 更新此文件",
+                "- ✅ `RULE.md`: 已加载 - 工作空间使用指南和规则，请严格遵循",
+                "- ✅ `MEMORY.md`: 已加载 - 长期记忆索引",
+                "",
+                "**💬 交流规范**:",
+                "",
+                "- 记忆相关操作无需暴露文件名，用自然语言表达即可。例如说「我已记住」而非「已更新 MEMORY.md」",
+                "- 任务执行过程中的关键决策和步骤应该告知用户，让用户了解你在做什么、为什么这么做",
+                "- 做真正有帮助的助手，而不是表演式的客套，尽可能帮忙解决问题",
+                "- 回复应结构清晰、重点突出。善用 **加粗**、列表、分段等格式让信息一目了然",
+                "- 适当使用 emoji 让表达更生动自然 🎯，但不要过度堆砌",
+                "",
+            ]
 
     # Cloud deployment: inject websites directory info and access URL
     cloud_website_lines = _build_cloud_website_section(workspace_dir)
     if cloud_website_lines:
         lines.extend(cloud_website_lines)
     
+    return lines
+
+
+def _build_project_workspace_section(
+    workspace_dir: str, project_dir: str, language: str, context_files_loaded: bool
+) -> List[str]:
+    """Workspace section for a session pointed at a project directory.
+
+    Two directories are in play and the model must not confuse them:
+    - Project directory (the current working dir): relative paths and work
+      products (documents, code, generated files, etc.) live here.
+    - System directory (``workspace_dir``, e.g. ``~/cow``): memory and skills
+      live here and are reached with absolute paths, never relative ones.
+    """
+    if language == "en":
+        lines = [
+            "## 📂 Workspace",
+            "",
+            "The user has opened a **project directory**. You are working inside the current project directory.",
+            "",
+            f"- **Project directory (current working dir)**: `{project_dir}`",
+            f"- **System directory (memory & skills)**: `{workspace_dir}`",
+            "",
+            "**Path rules** (very important):",
+            "",
+            f"1. **Relative paths are based on the project directory** `{project_dir}`. Put your work products here (documents, code, generated files, etc.).",
+            f"   - ✅ relative `output/report.html` → `{project_dir}/output/report.html`",
+            "",
+            f"2. **Memory and skills stay in the system directory** `{workspace_dir}`. Never write them into the project. Memory tools handle this for you; if you ever touch these files directly, use **absolute paths** under the system directory.",
+            f"   - ✅ absolute `{workspace_dir}/MEMORY.md`",
+            f"   - ❌ relative `MEMORY.md` (that would land in the project, which is wrong)",
+            "",
+            "3. **Accessing any other directory**: use absolute paths.",
+            "",
+            "4. **When unsure**: run `bash pwd` to confirm you are in the project directory.",
+            "",
+        ]
+    else:
+        lines = [
+            "## 📂 工作空间",
+            "",
+            "用户已打开一个**项目目录**，你正在当前项目目录中工作。",
+            "",
+            f"- **项目目录（当前工作目录）**: `{project_dir}`",
+            f"- **系统目录（记忆与技能）**: `{workspace_dir}`",
+            "",
+            "**路径使用规则** (非常重要):",
+            "",
+            f"1. **相对路径基于项目目录** `{project_dir}`。你的工作产物（文档、代码、生成的文件等）都放在这里。",
+            f"   - ✅ 相对路径 `output/report.html` → `{project_dir}/output/report.html`",
+            "",
+            f"2. **记忆和技能仍在系统目录** `{workspace_dir}`，不要写入项目目录。记忆操作由记忆工具自动完成；若确需直接访问这些文件，请使用系统目录下的**绝对路径**。",
+            f"   - ✅ 绝对路径 `{workspace_dir}/MEMORY.md`",
+            f"   - ❌ 相对路径 `MEMORY.md`（那会落到项目目录里，是错误的）",
+            "",
+            "3. **访问其他任意目录**：使用绝对路径。",
+            "",
+            "4. **不确定时**：用 `bash pwd` 确认当前处于项目目录。",
+            "",
+        ]
+
+    if context_files_loaded:
+        if language == "en":
+            lines += [
+                "**Files already auto-loaded** (no need to `read` again): `AGENT.md`, `USER.md`, `RULE.md`, `MEMORY.md` (from the system directory).",
+                "",
+            ]
+        else:
+            lines += [
+                "**已自动加载的文件**（无需再次 `read`）：`AGENT.md`、`USER.md`、`RULE.md`、`MEMORY.md`（来自系统目录）。",
+                "",
+            ]
+
+    cloud_website_lines = _build_cloud_website_section(workspace_dir)
+    if cloud_website_lines:
+        lines.extend(cloud_website_lines)
     return lines
 
 
@@ -694,6 +903,87 @@ def _build_context_files_section(context_files: List[ContextFile], language: str
         lines.append("")
     
     return lines
+
+
+def _build_team_section(runtime_info: Dict[str, Any], language: str) -> List[str]:
+    """Name the other Agents sharing this conversation, if any. Empty for one.
+
+    Addressing someone by name is routing, not delegation: the named Agent is
+    already the one reading this prompt, so handover is left for work nobody
+    was asked for by name.
+
+    States the Agent's own name, which nothing else in the prompt does. Without
+    it a mention reads as a third party and the Agent declines to answer on
+    that stranger's behalf.
+    """
+    teammates = runtime_info.get("teammates")
+    getter = runtime_info.get("_get_teammates")
+    if callable(getter):
+        try:
+            teammates = getter()
+        except Exception as e:
+            logger.warning(f"[PromptBuilder] Failed to resolve teammates: {e}")
+    if not teammates:
+        return []
+
+    # One line each, with what they are for: a bare list of names is enough to
+    # address someone but not to decide whether the work is theirs.
+    roster = []
+    for item in teammates:
+        if not item.get("id"):
+            continue
+        line = f"{item.get('name') or item['id']}(@{item['id']})"
+        if item.get("description"):
+            line += f"：{item['description']}" if language != "en" else f" — {item['description']}"
+        roster.append(line)
+    if not roster:
+        return []
+
+    own_id = runtime_info.get("agent_id") or ""
+    own_name = runtime_info.get("agent_name") or own_id
+    whoami = f"{own_name}(@{own_id})" if own_id else own_name
+
+    if language == "en":
+        return [
+            "## 👥 Team conversation",
+            "",
+            f"You are {whoami}. Also in this conversation:",
+            "",
+            *[f"- {line}" for line in roster],
+            "",
+            "Everyone here reads the same history. A teammate's earlier "
+            "reply is shown as `Name(@id)：` before their words; an unmarked "
+            "one is your own. Do not take a teammate's work, or their "
+            "promises, for yours.",
+            "",
+            "This turn is yours to answer. Answer as yourself, and do NOT "
+            "prefix your reply with your own name or id — that label is only "
+            "how others' past turns are shown to you.",
+            "",
+            "Use agent_delegate for work that belongs to a teammate, passing "
+            "their id above as agent_id (without the @), and say who you handed "
+            "it to and what you asked for. Refer to teammates by name to the "
+            "user, without the @id — the id is internal.",
+            "",
+        ]
+    return [
+        "## 👥 团队会话",
+        "",
+        f"你是 {whoami}。同在这个会话里的还有：",
+        "",
+        *[f"- {line}" for line in roster],
+        "",
+        "大家读到的是同一份记录。以「名字(@id)：」开头的是那位同事说过的话，"
+        "没有前缀的才是你自己说的。不要把同事做过的事、许下的承诺当成你的。",
+        "",
+        "这一轮由你来回答，以你自己的身份回答即可，回答时不要在开头加自己的名字或 id "
+        "前缀（前缀只是用来向你标记其他成员的历史发言）。",
+        "",
+        "该由某位同事做的事，用 agent_delegate 交出去：把那位同事上面的 id "
+        "作为 agent_id 传入 (不含@符号)，并说明交给了谁、交办了什么。对用户提到同事时只用名字，"
+        "不要带 @id，id 只用于内部。",
+        "",
+    ]
 
 
 def _build_runtime_section(runtime_info: Dict[str, Any], language: str) -> List[str]:

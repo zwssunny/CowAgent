@@ -1,5 +1,10 @@
 numpy>=1.21
-aiohttp>=3.8.6,<3.10
+# markdown structure-aware chunking for memory/knowledge md files (chunker.chunk_markdown)
+markdown-it-py>=3.0.0
+# aiohttp<3.10 has no prebuilt wheels for Python 3.13+, so pip would compile from
+# source (needs MSVC on Windows). Use >=3.10 on 3.13+ where cp313 wheels exist.
+aiohttp>=3.8.6,<3.10; python_version < "3.13"
+aiohttp>=3.10; python_version >= "3.13"
 requests>=2.28.2
 chardet>=5.1.0
 Pillow
@@ -9,12 +14,14 @@ croniter>=2.0.0
 click>=8.0
 qrcode
 json-repair
+# search_files tool: regex.search() supports a real per-call timeout, stdlib re does not
+regex>=2019.3.12
 
 # wechatcom & wechatmp
 wechatpy
 
-# zhipuai
-zai-sdk
+# zhipuai (>=0.2.3 required for GLM-5.3 reasoning_effort support)
+zai-sdk>=0.2.3
 # tongyi qwen sdk
 dashscope
 

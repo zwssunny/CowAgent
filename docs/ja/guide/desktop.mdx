@@ -5,7 +5,9 @@ description: CowAgent デスクトップクライアント（macOS / Windows）�
 
 CowAgent は、Agent の実行環境を内蔵したすぐに使えるデスクトップクライアントを提供しています。**Python や依存関係を手動でインストールする必要はありません**。ダウンロードしてインストールするだけで、ローカルでスーパー AI アシスタントを実行できます。
 
-<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/desktop-chat-demo-en.png" alt="CowAgent デスクトップクライアント" />
+<Frame caption="ブラウザ、ターミナル、ファイルシステムを直接操作し、長期記憶、パーソナルナレッジベース、自己進化を備え、すべてローカルで実行されます。">
+  <video controls preload="metadata" playsInline className="w-full rounded-xl" src="https://cdn.cowagent.ai/desktop/video/cow-demo-en-v1.mp4" />
+</Frame>
 
 ## ダウンロードとインストール
 
@@ -40,6 +42,8 @@ CowAgent は、Agent の実行環境を内蔵したすぐに使えるデスク�
 ## ブラウザからのアクセス
 
 デスクトップクライアントは起動するとローカルでポート `9876` をリッスンし、そのバックエンドは Web コンソールとまったく同じです。そのため、アプリを開いている間はブラウザで `http://localhost:9876` にアクセスすれば、クライアント UI と同じ完全な体験が得られます。
+
+このポートが使用できない場合（Windows で Hyper-V/WSL2 に予約されている場合など）、クライアントは自動的に別のポートへフォールバックして正常に起動します。実際のポートは `run.log` の `Local access` 行で確認でき、`config.json` の `web_port` で固定することもできます。
 
 ## ローカルデータの保存
 

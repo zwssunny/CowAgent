@@ -29,6 +29,7 @@ from agent.tools.base_tool import BaseTool, ToolResult
 from agent.tools.utils.url_safety import validate_url_safe
 from common import const
 from common.log import logger
+from common.utils import expand_path
 from config import conf
 
 DEFAULT_MODEL = const.GPT_41_MINI
@@ -52,13 +53,14 @@ _MAIN_MODEL_PROVIDER_NAME = "MainModel"
 _DISCOVERABLE_MODELS = [
     ("moonshot_api_key", const.MOONSHOT, const.KIMI_K2_6, "Moonshot"),
     ("ark_api_key", const.DOUBAO, const.DOUBAO_SEED_2_PRO, "Doubao"),
-    ("dashscope_api_key", const.QWEN_DASHSCOPE, const.QWEN37_PLUS, "DashScope"),
+    ("dashscope_api_key", const.QWEN_DASHSCOPE, const.QWEN38_FLASH, "DashScope"),
     ("claude_api_key", const.CLAUDEAPI, const.CLAUDE_SONNET_5, "Claude"),
-    ("gemini_api_key", const.GEMINI, const.GEMINI_35_FLASH, "Gemini"),
+    ("gemini_api_key", const.GEMINI, const.GEMINI_38_FLASH, "Gemini"),
     ("qianfan_api_key", const.QIANFAN, const.ERNIE_45_TURBO_VL, "Qianfan"),
     ("zhipu_ai_api_key", const.ZHIPU_AI, const.GLM_4_7, "ZhipuAI"),
     ("minimax_api_key", const.MiniMax, const.MINIMAX_M2_7, "MiniMax"),
     ("mimo_api_key", const.MIMO, const.MIMO_V2_5_PRO, "MiMo"),
+    ("deepseek_api_key", const.DEEPSEEK, const.DEEPSEEK_FLASH, "DeepSeek"),
 ]
 
 # Model name prefix → discoverable provider display_name.
@@ -76,6 +78,7 @@ _MODEL_PREFIX_TO_PROVIDER = [
     ("minimax-", "MiniMax"),
     ("abab", "MiniMax"),
     ("mimo-", "MiMo"),
+    ("deepseek-", "DeepSeek"),
 ]
 
 # Model prefixes that natively belong to OpenAI / LinkAI (raw HTTP providers).
@@ -96,6 +99,7 @@ _PROVIDER_ID_TO_DISPLAY = {
     "zhipu": "ZhipuAI",
     "minimax": "MiniMax",
     "mimo": "MiMo",
+    "deepseek": "DeepSeek",
 }
 
 
@@ -142,6 +146,15 @@ class Vision(BaseTool):
 
     def __init__(self, config: dict = None):
         self.config = config or {}
+        # Declaring cwd is also what makes the bridge inject the workspace.
+        self.cwd = self.config.get("cwd", os.getcwd())
+
+    def _resolve_path(self, path: str) -> str:
+        """Resolve a local image path the same way the file tools do."""
+        path = expand_path(path)
+        if os.path.isabs(path):
+            return path
+        return os.path.abspath(os.path.join(self.cwd, path))
 
     @staticmethod
     def is_available() -> bool:
@@ -162,7 +175,7 @@ class Vision(BaseTool):
                 "Error: No model available for Vision.\n"
                 "The main model does not support vision and no other API keys are configured.\n"
                 "Options:\n"
-                "  1. Switch to a multimodal model (e.g. claude-sonnet-5, qwen3.7-plus, gemini-2.0-flash, ernie-4.5-turbo-vl)\n"
+                "  1. Switch to a multimodal model (e.g. claude-sonnet-5, qwen3.8-flash, gemini-2.0-flash, ernie-4.5-turbo-vl)\n"
                 "  2. Configure OPENAI_API_KEY: env_config(action=\"set\", key=\"OPENAI_API_KEY\", value=\"your-key\")\n"
                 "  3. Configure LINKAI_API_KEY: env_config(action=\"set\", key=\"LINKAI_API_KEY\", value=\"your-key\")"
             )
@@ -274,6 +287,20 @@ class Vision(BaseTool):
         p = builder()
         if p:
             providers.append(p)
+
+    def _current_main_model(self) -> str:
+        """The model name the *current agent* actually runs on.
+
+        Sessions can pin their own model (e.g. claude-sonnet-5) via a session
+        override, so the global ``conf().get("model")`` (e.g. deepseek-v4-flash)
+        is the wrong source — forwarding it to the session's real bot causes a
+        vendor-foreign 404 (a Claude bot asked for deepseek-v4-flash). Prefer
+        the bridge's resolved model, fall back to global config.
+        """
+        model = getattr(self.model, "model", None)
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        return conf().get("model") or ""
 
     @staticmethod
     def _resolve_user_vision_model() -> Optional[str]:
@@ -456,7 +483,7 @@ class Vision(BaseTool):
         main_bot_type = None
         main_bot_supports_vision = False
         if self.model and hasattr(self.model, '_resolve_bot_type'):
-            main_bot_type = self.model._resolve_bot_type(conf().get("model", ""))
+            main_bot_type = self.model._resolve_bot_type(self._current_main_model())
             main_bot = getattr(self.model, "bot", None)
             main_bot_supports_vision = self._main_bot_supports_vision(main_bot)
 
@@ -526,7 +553,7 @@ class Vision(BaseTool):
             return False
         if hasattr(bot, "supports_vision"):
             return bool(getattr(bot, "supports_vision"))
-        main_model = (conf().get("model") or "").lower()
+        main_model = self._current_main_model().lower()
         if not main_model:
             return False
         if main_model.startswith(_OPENAI_MODEL_PREFIXES):
@@ -550,11 +577,11 @@ class Vision(BaseTool):
         if not self._main_bot_supports_vision(bot):
             return None
 
-        # Use the configured main model name; do NOT inject tools.vision.model
-        # here, because by the time we reach this branch the tools.vision.model
-        # routing has already been attempted (and either matched the main bot
-        # or failed to find a provider).
-        main_model_name = conf().get("model") or None
+        # Use the *current agent's* main model name (session override aware);
+        # do NOT inject tools.vision.model here, because by the time we reach
+        # this branch the tools.vision.model routing has already been attempted
+        # (and either matched the main bot or failed to find a provider).
+        main_model_name = self._current_main_model() or None
 
         return VisionProvider(
             name=_MAIN_MODEL_PROVIDER_NAME,
@@ -715,8 +742,13 @@ class Vision(BaseTool):
             self._validate_url_safe(image)
             return self._download_to_data_url(image)
 
-        if not os.path.isfile(image):
-            raise FileNotFoundError(f"Image file not found: {image}")
+        resolved = self._resolve_path(image)
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(
+                f"Image file not found: {image}"
+                + (f" (resolved to {resolved})" if resolved != image else "")
+            )
+        image = resolved
 
         ext = image.rsplit(".", 1)[-1].lower() if "." in image else ""
         mime_type = SUPPORTED_EXTENSIONS.get(ext)

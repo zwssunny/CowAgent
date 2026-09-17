@@ -127,7 +127,7 @@ class MemoryService:
 
         :param filename: File name, e.g. ``MEMORY.md``, ``2026-02-20.md``
         :param category: ``"memory"``, ``"dream"`` or ``"evolution"``
-        :return: dict with ``filename`` and ``content``
+        :return: dict with ``filename``, ``rel_path`` and ``content``
         :raises FileNotFoundError: if the file does not exist
         """
         path = self._resolve_path(filename, category)
@@ -139,6 +139,10 @@ class MemoryService:
 
         return {
             "filename": filename,
+            # Where this file sits under the workspace root. A caller that wants
+            # to edit it can then address it through the workspace file API
+            # instead of re-deriving the layout from filename plus category.
+            "rel_path": self._to_rel(path),
             "content": content,
         }
 
@@ -211,6 +215,11 @@ class MemoryService:
             raise ValueError(f"Invalid filename: path traversal detected")
 
         return resolved
+
+    def _to_rel(self, path: str) -> str:
+        """Path relative to the workspace root, with forward slashes."""
+        root = os.path.realpath(self.workspace_root)
+        return os.path.relpath(path, root).replace(os.sep, "/")
 
     @staticmethod
     def _file_info(path: str, filename: str, file_type: str) -> dict:

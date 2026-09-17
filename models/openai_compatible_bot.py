@@ -108,6 +108,21 @@ class OpenAICompatibleBot:
             
             # Build request parameters
             model_name = kwargs.get("model", api_config.get('model', 'gpt-5.4'))
+
+            # Models like gpt-6-astra only support tool calling via the Responses
+            # API (Chat Completions rejects tools with a non-"none" reasoning
+            # effort, and Astra has no "none"). Route them through Responses and
+            # translate the result back to Chat-Completions shape.
+            from models.openai import responses_adapter as responses_adapter
+            if responses_adapter.is_responses_only_model(model_name):
+                return self._call_with_tools_responses(
+                    model_name=model_name,
+                    messages=messages,
+                    tools=tools,
+                    stream=stream,
+                    api_config=api_config,
+                    kwargs=kwargs,
+                )
             request_params = {
                 "model": model_name,
                 "messages": messages,
@@ -117,6 +132,14 @@ class OpenAICompatibleBot:
                 "presence_penalty": kwargs.get("presence_penalty", api_config.get('default_presence_penalty', 0.0)),
                 "stream": stream
             }
+            # Ask for a final usage chunk on streaming calls so the agent can
+            # surface a real prompt_tokens count (context-usage indicator)
+            # instead of the char-based estimate. Providers that don't support
+            # stream_options simply ignore it or omit the usage chunk, in which
+            # case the agent falls back to the estimate — so this is safe to
+            # always request on the OpenAI-compatible path.
+            if stream:
+                request_params["stream_options"] = {"include_usage": True}
             # GPT-5.x / o-series reasoning models only accept default
             # temperature/top_p and reject penalty params.
             is_gpt5_reasoning = self._is_gpt5_reasoning_model(model_name)
@@ -166,6 +189,69 @@ class OpenAICompatibleBot:
                     "status_code": 500
                 }
     
+    def _call_with_tools_responses(self, *, model_name, messages, tools, stream,
+                                   api_config, kwargs):
+        """Tool-calling path for Responses-only models (e.g. gpt-6-astra).
+
+        Builds a Responses request from the already-converted OpenAI-shaped
+        ``messages`` / ``tools`` and translates the Responses output (sync) or
+        SSE events (stream) back into Chat-Completions shape so the agent
+        consumes it identically to the ``/chat/completions`` path.
+        """
+        from models.openai import responses_adapter
+
+        payload = responses_adapter.build_responses_payload(
+            model=model_name,
+            messages=messages,
+            tools=tools,
+            tool_choice=kwargs.get("tool_choice", "auto") if tools else None,
+            max_output_tokens=kwargs.get("max_tokens"),
+            reasoning_effort=kwargs.get("reasoning_effort"),
+            response_format=kwargs.get("response_format"),
+        )
+        api_key = api_config.get("api_key")
+        api_base = api_config.get("api_base")
+        timeout = kwargs.get("request_timeout") or kwargs.get("timeout")
+
+        if stream:
+            return self._handle_responses_stream(payload, api_key, api_base, timeout, model_name)
+        return self._handle_responses_sync(payload, api_key, api_base, timeout)
+
+    def _handle_responses_sync(self, payload, api_key, api_base, timeout):
+        from models.openai import responses_adapter
+        try:
+            client = self._get_http_client()
+            response = client.responses(
+                api_key=api_key, api_base=api_base, timeout=timeout,
+                stream=False, **payload,
+            )
+            return responses_adapter.responses_to_chat_completion(response)
+        except OpenAIHTTPError as e:
+            logger.error(f"[{self.__class__.__name__}] responses sync error: "
+                         f"HTTP {e.status_code}: {e.message}")
+            return {"error": True, "message": e.message, "status_code": e.status_code or 500}
+        except Exception as e:
+            logger.error(f"[{self.__class__.__name__}] responses sync error: {e}")
+            return {"error": True, "message": str(e), "status_code": 500}
+
+    def _handle_responses_stream(self, payload, api_key, api_base, timeout, model_name):
+        from models.openai import responses_adapter
+        try:
+            client = self._get_http_client()
+            events = client.responses(
+                api_key=api_key, api_base=api_base, timeout=timeout,
+                stream=True, **payload,
+            )
+            for chunk in responses_adapter.responses_stream_to_chat_chunks(events, model_name):
+                yield chunk
+        except OpenAIHTTPError as e:
+            logger.error(f"[{self.__class__.__name__}] responses stream error: "
+                         f"HTTP {e.status_code}: {e.message}")
+            yield {"error": True, "message": e.message, "status_code": e.status_code or 500}
+        except Exception as e:
+            logger.error(f"[{self.__class__.__name__}] responses stream error: {e}")
+            yield {"error": True, "message": str(e), "status_code": 500}
+
     def _get_http_client(self) -> OpenAIHTTPClient:
         """Build an HTTP client honoring the global proxy config.
 

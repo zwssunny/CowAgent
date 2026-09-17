@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useMemo, useState, useRef } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import { Loader2 } from 'lucide-react'
 import { t } from '../../i18n'
@@ -25,6 +25,8 @@ export interface CapabilityCardProps {
   status?: string
   onSave: (providerId: string, model: string) => void
   children?: React.ReactNode
+  // Optional trailing element on the card header (e.g. the chat-fallback gear).
+  action?: React.ReactNode
 }
 
 const CapabilityCard: React.FC<CapabilityCardProps> = ({
@@ -40,11 +42,26 @@ const CapabilityCard: React.FC<CapabilityCardProps> = ({
   status,
   onSave,
   children,
+  action,
 }) => {
   const [provider, setProvider] = useState(state.current_provider || '')
   const [model, setModel] = useState(state.current_model || '')
-  const [customModel, setCustomModel] = useState('')
+  // Custom providers render the model as a free-form input only while they
+  // have no catalog; once the vendor maintains a model catalog, the model is
+  // picked from a dropdown like any built-in vendor.
+  const [customModel, setCustomModel] = useState(
+    (state.current_provider || '').startsWith('custom:') ? state.current_model || '' : ''
+  )
   const [showCustom, setShowCustom] = useState(false)
+  // Remembers the custom model typed per provider so switching vendors and
+  // back doesn't lose it. Keyed by provider id.
+  const customModelByProvider = useRef<Record<string, string>>({})
+
+  const providerHasCatalog = (id: string): boolean =>
+    !!data?.providers?.find((x) => x.id === id)?.catalog?.length
+  const isCustomProvider = provider.startsWith('custom:')
+  // Free-form input only for custom vendors without a catalog.
+  const useFreeText = isCustomProvider && !providerHasCatalog(provider)
 
   // A provider is configured when it has credentials (a custom provider counts
   // only once it actually carries a name/key, not as an empty placeholder).
@@ -84,8 +101,31 @@ const CapabilityCard: React.FC<CapabilityCardProps> = ({
   }, [data, state.provider_models, provider, allowCustomModel, model, showCustom])
 
   const handleProvider = (id: string) => {
+    // Stash the custom model typed under the provider we're leaving.
+    if (showCustom || isCustomProvider) {
+      const typed = customModel.trim()
+      if (typed) customModelByProvider.current[provider] = typed
+    }
     setProvider(id)
     setShowCustom(false)
+    const remembered = customModelByProvider.current[id]
+    if (id.startsWith('custom:') && !providerHasCatalog(id)) {
+      // Catalog-less custom vendor uses the free-form input: prefill with a
+      // remembered value, else the saved model when re-selecting the same
+      // provider. A custom vendor WITH a catalog falls through to the normal
+      // dropdown path below.
+      const saved = id === state.current_provider ? state.current_model || '' : ''
+      setCustomModel(remembered || saved)
+      setModel('')
+      return
+    }
+    if (remembered) {
+      // A remembered custom model for a preset provider: reopen custom input.
+      setShowCustom(true)
+      setCustomModel(remembered)
+      setModel('')
+      return
+    }
     setCustomModel('')
     const first = resolveModels(data, id, state.provider_models)[0]
     setModel(first?.value || '')
@@ -95,6 +135,9 @@ const CapabilityCard: React.FC<CapabilityCardProps> = ({
     if (val === CUSTOM_OPTION) {
       setShowCustom(true)
       setModel('')
+      // Restore any custom model previously typed for this provider.
+      const remembered = customModelByProvider.current[provider]
+      if (remembered) setCustomModel(remembered)
     } else {
       setShowCustom(false)
       setModel(val)
@@ -102,11 +145,19 @@ const CapabilityCard: React.FC<CapabilityCardProps> = ({
     }
   }
 
-  const finalModel = showCustom ? customModel.trim() : model
+  // Keep the per-provider memory in sync as the user types a custom model.
+  const handleCustomModelInput = (val: string) => {
+    setCustomModel(val)
+    const trimmed = val.trim()
+    if (trimmed) customModelByProvider.current[provider] = trimmed
+    else delete customModelByProvider.current[provider]
+  }
+
+  const finalModel = useFreeText || showCustom ? customModel.trim() : model
   const isAuto = allowAuto && !provider
 
   return (
-    <Card icon={<Icon size={16} />} title={title} subtitle={subtitle}>
+    <Card icon={<Icon size={16} />} title={title} subtitle={subtitle} action={action}>
       <div className="space-y-4">
         <Field label={t('models_provider')}>
           <Dropdown
@@ -123,19 +174,31 @@ const CapabilityCard: React.FC<CapabilityCardProps> = ({
         </Field>
         {!isAuto && (
           <Field label={t('models_model')}>
-            <Dropdown
-              value={showCustom ? CUSTOM_OPTION : model}
-              options={modelOptions}
-              placeholder={t('models_select_model')}
-              onChange={handleModel}
-            />
-            {showCustom && (
+            {useFreeText ? (
+              // Catalog-less custom vendor: type the model directly.
               <TextInput
-                className="mt-2 font-mono"
+                className="font-mono"
                 value={customModel}
-                onChange={(e) => setCustomModel(e.target.value)}
+                onChange={(e) => handleCustomModelInput(e.target.value)}
                 placeholder={t('config_custom_model_hint')}
               />
+            ) : (
+              <>
+                <Dropdown
+                  value={showCustom ? CUSTOM_OPTION : model}
+                  options={modelOptions}
+                  placeholder={t('models_select_model')}
+                  onChange={handleModel}
+                />
+                {showCustom && (
+                  <TextInput
+                    className="mt-2 font-mono"
+                    value={customModel}
+                    onChange={(e) => handleCustomModelInput(e.target.value)}
+                    placeholder={t('config_custom_model_hint')}
+                  />
+                )}
+              </>
             )}
           </Field>
         )}

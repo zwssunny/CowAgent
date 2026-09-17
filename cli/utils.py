@@ -11,16 +11,40 @@ def get_project_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def get_workspace_dir() -> str:
-    """Get the agent workspace directory from config, defaulting to ~/cow."""
-    config = load_config_json()
-    workspace = config.get("agent_workspace", "~/cow")
-    return os.path.expanduser(workspace)
+def _ensure_project_on_path() -> None:
+    root = get_project_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
 
 
-def get_skills_dir() -> str:
+def get_workspace_dir(agent_id: str = None) -> str:
+    """Workspace directory of an Agent, defaulting to the configured default.
+
+    The CLI runs out of process and reads config.json itself, but resolves it
+    through the same registry as the gateway so both agree on where an Agent's
+    files live.
+    """
+    _ensure_project_on_path()
+    from agent.registry import AgentRegistry
+
+    registry = AgentRegistry.from_config(load_config_json())
+    return registry.get(agent_id, require_enabled=False).workspace
+
+
+def get_skills_dir(agent_id: str = None) -> str:
     """Get the custom skills directory."""
-    return os.path.join(get_workspace_dir(), "skills")
+    _ensure_project_on_path()
+    from common import state_dir
+
+    return str(state_dir.skills_dir(base=get_workspace_dir(agent_id)))
+
+
+def get_knowledge_dir(agent_id: str = None) -> str:
+    """Get the knowledge base directory."""
+    _ensure_project_on_path()
+    from common import state_dir
+
+    return str(state_dir.knowledge_dir(base=get_workspace_dir(agent_id)))
 
 
 def get_builtin_skills_dir() -> str:
@@ -34,7 +58,8 @@ def load_config_json() -> dict:
     if not os.path.exists(config_path):
         return {}
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        # utf-8-sig tolerates a UTF-8 BOM (e.g. edited with Windows Notepad).
+        with open(config_path, "r", encoding="utf-8-sig") as f:
             return json.load(f)
     except Exception:
         return {}

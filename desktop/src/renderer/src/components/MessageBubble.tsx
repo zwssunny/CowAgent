@@ -1,10 +1,18 @@
 import React, { useState } from 'react'
-import { Copy, Check, RefreshCw, Trash2, File as FileIcon, Sprout } from 'lucide-react'
+import { Copy, Check, RefreshCw, Trash2, File as FileIcon, Folder, Sprout } from 'lucide-react'
 import type { ChatMessage } from '../types'
 import { t } from '../i18n'
 import apiClient from '../api/client'
+import { useWorkspaceStore } from '../store/workspaceStore'
 import Markdown from './Markdown'
+import MentionText from './MentionText'
 import MessageSteps, { ThinkingStep } from './MessageSteps'
+import FileCard from './FileCard'
+import { useLightboxStore } from './Lightbox'
+import AgentAvatar from './AgentAvatar'
+import { useAgentStore, selectMultiAgent, findAgent } from '../store/agentStore'
+import { useSessionSettingsStore, selectSharedConversation } from '../store/sessionSettingsStore'
+import { product } from '@product'
 
 interface MessageBubbleProps {
   message: ChatMessage
@@ -42,6 +50,23 @@ const HoverAction: React.FC<{ onClick: () => void; title: string; danger?: boole
 const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, onEdit, onDelete, onMediaLoad }) => {
   const isUser = message.role === 'user'
   const [copied, setCopied] = useState(false)
+  const preview = useWorkspaceStore((s) => s.preview)
+  const openLightbox = useLightboxStore((s) => s.open)
+  // In multi-Agent mode, show the speaking Agent's face on assistant bubbles.
+  // A teammate's turn is tagged with its author (`extras.agent_id`); untagged
+  // replies are the conversation owner's, and the owner is always the active
+  // Agent (opening a chat activates its owner; switching Agents on a chat that
+  // has messages starts a new one), so falling back to it never rewrites who
+  // spoke in past turns.
+  const multiAgent = useAgentStore(selectMultiAgent)
+  const activeAgentId = useAgentStore((s) => s.activeAgentId)
+  const speakerId = (message.extras?.agent_id as string) || activeAgentId
+  const speaker = multiAgent && speakerId ? findAgent(speakerId) : undefined
+  // In a group conversation several Agents answer, so each reply is labelled
+  // with its speaker's name (as in the web console). A solo chat keeps the
+  // plain bubble — the face alone says who it is.
+  const shared = useSessionSettingsStore(selectSharedConversation)
+  const speakerName = shared && speaker ? speaker.name || speaker.id : ''
 
   const copy = () => {
     navigator.clipboard.writeText(message.content)
@@ -64,25 +89,49 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
       <div className="group flex flex-col items-end px-4 sm:px-6 py-2">
         {message.attachments && message.attachments.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-1.5 justify-end max-w-[75%]">
-            {message.attachments.map((att, i) =>
-              att.file_type === 'image' && att.preview_url ? (
-                <img
-                  key={i}
-                  src={apiClient.getFileUrl(att.preview_url)}
-                  alt={att.file_name}
-                  className="max-w-[180px] max-h-[150px] rounded-xl object-cover border border-default"
-                />
-              ) : (
+            {message.attachments.map((att, i) => {
+              if (att.file_type === 'image' && (att.preview_url || att.file_path)) {
+                // History replay recovers attachments from prompt markers,
+                // which carry only the local file_path — serve it via /api/file.
+                const url = att.preview_url
+                  ? apiClient.getFileUrl(att.preview_url)
+                  : apiClient.getServeFileUrl(att.file_path)
+                return (
+                  <img
+                    key={i}
+                    src={url}
+                    alt={att.file_name}
+                    onClick={() => openLightbox(url)}
+                    className="max-w-[260px] max-h-[220px] rounded-xl object-cover border border-default cursor-zoom-in"
+                  />
+                )
+              }
+              if (att.file_type === 'workspace_ref') {
+                return (
+                  <div
+                    key={i}
+                    title={att.file_path}
+                    onClick={() => preview(att.file_path)}
+                    className="flex items-center gap-1.5 px-3 py-2 bg-surface-2 hover:bg-surface-3 rounded-xl text-xs text-content-secondary cursor-pointer transition-colors"
+                  >
+                    {att.is_dir ? <Folder size={13} /> : <FileIcon size={13} />}
+                    {att.file_name}
+                  </div>
+                )
+              }
+              return (
                 <div key={i} className="flex items-center gap-1.5 px-3 py-2 bg-surface-2 rounded-xl text-xs text-content-secondary">
                   <FileIcon size={13} />
                   {att.file_name}
                 </div>
               )
-            )}
+            })}
           </div>
         )}
-        <div className="max-w-[75%] rounded-2xl rounded-br-md px-4 py-2.5 bg-accent text-white">
-          <div className="text-sm whitespace-pre-wrap break-words">{message.content}</div>
+        <div className="max-w-[75%] rounded-2xl rounded-br-md px-4 py-2.5 bg-bubble-user text-bubble-user-text">
+          <div className="text-sm whitespace-pre-wrap break-words">
+            <MentionText text={message.content} onAccent />
+          </div>
         </div>
         <div className="flex items-center gap-0.5 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <span className="text-[11px] text-content-tertiary mr-1">{fmtTime(message.timestamp)}</span>
@@ -107,8 +156,21 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
 
   return (
     <div className="group flex gap-3 px-4 sm:px-6 py-2">
-      <img src="./logo.jpg" alt="CowAgent" className="w-7 h-7 rounded-lg flex-shrink-0 mt-1" />
+      {product.slots?.AssistantAvatar ? (
+        <div className="w-7 h-7 rounded-lg flex-shrink-0 mt-1 overflow-hidden">
+          <product.slots.AssistantAvatar />
+        </div>
+      ) : speaker ? (
+        <div className="mt-1">
+          <AgentAvatar agent={speaker} size={28} shape="square" />
+        </div>
+      ) : (
+        <img src="./logo.jpg" alt="Agent" className="w-7 h-7 rounded-lg flex-shrink-0 mt-1" />
+      )}
       <div className="flex-1 min-w-0 max-w-[calc(100%-2.5rem)]">
+        {speakerName && (
+          <div className="text-[11px] font-medium text-content-tertiary mb-1 ml-1 truncate">{speakerName}</div>
+        )}
         <div className="inline-block w-full rounded-2xl border border-default bg-surface px-4 py-3">
           {message.kind === 'evolution' && (
             <div className="inline-flex items-center gap-1 mb-1.5 text-[11px] text-content-tertiary">
@@ -136,28 +198,44 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
           {/* Final answer */}
           {message.content && <Markdown content={message.content} />}
 
+          {/* Files the agent wrote this turn — click to open the preview panel. */}
+          {message.artifacts && message.artifacts.length > 0 && (
+            <div className="flex flex-col items-start">
+              {message.artifacts.map((a) => (
+                <FileCard key={a.abs_path || a.rel_path} meta={a} />
+              ))}
+            </div>
+          )}
+
           {/* Media attachments sent via the `send` tool (images / files). */}
           {message.attachments && message.attachments.length > 0 && (
             <div className="flex flex-wrap gap-2 mt-2">
-              {message.attachments.map((att, i) =>
-                att.file_type === 'image' ? (
-                  <img
-                    key={i}
-                    src={apiClient.getFileUrl(att.preview_url || att.file_path)}
-                    alt={att.file_name}
-                    onLoad={() => onMediaLoad?.()}
-                    onClick={() => window.open(apiClient.getFileUrl(att.preview_url || att.file_path), '_blank')}
-                    className="max-w-[320px] w-full rounded-xl border border-default cursor-zoom-in"
-                  />
-                ) : att.file_type === 'video' ? (
-                  <video
-                    key={i}
-                    src={apiClient.getFileUrl(att.preview_url || att.file_path)}
-                    controls
-                    onLoadedData={() => onMediaLoad?.()}
-                    className="max-w-[360px] w-full rounded-xl border border-default"
-                  />
-                ) : (
+              {message.attachments.map((att, i) => {
+                const url = apiClient.getFileUrl(att.preview_url || att.file_path)
+                if (att.file_type === 'image') {
+                  return (
+                    <img
+                      key={i}
+                      src={url}
+                      alt={att.file_name}
+                      onLoad={() => onMediaLoad?.()}
+                      onClick={() => openLightbox(url)}
+                      className="max-w-[320px] w-full rounded-xl border border-default cursor-zoom-in"
+                    />
+                  )
+                }
+                if (att.file_type === 'video') {
+                  return (
+                    <video
+                      key={i}
+                      src={url}
+                      controls
+                      onLoadedData={() => onMediaLoad?.()}
+                      className="max-w-[360px] w-full rounded-xl border border-default"
+                    />
+                  )
+                }
+                return (
                   <button
                     key={i}
                     type="button"
@@ -168,7 +246,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
                     {att.file_name}
                   </button>
                 )
-              )}
+              })}
             </div>
           )}
 

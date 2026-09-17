@@ -333,3 +333,77 @@ def compress_turn_to_text_only(turn: Dict) -> Dict:
         })
 
     return {"messages": compressed_messages}
+
+
+def identify_complete_turns(messages: List[Dict]) -> List[Dict]:
+    """Split a message list into complete conversation turns.
+
+    A turn starts at a real user query (text block, no tool_result) and
+    includes all following assistant/tool messages. Grouping by whole turns
+    keeps tool_use / tool_result pairs intact when trimming or compacting.
+
+    Returns a list of turns, each a dict with a ``messages`` list.
+    """
+    turns: List[Dict] = []
+    current = {"messages": []}
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", [])
+        is_user_query = False
+        if role == "user":
+            if isinstance(content, list):
+                has_text = any(
+                    isinstance(b, dict) and b.get("type") == "text" for b in content
+                )
+                has_tool_result = any(
+                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+                )
+                # A message with tool_result is internal, never a real query.
+                is_user_query = has_text and not has_tool_result
+            elif isinstance(content, str):
+                is_user_query = True
+
+        if is_user_query:
+            if current["messages"]:
+                turns.append(current)
+            current = {"messages": [msg]}
+        else:
+            current["messages"].append(msg)
+
+    if current["messages"]:
+        turns.append(current)
+    return turns
+
+
+def build_compaction_summary_text(summary: str, turn_count: int, original_text: str = "") -> str:
+    """Build the standard in-context summary header for compacted turns.
+
+    Shared by both automatic trimming and the manual /compact command so the
+    injected note reads identically regardless of how it was triggered.
+    """
+    return (
+        f"[System: Previous conversation summary — "
+        f"{turn_count} turns were compacted]\n\n"
+        f"{summary.strip()}\n\n"
+        f"The recent conversation continues below.\n\n---\n\n"
+        f"{original_text}"
+    )
+
+
+def find_first_user_text_block(turns: List[Dict]):
+    """Return the first user text block dict across *turns*, or None.
+
+    This is the injection target for a compaction summary — prepending into
+    an existing user message avoids creating two adjacent user messages
+    (which breaks strict user/assistant alternation on some providers).
+    """
+    for turn in turns:
+        for msg in turn.get("messages", []):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        return block
+    return None

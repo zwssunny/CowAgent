@@ -53,6 +53,12 @@ export function createTray({ getWindow, iconPath, onQuit }: TrayDeps): Tray | nu
   return tray
 }
 
+// Live tray instance (Windows/Linux only), so its icon can be updated at
+// runtime. Null on macOS or before createTray().
+export function getTray(): Tray | null {
+  return tray
+}
+
 export function destroyTray() {
   tray?.destroy()
   tray = null

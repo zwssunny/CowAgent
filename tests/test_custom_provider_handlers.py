@@ -15,6 +15,7 @@ import os
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 # Add project root to path.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -283,6 +284,131 @@ class TestProviderOverviewExpansion(unittest.TestCase):
         cards = ModelsHandler._custom_provider_cards(config_module.conf())
         active_cards = [c for c in cards if c.get("active")]
         self.assertEqual(len(active_cards), 0)
+
+
+class TestCustomImageProvider(unittest.TestCase):
+    def setUp(self):
+        self.provider = {
+            "id": "image_vendor",
+            "name": "image-vendor",
+            "api_key": "image-key",
+            "api_base": "https://images.example.com/v1",
+            "model": "vendor-image-model",
+        }
+        set_conf({
+            "custom_providers": [self.provider],
+            "skills": {
+                "image-generation": {
+                    "provider": "custom:image_vendor",
+                    "model": "vendor-image-model",
+                },
+            },
+        })
+
+    def test_image_capability_exposes_custom_provider(self):
+        cap = ModelsHandler._image_capability(config_module.conf())
+
+        self.assertIn("custom:image_vendor", cap["providers"])
+        self.assertEqual(cap["current_provider"], "custom:image_vendor")
+        self.assertEqual(cap["provider_models"]["custom"], [])
+        self.assertTrue(cap["runtime_active"])
+        self.assertNotIn("note", cap)
+
+    def test_set_image_uses_custom_provider_default_model(self):
+        handler = ModelsHandler.__new__(ModelsHandler)
+        file_config = {"custom_providers": [self.provider]}
+        handler._read_file_config = lambda: file_config
+        handler._write_file_config = lambda data: None
+
+        with patch.dict(os.environ, {}, clear=False):
+            result = json.loads(
+                handler._set_image("custom:image_vendor", "")
+            )
+            payload = json.loads(
+                os.environ["SKILL_IMAGE_GENERATION_CUSTOM_PROVIDER"]
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["model"], "vendor-image-model")
+        self.assertEqual(payload["id"], "image_vendor")
+        self.assertEqual(payload["api_base"], "https://images.example.com/v1")
+        self.assertEqual(
+            file_config["skills"]["image-generation"]["provider"],
+            "custom:image_vendor",
+        )
+
+    def test_set_image_rejects_unknown_custom_provider(self):
+        handler = ModelsHandler.__new__(ModelsHandler)
+        result = json.loads(handler._set_image("custom:missing", "model"))
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("unknown custom provider", result["message"])
+
+    def test_editing_selected_provider_refreshes_skill_environment(self):
+        handler = ModelsHandler.__new__(ModelsHandler)
+        handler._read_file_config = lambda: {}
+        handler._write_file_config = lambda data: None
+        handler._reset_bridge = lambda: None
+        updated = dict(
+            self.provider,
+            api_key="new-key",
+            api_base="https://new.example.com/v1",
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            handler._persist_custom_providers([updated])
+            payload = json.loads(
+                os.environ["SKILL_IMAGE_GENERATION_CUSTOM_PROVIDER"]
+            )
+
+        self.assertEqual(payload["api_key"], "new-key")
+        self.assertEqual(
+            payload["api_base"],
+            "https://new.example.com/v1",
+        )
+
+    def test_deleting_selected_provider_clears_image_route(self):
+        handler = ModelsHandler.__new__(ModelsHandler)
+        file_config = {
+            "custom_providers": [self.provider],
+            "skills": {
+                "image-generation": {
+                    "provider": "custom:image_vendor",
+                    "model": "vendor-image-model",
+                },
+            },
+        }
+        handler._read_file_config = lambda: file_config
+        handler._write_file_config = lambda data: None
+        handler._reset_bridge = lambda: None
+        env = {
+            "SKILL_IMAGE_GENERATION_PROVIDER": "custom:image_vendor",
+            "SKILL_IMAGE_GENERATION_MODEL": "vendor-image-model",
+            "SKILL_IMAGE_GENERATION_CUSTOM_PROVIDER": json.dumps(
+                self.provider
+            ),
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            handler._persist_custom_providers([])
+
+            image_config = config_module.conf()["skills"][
+                "image-generation"
+            ]
+            self.assertEqual(image_config["provider"], "")
+            self.assertEqual(image_config["model"], "")
+            self.assertNotIn(
+                "SKILL_IMAGE_GENERATION_CUSTOM_PROVIDER",
+                os.environ,
+            )
+            self.assertNotIn(
+                "SKILL_IMAGE_GENERATION_PROVIDER",
+                os.environ,
+            )
+            self.assertNotIn(
+                "SKILL_IMAGE_GENERATION_MODEL",
+                os.environ,
+            )
 
 
 if __name__ == "__main__":

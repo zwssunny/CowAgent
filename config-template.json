@@ -1,7 +1,7 @@
 {
   "cow_lang": "auto",
   "channel_type": "web",
-  "model": "deepseek-v4-flash",
+  "model": "deepseek-flash",
   "deepseek_api_key": "",
   "deepseek_api_base": "https://api.deepseek.com/v1",
   "qianfan_api_key": "",
@@ -34,15 +34,19 @@
   "wecom_bot_secret": "",
   "web_host": "",
   "web_password": "",
+  "external_api_token": "",
   "agent": true,
-  "agent_max_context_tokens": 50000,
-  "agent_max_context_turns": 20,
-  "agent_max_steps": 20,
+  "agent_max_context_tokens": 64000,
+  "agent_max_context_turns": 30,
+  "agent_max_steps": 30,
+  "agent_permission_mode": "full-access",
+  "subagent": {
+    "enabled": true,
+    "max_concurrent": 3
+  },
   "enable_thinking": false,
   "reasoning_effort": "high",
   "knowledge": true,
   "self_evolution_enabled": true,
-  "mcp_tool_retrieval_enabled": false,
-  "mcp_tool_retrieval_threshold": 20,
-  "mcp_tool_retrieval_top_k": 10
+  "mcp_tool_retrieval_enabled": false
 }

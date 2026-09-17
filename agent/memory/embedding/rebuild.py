@@ -25,8 +25,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 from common.log import logger
-from common.utils import expand_path
-
 
 @dataclass
 class RebuildResult:
@@ -157,7 +155,9 @@ def main() -> int:
 
     load_config()
 
-    workspace_root = expand_path(conf().get("agent_workspace", "~/cow"))
+    from common.state_dir import state_root_str
+
+    workspace_root = state_root_str()
     memory_config = MemoryConfig(workspace_root=workspace_root)
 
     logger.info(f"[RebuildIndex] Workspace: {workspace_root}")

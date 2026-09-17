@@ -1,0 +1,337 @@
+                <!-- ====================================================== -->
+                <!-- VIEW: Config                                            -->
+                <!-- ====================================================== -->
+                <div id="view-config" class="view">
+                    <!-- Tailwind JIT safelist: models capability-card icon colors
+                         are emitted from JS template strings. Listing them here
+                         (display:none) guarantees the CDN-side compiler picks
+                         them up regardless of render timing. -->
+                    <div class="hidden bg-blue-50 dark:bg-blue-900/30 text-blue-500
+                                       bg-orange-50 dark:bg-orange-900/30 text-orange-500
+                                       bg-purple-50 dark:bg-purple-900/30 text-purple-500
+                                       bg-amber-50 dark:bg-amber-900/30 text-amber-500
+                                       bg-primary-50 dark:bg-primary-900/30 text-primary-500"></div>
+                    <div class="flex-1 overflow-y-auto p-6">
+                        <div class="max-w-4xl mx-auto">
+                            <div class="flex items-center justify-between mb-6">
+                                <div>
+                                    <h2 class="text-xl font-bold text-slate-800 dark:text-slate-100" data-i18n="config_title">配置管理</h2>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 mt-1" data-i18n="config_desc">管理模型和 Agent 配置</p>
+                                </div>
+                            </div>
+
+                            <!-- Tabs: 基础配置 / 模型配置 -->
+                            <div class="flex items-center justify-between gap-3 mb-6">
+                                <div class="flex items-center bg-slate-100 dark:bg-white/10 rounded-lg p-0.5 w-max">
+                                    <button id="config-tab-basic" onclick="switchConfigTab('basic')"
+                                            class="config-tab px-4 py-1.5 rounded-md text-xs font-medium cursor-pointer transition-colors duration-150 active">
+                                        <i class="fas fa-sliders mr-1.5"></i><span data-i18n="settings_tab_basic">基础配置</span>
+                                    </button>
+                                    <button id="config-tab-models" onclick="switchConfigTab('models')"
+                                            class="config-tab px-4 py-1.5 rounded-md text-xs font-medium cursor-pointer transition-colors duration-150">
+                                        <i class="fas fa-microchip mr-1.5"></i><span data-i18n="settings_tab_models">模型配置</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Panel: 基础配置 -->
+                            <div id="config-panel-basic" class="grid gap-6">
+
+                                <!-- Model Config Card -->
+                                <div class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 p-6">
+                                    <div class="flex items-center gap-3 mb-5">
+                                        <div class="w-9 h-9 rounded-lg bg-primary-50 dark:bg-primary-900/30 flex items-center justify-center">
+                                            <i class="fas fa-microchip text-primary-500 text-sm"></i>
+                                        </div>
+                                        <h3 class="font-semibold text-slate-800 dark:text-slate-100" data-i18n="config_model">模型配置</h3>
+                                        <a class="ml-auto text-xs text-slate-500 dark:text-slate-400 hover:text-primary-500 dark:hover:text-primary-400 cursor-pointer transition-colors flex items-center gap-1"
+                                           onclick="switchConfigTab('models')">
+                                            <span data-i18n="config_model_advanced">高级配置</span>
+                                            <i class="fas fa-arrow-right text-[10px]"></i>
+                                        </a>
+                                    </div>
+                                    <div class="space-y-5">
+                                        <!-- Provider -->
+                                        <div>
+                                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5" data-i18n="config_provider">模型厂商</label>
+                                            <div id="cfg-provider" class="cfg-dropdown" tabindex="0">
+                                                <div class="cfg-dropdown-selected">
+                                                    <span class="cfg-dropdown-text">--</span>
+                                                    <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                                                </div>
+                                                <div class="cfg-dropdown-menu"></div>
+                                            </div>
+                                            <div id="cfg-custom-tip" class="mt-1.5 text-xs text-slate-400 dark:text-slate-500 hidden">
+                                                <i class="fas fa-info-circle mr-1"></i><span data-i18n="config_custom_tip">接口需遵循 OpenAI API 协议</span>
+                                            </div>
+                                        </div>
+                                        <!-- Model -->
+                                        <div>
+                                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5" data-i18n="config_model_name">模型</label>
+                                            <div id="cfg-model-select" class="cfg-dropdown" tabindex="0">
+                                                <div class="cfg-dropdown-selected">
+                                                    <span class="cfg-dropdown-text">--</span>
+                                                    <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                                                </div>
+                                                <div class="cfg-dropdown-menu"></div>
+                                            </div>
+                                            <div id="cfg-model-custom-wrap" class="mt-2 hidden">
+                                                <input id="cfg-model-custom" type="text"
+                                                       class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                                              bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                                              focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                                                       data-i18n-placeholder="config_custom_model_hint" placeholder="输入自定义模型名称">
+                                            </div>
+                                        </div>
+                                        <!-- API Key -->
+                                        <div id="cfg-api-key-wrap">
+                                            <div class="flex items-center justify-between gap-2 mb-1.5">
+                                                <label class="block text-sm font-medium text-slate-600 dark:text-slate-400">API Key</label>
+                                                <a id="cfg-manage-key" href="https://link-ai.tech/console/models?apikey=1"
+                                                   target="_blank" rel="noopener noreferrer"
+                                                   class="hidden inline-flex items-center gap-1 text-xs text-primary-500 hover:underline">
+                                                    <span data-i18n="models_manage_api_key">管理 API Key</span>
+                                                    <i class="fas fa-arrow-up-right-from-square text-[10px]"></i>
+                                                </a>
+                                            </div>
+                                            <div class="relative">
+                                                <input id="cfg-api-key" type="text" autocomplete="off" data-1p-ignore data-lpignore="true"
+                                                       class="w-full px-3 py-2 pr-10 rounded-lg border border-slate-200 dark:border-slate-600
+                                                              bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                                              focus:outline-none focus:border-primary-500 font-mono transition-colors cfg-key-masked"
+                                                       placeholder="sk-...">
+                                                <button type="button" id="cfg-api-key-toggle"
+                                                        class="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600
+                                                               dark:hover:text-slate-300 cursor-pointer transition-colors p-1"
+                                                        onclick="toggleApiKeyVisibility()">
+                                                    <i class="fas fa-eye text-xs"></i>
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <!-- API Base -->
+                                        <div id="cfg-api-base-wrap" class="hidden">
+                                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">API Base</label>
+                                            <input id="cfg-api-base" type="text"
+                                                   class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                                          bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                                          focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                                                   placeholder="https://...">
+                                        </div>
+                                        <!-- Save Model Button -->
+                                        <div class="flex items-center justify-end gap-3 pt-1">
+                                            <span id="cfg-model-status" class="text-xs text-primary-500 opacity-0 transition-opacity duration-300"></span>
+                                            <button id="cfg-model-save"
+                                                    class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
+                                                           cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                                                    onclick="saveModelConfig()" data-i18n="config_save">保存</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Agent Config Card -->
+                                <div id="config-agent-card" class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 p-6">
+                                    <div class="flex items-center gap-3 mb-5">
+                                        <div class="w-9 h-9 rounded-lg bg-emerald-50 dark:bg-emerald-900/30 flex items-center justify-center">
+                                            <i class="fas fa-robot text-emerald-500 text-sm"></i>
+                                        </div>
+                                        <h3 class="font-semibold text-slate-800 dark:text-slate-100" data-i18n="config_agent">Agent 配置</h3>
+                                    </div>
+                                    <div class="space-y-4">
+                                        <div>
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                                <span data-i18n="config_max_tokens">最大上下文 Token</span>
+                                                <span class="cfg-tip" data-tip-key="config_max_tokens_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <input id="cfg-max-tokens" type="number" min="0" max="10000000" step="1000"
+                                                   class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                                          bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                                          focus:outline-none focus:border-primary-500 font-mono transition-colors">
+                                        </div>
+                                        <div>
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                                <span data-i18n="config_max_turns">最大记忆轮次</span>
+                                                <span class="cfg-tip" data-tip-key="config_max_turns_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <input id="cfg-max-turns" type="number" min="1" max="1000" step="1"
+                                                   class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                                          bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                                          focus:outline-none focus:border-primary-500 font-mono transition-colors">
+                                        </div>
+                                        <div>
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                                <span data-i18n="config_max_steps">最大执行步数</span>
+                                                <span class="cfg-tip" data-tip-key="config_max_steps_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <input id="cfg-max-steps" type="number" min="1" max="1000" step="1"
+                                                   class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                                          bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                                          focus:outline-none focus:border-primary-500 font-mono transition-colors">
+                                        </div>
+                                        <div class="flex items-center justify-between">
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400">
+                                                <span data-i18n="config_enable_thinking">Deep Thinking</span>
+                                                <span class="cfg-tip" data-tip-key="config_enable_thinking_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <label class="relative inline-flex items-center cursor-pointer">
+                                                <input id="cfg-enable-thinking" type="checkbox" class="sr-only peer">
+                                                <div class="w-9 h-5 bg-slate-200 dark:bg-slate-700 peer-checked:bg-primary-400 rounded-full
+                                                            after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white
+                                                            after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
+                                            </label>
+                                        </div>
+                                        <div id="cfg-reasoning-effort-wrap" class="hidden">
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                                <span data-i18n="config_reasoning_effort">思考强度</span>
+                                                <span class="cfg-tip" data-tip-key="config_reasoning_effort_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <div id="cfg-reasoning-effort" class="cfg-dropdown" tabindex="0">
+                                                <div class="cfg-dropdown-selected">
+                                                    <span class="cfg-dropdown-text">--</span>
+                                                    <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                                                </div>
+                                                <div class="cfg-dropdown-menu"></div>
+                                            </div>
+                                        </div>
+                                        <div class="flex items-center justify-between">
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400">
+                                                <span data-i18n="config_subagent">Sub Agents</span>
+                                                <span class="cfg-tip" data-tip-key="config_subagent_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <label class="relative inline-flex items-center cursor-pointer">
+                                                <input id="cfg-subagent" type="checkbox" class="sr-only peer">
+                                                <div class="w-9 h-5 bg-slate-200 dark:bg-slate-700 peer-checked:bg-primary-400 rounded-full
+                                                            after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white
+                                                            after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
+                                            </label>
+                                        </div>
+                                        <div class="flex items-center justify-between">
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400">
+                                                <span data-i18n="config_self_evolution">Self-Evolution</span>
+                                                <span class="cfg-tip" data-tip-key="config_self_evolution_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <label class="relative inline-flex items-center cursor-pointer">
+                                                <input id="cfg-self-evolution" type="checkbox" class="sr-only peer">
+                                                <div class="w-9 h-5 bg-slate-200 dark:bg-slate-700 peer-checked:bg-primary-400 rounded-full
+                                                            after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white
+                                                            after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
+                                            </label>
+                                        </div>
+                                        <div class="flex items-center justify-end gap-3 pt-1">
+                                            <span id="cfg-agent-status" class="text-xs text-primary-500 opacity-0 transition-opacity duration-300"></span>
+                                            <button id="cfg-agent-save"
+                                                    class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
+                                                           cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                                                    onclick="saveAgentConfig()" data-i18n="config_save">保存</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Security Config Card -->
+                                <div class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 p-6">
+                                    <div class="flex items-center gap-3 mb-5">
+                                        <div class="w-9 h-9 rounded-lg bg-amber-50 dark:bg-amber-900/30 flex items-center justify-center">
+                                            <i class="fas fa-lock text-amber-500 text-sm"></i>
+                                        </div>
+                                        <h3 class="font-semibold text-slate-800 dark:text-slate-100" data-i18n="config_security">安全设置</h3>
+                                    </div>
+                                    <div class="space-y-4">
+                                        <div>
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                                <span data-i18n="config_permission">默认权限</span>
+                                                <span class="cfg-tip" data-tip-key="config_permission_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <div id="cfg-permission" class="cfg-dropdown" tabindex="0">
+                                                <div class="cfg-dropdown-selected">
+                                                    <span class="cfg-dropdown-text">--</span>
+                                                    <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                                                </div>
+                                                <div class="cfg-dropdown-menu"></div>
+                                            </div>
+                                            <p class="text-xs text-slate-400 dark:text-slate-500 mt-1.5" data-i18n="config_permission_desc">新会话默认使用该权限；单个会话可在输入框下方单独调整</p>
+                                        </div>
+                                        <div>
+                                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5" data-i18n="config_password">访问密码</label>
+                                            <input id="cfg-password" type="password" autocomplete="new-password"
+                                                   class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                                          bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                                          focus:outline-none focus:border-primary-500 font-mono transition-colors
+                                                          cfg-key-masked"
+                                                   data-masked="1">
+                                            <p class="text-xs text-slate-400 dark:text-slate-500 mt-1.5" data-i18n="config_password_hint">留空则不启用密码保护</p>
+                                        </div>
+                                        <div class="flex items-center justify-end gap-3 pt-1">
+                                            <span id="cfg-password-status" class="text-xs text-primary-500 opacity-0 transition-opacity duration-300"></span>
+                                            <button id="cfg-password-save"
+                                                    class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
+                                                           cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                                                    onclick="savePasswordConfig()" data-i18n="config_save">保存</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- System Config Card -->
+                                <div class="bg-white dark:bg-[#1A1A1A] rounded-xl border border-slate-200 dark:border-white/10 p-6">
+                                    <div class="flex items-center gap-3 mb-5">
+                                        <div class="w-9 h-9 rounded-lg bg-sky-50 dark:bg-sky-900/30 flex items-center justify-center">
+                                            <i class="fas fa-sliders-h text-sky-500 text-sm"></i>
+                                        </div>
+                                        <h3 class="font-semibold text-slate-800 dark:text-slate-100" data-i18n="config_system">系统</h3>
+                                    </div>
+                                    <div class="space-y-4">
+                                        <div>
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5">
+                                                <span data-i18n="config_language">语言</span>
+                                                <span class="cfg-tip" data-tip-key="config_language_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <div id="cfg-lang-select" class="cfg-dropdown" tabindex="0">
+                                                <div class="cfg-dropdown-selected">
+                                                    <span class="cfg-dropdown-text">--</span>
+                                                    <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                                                </div>
+                                                <div class="cfg-dropdown-menu"></div>
+                                            </div>
+                                        </div>
+                                        <div class="flex items-center justify-between">
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400">
+                                                <span data-i18n="config_task_notify">Task Notifications</span>
+                                                <span class="cfg-tip" data-tip-key="config_task_notify_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <label class="relative inline-flex items-center cursor-pointer">
+                                                <input id="cfg-task-notify" type="checkbox" class="sr-only peer">
+                                                <div class="w-9 h-5 bg-slate-200 dark:bg-slate-700 peer-checked:bg-primary-400 rounded-full
+                                                            after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white
+                                                            after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
+                                            </label>
+                                        </div>
+                                        <div class="flex items-center justify-between">
+                                            <label class="flex items-center gap-1.5 text-sm font-medium text-slate-600 dark:text-slate-400">
+                                                <span data-i18n="config_task_notify_sound">Notification Sound</span>
+                                                <span class="cfg-tip" data-tip-key="config_task_notify_sound_hint"><i class="fas fa-circle-question"></i></span>
+                                            </label>
+                                            <label class="relative inline-flex items-center cursor-pointer">
+                                                <input id="cfg-task-notify-sound" type="checkbox" class="sr-only peer">
+                                                <div class="w-9 h-5 bg-slate-200 dark:bg-slate-700 peer-checked:bg-primary-400 rounded-full
+                                                            after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white
+                                                            after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
+                                            </label>
+                                        </div>
+                                        <div id="cfg-task-notify-blocked" class="hidden flex items-start gap-2 text-xs text-amber-600 dark:text-amber-500 bg-amber-50 dark:bg-amber-900/20 rounded-lg px-3 py-2">
+                                            <i class="fas fa-triangle-exclamation mt-0.5"></i>
+                                            <span data-i18n="config_task_notify_blocked">系统通知已被浏览器屏蔽，请点击地址栏左侧图标 → 通知 → 允许后刷新页面</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                            </div>
+
+                            <!-- Panel: 模型配置 (advanced vendor / capability management) -->
+                            <div id="config-panel-models" class="hidden">
+                                <div id="models-loading" class="flex items-center gap-2 py-12 justify-center text-slate-400 dark:text-slate-500 text-sm">
+                                    <i class="fas fa-spinner fa-spin text-xs"></i><span>Loading...</span>
+                                </div>
+                                <div id="models-content" class="grid gap-6 hidden"></div>
+                            </div>
+
+                        </div>
+                    </div>
+                </div>

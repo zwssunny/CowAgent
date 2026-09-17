@@ -3,7 +3,7 @@ title: Kimi
 description: Kimi (Moonshot) model configuration (Text Chat + Image Understanding)
 ---
 
-Kimi is provided by Moonshot and supports both text chat and image understanding. The `kimi-k2.x` series natively supports vision.
+Kimi is provided by Moonshot and supports both text chat and image understanding. The `kimi-k3` and `kimi-k2.x` series natively support vision.
 
 <Tip>
   All capabilities below can be configured in one place via the "Model Management" page in the Web Console, with no need to manually edit the configuration file.
@@ -13,15 +13,15 @@ Kimi is provided by Moonshot and supports both text chat and image understanding
 
 ```json
 {
-  "model": "kimi-k2.7-code",
+  "model": "kimi-k3",
   "moonshot_api_key": "YOUR_API_KEY"
 }
 ```
 
 | Parameter | Description |
 | --- | --- |
-| `model` | Can be `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k2.6`, `kimi-k2.5`, `kimi-k2`, `moonshot-v1-8k`, `moonshot-v1-32k`, `moonshot-v1-128k` |
-| `moonshot_api_key` | Create one in the [Moonshot Console](https://platform.moonshot.cn/console/api-keys) |
+| `model` | Can be `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k2.6`, `kimi-k2.5`, `kimi-k2`, `moonshot-v1-8k`, `moonshot-v1-32k`, `moonshot-v1-128k` |
+| `moonshot_api_key` | Create one in the [Moonshot Console](https://platform.kimi.com?aff=cowagent) |
 | `moonshot_base_url` | Optional, defaults to `https://api.moonshot.cn/v1` |
 
 ## Image Understanding

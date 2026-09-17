@@ -40,6 +40,25 @@ class WechatComAppChannel(ChatChannel):
         logger.info(
             "[wechatcom] Initializing WeCom app channel, corp_id: {}, agent_id: {}".format(self.corp_id, self.agent_id)
         )
+        # Fail fast with a readable message when the channel is enabled but its
+        # required credentials are missing. Otherwise WeChatCrypto concatenates
+        # a None aes_key with a string and raises an opaque
+        # "unsupported operand type(s) for +: 'NoneType' and 'str'".
+        missing = [
+            key
+            for key, val in (
+                ("wechatcom_corp_id", self.corp_id),
+                ("wechatcomapp_token", self.token),
+                ("wechatcomapp_aes_key", self.aes_key),
+            )
+            if not val
+        ]
+        if missing:
+            raise RuntimeError(
+                "[wechatcom] WeCom app channel is enabled but missing required config: "
+                + ", ".join(missing)
+                + ". Fill them in config.json or remove 'wechatcom_app' from channel_type."
+            )
         self.crypto = WeChatCrypto(self.token, self.aes_key, self.corp_id)
         self.client = WechatComAppClient(self.corp_id, self.secret)
 

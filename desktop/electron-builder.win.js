@@ -119,4 +119,14 @@ async function customSign(configuration) {
 // SmartScreen/Defender to attribute the publisher).
 config.win = { ...config.win, signtoolOptions: { sign: customSign, signingHashAlgorithms: ['sha256'] } }
 
+// Bundle ripgrep — Windows only. The "Bundle ripgrep binary" CI step downloads
+// rg.exe to resources/bin; ship it under <resources>/bin so python-manager can
+// put it on the backend's PATH (shutil.which("rg") -> fast rg backend instead
+// of the slow PowerShell fallback). Declared here, not in package.json, so the
+// macOS build (which never creates resources/bin) never references it.
+config.extraResources = [
+  ...(config.extraResources || []),
+  { from: 'resources/bin', to: 'bin', filter: ['rg.exe'] },
+]
+
 module.exports = config

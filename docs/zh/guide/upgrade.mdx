@@ -23,6 +23,33 @@ cow update
   如果未安装 Cow CLI，也可以使用 `./run.sh update` 完成相同操作。
 </Note>
 
+
+## 控制台一键更新
+
+源码安装也可以直接在 Web 控制台升级，不必再开终端。
+
+1. 点击左侧栏底部的版本号，弹出上拉菜单。打开菜单时**不会**访问 GitHub。
+2. 点击 **检查更新**，才会拉取版本信息。这是唯一的网络请求；若有新版本，同一项会变成 **立即更新** 并带一个红点提示。
+3. 点击 **立即更新**。控制台复用 `cow update` 的同一条路径（`git pull`、安装依赖、重装 CLI），然后重启服务。菜单里的 **版本说明** 则会打开 GitHub releases 页面查看完整变更。
+
+更新只操作 git 代码目录：用户数据在仓库之外（`agent_workspace`，默认 `~/cow`），`config.json` 也被 gitignore，所以 `git pull` 不会覆盖它们，无需备份。更新前会记录当前 git 提交，如果新代码无法 import，会重置回该提交，且不杀死正在运行的进程。
+
+更新成功后，控制台会自动重连并显示新版本号。
+
+<Note>
+  Docker 镜像和桌面客户端不能用这个按钮。Docker 仍使用 `docker compose pull`；桌面客户端继续走内置更新。Windows 上请在终端执行 `cow update`，Web 控制台无法从进程内部完成重启。
+</Note>
+
+### 回滚
+
+如果更新成功但新版本工作异常，回退到上一个提交即可：
+
+```bash
+cow stop
+git reset --hard <previous-commit>   # tmp/web-update-status.json 中会记录
+cow start
+```
+
 ## 手动升级
 
 在项目根目录下执行：

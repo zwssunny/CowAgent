@@ -79,7 +79,7 @@ def parse_custom_bot_type(bot_type):
     return False, ""
 
 
-def resolve_custom_credentials():
+def resolve_custom_credentials(bot_type=None):
     """Resolve the effective (api_key, api_base, model) for custom mode.
 
     Resolution order:
@@ -88,10 +88,20 @@ def resolve_custom_credentials():
       2. If ``bot_type`` is exactly ``"custom"`` (legacy), return the flat
          ``custom_api_key`` / ``custom_api_base``.
 
+    :param bot_type: the bot type to resolve credentials for. Callers that
+        route a turn to a provider other than the globally configured one
+        (a session model override, or an engaged chat fallback) must pass it
+        explicitly — reading ``conf()["bot_type"]`` here would return the
+        *global* provider's credentials, so the caller would send another
+        vendor's model id to the wrong api_base and get a 404 back. When
+        ``None``, the globally configured ``bot_type`` is used, which keeps
+        every pre-existing caller behaving exactly as before.
+
     :return: tuple ``(api_key, api_base, model)``. ``api_base`` and ``model``
              may be ``None`` / empty when not configured.
     """
-    bot_type = conf().get("bot_type", "")
+    if bot_type is None:
+        bot_type = conf().get("bot_type", "")
     is_custom, provider_id = parse_custom_bot_type(bot_type)
 
     if not is_custom:

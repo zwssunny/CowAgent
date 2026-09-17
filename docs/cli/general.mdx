@@ -33,6 +33,16 @@ Abort the agent task currently running in this session. When the agent is busy w
 /cancel
 ```
 
+## steer
+
+Redirect the Agent task currently running in this session without cancelling it. The instruction is injected at the next safe checkpoint; a tool that is already running may finish, while tools that have not started are skipped. If no task is active, `/steer` does not start or queue a new one. Available across all chat channels.
+
+```text
+/steer focus on the failing tests first
+```
+
+In the Web console, enter an instruction while a reply is running and click **Steer active task**. Sending an ordinary message still uses the session queue.
+
 ## config
 
 View or modify runtime configuration. Changes take effect immediately without restarting.
@@ -52,14 +62,14 @@ View or modify runtime configuration. Changes take effect immediately without re
 **Modify a config item:**
 
 ```text
-/config model deepseek-v4-flash
+/config model deepseek-flash
 ```
 
 **Configurable items:**
 
 | Item | Description | Example |
 | --- | --- | --- |
-| `model` | AI model name | `deepseek-v4-flash` |
+| `model` | AI model name | `deepseek-flash` |
 | `agent_max_context_tokens` | Max context tokens | `40000` |
 | `agent_max_context_turns` | Max context memory turns | `30` |
 | `agent_max_steps` | Max decision steps per task | `15` |
@@ -80,11 +90,23 @@ View current session context statistics, including message count and content len
 **Clear current session context:**
 
 ```text
-/context clear
+/clear
 ```
 
 <Tip>
-  Clearing context makes the Agent "forget" previous conversation, useful for switching topics or freeing context space.
+  Clearing context makes the Agent "forget" previous conversation, useful for switching topics or freeing context space. `/context clear` still works as an alias.
+</Tip>
+
+## compact
+
+Summarize older turns to free up context while keeping recent turns intact. Unlike automatic trimming, this runs immediately regardless of current token usage.
+
+```text
+/compact
+```
+
+<Tip>
+  Use `/compact` before a long task to reclaim context space without fully clearing the conversation. Recent turns and an LLM summary of older turns are retained.
 </Tip>
 
 ## logs

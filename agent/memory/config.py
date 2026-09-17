@@ -5,16 +5,21 @@ Provides global memory configuration with simplified workspace structure
 """
 
 from __future__ import annotations
-import os
+import threading
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Dict, List, Optional
 from pathlib import Path
 
 
 def _default_workspace():
-    """Get default workspace path with proper Windows support"""
-    from common.utils import expand_path
-    return expand_path("~/cow")
+    """
+    Resolve the workspace of the routed Agent. Deferring to state_dir keeps
+    every consumer of get_default_memory_config() - ConversationStore, the
+    evolution executor, the evolution-undo tool - on the right workspace
+    without each entrypoint having to prime the singleton.
+    """
+    from common.state_dir import state_root_str
+    return state_root_str()
 
 
 @dataclass
@@ -52,71 +57,92 @@ class MemoryConfig:
     def get_workspace(self) -> Path:
         """Get workspace root directory"""
         return Path(self.workspace_root)
-    
+
     def get_memory_dir(self) -> Path:
         """Get memory files directory"""
-        return self.get_workspace() / "memory"
-    
+        from common import state_dir
+        return state_dir.memory_dir(base=self.workspace_root)
+
     def get_db_path(self) -> Path:
         """Get SQLite database path for long-term memory index"""
-        index_dir = self.get_memory_dir() / "long-term"
-        index_dir.mkdir(parents=True, exist_ok=True)
-        return index_dir / "index.db"
-    
+        from common import state_dir
+        return state_dir.memory_index_db(base=self.workspace_root)
+
     def get_skills_dir(self) -> Path:
         """Get skills directory"""
-        return self.get_workspace() / "skills"
-    
-    def get_agent_workspace(self, agent_name: Optional[str] = None) -> Path:
-        """
-        Get workspace directory for an agent
-        
-        Args:
-            agent_name: Optional agent name (not used in current implementation)
-            
-        Returns:
-            Path to workspace directory
-        """
-        workspace = self.get_workspace()
-        # Ensure workspace directory exists
-        workspace.mkdir(parents=True, exist_ok=True)
-        return workspace
+        from common import state_dir
+        return state_dir.skills_dir(base=self.workspace_root)
 
 
-# Global memory configuration
-_global_memory_config: Optional[MemoryConfig] = None
+# One config per workspace, not one per process: several Agents share this
+# module, and the consumers that read it take no config= argument
+# (ConversationStore, the evolution executor, the evolution-undo tool,
+# MemoryManager()). A single slot means whichever Agent initialized last
+# decides where every other Agent's memory is written.
+_memory_configs: Dict[str, MemoryConfig] = {}
+_pinned_memory_config: Optional[MemoryConfig] = None
+_memory_config_lock = threading.RLock()
+
+
+def _key(workspace_root: str) -> str:
+    """Canonicalize so a registration and a lookup for the same directory
+    agree. ``~/cow``, ``/var/...`` and ``/private/var/...`` all reach the same
+    place; keying on the raw string would silently miss the registered config
+    and hand back a bare default instead."""
+    import os
+    from common.utils import expand_path
+
+    return os.path.realpath(expand_path(str(workspace_root)))
 
 
 def get_default_memory_config() -> MemoryConfig:
+    """Config for the workspace this call belongs to, per the routed identity.
+
+    Returns the instance registered by that Agent's initializer when there is
+    one, so callers see its embedding settings and not just a bare default.
     """
-    Get the global memory configuration.
-    If not set, returns a default configuration.
-    
-    Returns:
-        MemoryConfig instance
-    """
-    global _global_memory_config
-    if _global_memory_config is None:
-        _global_memory_config = MemoryConfig()
-    return _global_memory_config
+    if _pinned_memory_config is not None:
+        return _pinned_memory_config
+
+    workspace_root = _default_workspace()
+    key = _key(workspace_root)
+    config = _memory_configs.get(key)
+    if config is not None:
+        return config
+    with _memory_config_lock:
+        config = _memory_configs.get(key)
+        if config is None:
+            config = MemoryConfig(workspace_root=workspace_root)
+            _memory_configs[key] = config
+        return config
 
 
-def set_global_memory_config(config: MemoryConfig):
+def register_memory_config(config: MemoryConfig) -> None:
+    """Publish an Agent's config as the default for its own workspace.
+
+    What an initializer wants: the fully built config (embedding provider and
+    all) reaches this Agent's config-less consumers, without touching what any
+    other Agent resolves.
     """
-    Set the global memory configuration.
-    This should be called before creating any MemoryManager instances.
-    
-    Args:
-        config: MemoryConfig instance to use globally
-        
-    Example:
-        >>> from agent.memory import MemoryConfig, set_global_memory_config
-        >>> config = MemoryConfig(
-        ...     workspace_root="~/my_agents",
-        ...     embedding_provider="openai",
-        ...     vector_weight=0.8
-        ... )
-        >>> set_global_memory_config(config)
+    with _memory_config_lock:
+        _memory_configs[_key(config.workspace_root)] = config
+
+
+def reset_memory_configs() -> None:
+    """Drop every registered config and any pin. For tests."""
+    global _pinned_memory_config
+    with _memory_config_lock:
+        _memory_configs.clear()
+        _pinned_memory_config = None
+
+
+def set_global_memory_config(config: Optional[MemoryConfig]) -> None:
+    """Force every workspace to one config; pass None to follow routing again.
+
+    A blunt instrument, kept for tests and single-Agent callers that want to
+    override embedding or search settings process-wide. Prefer
+    register_memory_config in anything that runs per Agent.
     """
-    global _global_memory_config
-    _global_memory_config = config
+    global _pinned_memory_config
+    with _memory_config_lock:
+        _pinned_memory_config = config

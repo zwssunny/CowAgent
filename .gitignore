@@ -14,7 +14,7 @@ tmp
 plugins.json
 *.log
 logs/
-workspace
+/workspace
 config.yaml
 user_datas.pkl
 chatgpt_tool_hub/
@@ -34,6 +34,8 @@ plugins/banwords/lib/__pycache__
 !plugins/linkai
 !plugins/cow_cli
 client_config.json
+# HMAC key for signing /preview URLs; generated per install.
+.preview_secret
 ref/
 **/.dev.vars
 .cursor/
@@ -54,11 +56,19 @@ desktop/build/*
 !desktop/build/cowagent-backend.spec
 !desktop/build/requirements-desktop.txt
 !desktop/build/build-backend.sh
+!desktop/build/build-feishu-vendor.py
 !desktop/build/entitlements.mac.plist
-!desktop/build/notarize-dmg.sh
+!desktop/build/installer.nsh
 
 # Icon authoring scratch dir: intermediate assets used to produce the final
 # icons. Only the finished icons under desktop/resources/ should be committed.
 desktop/resources/.icon-work/
 
+# Bundled ripgrep binary: downloaded by CI (release workflow) at build time,
+# never committed — it's a multi-MB platform-specific executable.
+desktop/resources/bin/
+
 .wrangler/
+
+# Obsidian editor workspace (accidental commit vector; never part of the app)
+.obsidian/

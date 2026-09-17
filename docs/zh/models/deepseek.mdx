@@ -9,14 +9,14 @@ DeepSeek 是当前 Agent 模式默认推荐的厂商之一，主打高性价比�
 
 ```json
 {
-  "model": "deepseek-v4-flash",
+  "model": "deepseek-flash",
   "deepseek_api_key": "YOUR_API_KEY"
 }
 ```
 
 | 参数 | 说明 |
 | --- | --- |
-| `model` | 支持 `deepseek-v4-flash`（默认）、`deepseek-v4-pro` |
+| `model` | 支持 `deepseek-flash`（默认，V4.1 Flash，原生多模态）、`deepseek-v4-flash`、`deepseek-v4-pro` |
 | `deepseek_api_key` | 在 [DeepSeek 平台](https://platform.deepseek.com/api_keys) 创建 |
 | `deepseek_api_base` | 可选，默认为 `https://api.deepseek.com/v1`，可修改为第三方代理地址 |
 
@@ -24,12 +24,13 @@ DeepSeek 是当前 Agent 模式默认推荐的厂商之一，主打高性价比�
 
 | 模型 | 适用场景 |
 | --- | --- |
-| `deepseek-v4-flash` | 默认推荐，速度快、成本低 |
+| `deepseek-flash` | 默认推荐，V4.1 Flash，原生多模态、速度快、成本低 |
+| `deepseek-v4-flash` | 上一代 V4 Flash |
 | `deepseek-v4-pro` | 更智能，复杂任务效果更强 |
 
 ## 思考模式
 
-V4 系列（`deepseek-v4-flash` / `deepseek-v4-pro`）支持显式的「思考模式」：模型在输出最终回答前，先输出一段思维链（`reasoning_content`），从而提升答案质量。
+`deepseek-flash` 及 V4 系列（`deepseek-v4-flash` / `deepseek-v4-pro`）支持显式的「思考模式」：模型在输出最终回答前，先输出一段思维链（`reasoning_content`），从而提升答案质量。
 
 ### 开关
 
@@ -68,5 +69,5 @@ V4 系列（`deepseek-v4-flash` / `deepseek-v4-pro`）支持显式的「思考�
 - **多轮工具调用**：当历史中包含工具调用时，DeepSeek 要求所有 assistant 消息必须回传 `reasoning_content`。CowAgent 会自动处理回传逻辑，跨轮次切换思考开关也不会出错。
 
 <Tip>
-  默认使用 `deepseek-v4-flash`；复杂任务可使用 `deepseek-v4-pro`；需要深度推理可开启 `enable_thinking`。
+  默认使用 `deepseek-flash`（V4.1 Flash，原生多模态）；复杂任务可使用 `deepseek-v4-pro`；需要深度推理可开启 `enable_thinking`。
 </Tip>

@@ -23,6 +23,7 @@ Design goals:
 """
 
 import json
+import os
 from typing import Any, Dict, Generator, Optional
 from urllib.parse import urlparse
 
@@ -38,6 +39,11 @@ DEFAULT_TIMEOUT = 600  # seconds; matches old openai SDK default
 _APP_TITLE = "CowAgent"
 _APP_REFERER = "https://github.com/zhayujie/CowAgent"
 
+
+# Optional client-source tag. Only sent to the source-tagged hosts below, so no
+# client identity leaks to a user's own proxy.
+_SOURCE_HEADER = "X-Client-Source"
+
 # Per-gateway app attribution headers, only sent when the request host
 # matches a documented gateway. Sending these to user-configured custom
 # proxies would leak app identity, so we dispatch by host suffix.
@@ -46,11 +52,22 @@ _ATTRIBUTION_HEADERS_BY_HOST: Dict[str, Dict[str, str]] = {
         "HTTP-Referer": _APP_REFERER,
         "X-Title": _APP_TITLE,
     },
+    "orcarouter.ai": {
+        "HTTP-Referer": _APP_REFERER,
+        "X-Title": _APP_TITLE,
+    },
     "ai-gateway.vercel.sh": {
         "HTTP-Referer": _APP_REFERER,
         "X-Title": _APP_TITLE,
     },
+    "link-ai.tech": {
+        "X-Title": _APP_TITLE,
+    },
 }
+
+# Hosts that also receive the client-source tag. Resolved per request rather
+# than baked into the table above, so COW_DESKTOP set after import is honored.
+_SOURCE_TAGGED_HOSTS = ("link-ai.tech",)
 
 
 def _resolve_attribution_headers(url: str) -> Dict[str, str]:
@@ -62,7 +79,16 @@ def _resolve_attribution_headers(url: str) -> Dict[str, str]:
         return {}
     for suffix, headers in _ATTRIBUTION_HEADERS_BY_HOST.items():
         if host == suffix or host.endswith("." + suffix):
-            return dict(headers)
+            resolved = dict(headers)
+            if any(host == h or host.endswith("." + h) for h in _SOURCE_TAGGED_HOSTS):
+                try:
+                    from common.utils import apply_client_source
+                    apply_client_source(resolved)
+                except Exception:
+                    resolved[_SOURCE_HEADER] = (
+                        "desktop" if os.environ.get("COW_DESKTOP") == "1" else "open-source"
+                    )
+            return resolved
     return {}
 
 
@@ -132,6 +158,45 @@ class OpenAIHTTPClient:
         (plain ``dict``). On error during streaming, yields a single dict with
         ``{"error": True, ...}`` and stops, matching the contract expected by
         ``agent/protocol/agent_stream.py``.
+        """
+        payload["stream"] = stream
+        return self._request(
+            path=path,
+            payload=payload,
+            api_key=api_key,
+            api_base=api_base,
+            timeout=timeout,
+            proxy=proxy,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+            stream=stream,
+        )
+
+    def responses(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        timeout: Optional[float] = None,
+        proxy: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+        extra_query: Optional[Dict[str, str]] = None,
+        path: str = "/responses",
+        stream: bool = False,
+        **payload,
+    ):
+        """POST /responses (OpenAI Responses API).
+
+        Required for models like gpt-6-astra whose tool calling is only
+        supported on Responses (Chat Completions cannot do tool calling with a
+        non-``none`` reasoning effort, and Astra does not support ``none``).
+
+        Non-streaming returns the raw Responses ``dict``. Streaming returns a
+        generator yielding parsed SSE event ``dict`` objects (each carries a
+        ``type`` such as ``response.output_text.delta``); the caller is
+        responsible for translating them into whatever shape it needs. On
+        error during streaming a single ``{"error": ..., "status_code": ...}``
+        chunk is yielded, matching :meth:`chat_completions`.
         """
         payload["stream"] = stream
         return self._request(

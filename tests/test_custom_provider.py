@@ -169,6 +169,69 @@ class TestResolveCustomCredentials(unittest.TestCase):
             ("legacy-key", "https://legacy.example.com/v1", None),
         )
 
+    # --- Explicit bot_type (routes the call off the global provider) ---
+
+    def test_explicit_bot_type_overrides_the_global_one(self):
+        """A caller routing to another provider gets that provider's creds.
+
+        This is the chat-fallback case: the global bot_type points at the
+        primary provider, but the engaged fallback link names a different
+        ``custom:<id>``. Reading the global value here paired the fallback's
+        model id with the primary vendor's api_base, and upstream answered
+        404 "model is not found".
+        """
+        set_conf({
+            "bot_type": "custom:primary1",
+            "custom_providers": [
+                {"id": "primary1", "name": "primary", "api_key": "key-primary",
+                 "api_base": "https://primary.example.com/v1", "model": "primary-model"},
+                {"id": "backup22", "name": "backup", "api_key": "key-backup",
+                 "api_base": "https://backup.example.com/v1", "model": "backup-model"},
+            ],
+        })
+        # No argument -> global provider (unchanged legacy behavior)
+        self.assertEqual(
+            self.resolve(),
+            ("key-primary", "https://primary.example.com/v1", "primary-model"),
+        )
+        # Explicit argument -> that provider, not the global one
+        self.assertEqual(
+            self.resolve("custom:backup22"),
+            ("key-backup", "https://backup.example.com/v1", "backup-model"),
+        )
+
+    def test_explicit_non_custom_bot_type_uses_openai_fields(self):
+        """An explicit non-custom type must not resolve custom credentials."""
+        set_conf({
+            "bot_type": "custom:primary1",
+            "open_ai_api_key": "sk-openai",
+            "open_ai_api_base": "https://api.openai.com/v1",
+            "custom_providers": [
+                {"id": "primary1", "name": "primary", "api_key": "key-primary",
+                 "api_base": "https://primary.example.com/v1"},
+            ],
+        })
+        self.assertEqual(
+            self.resolve("chatGPT"),
+            ("sk-openai", "https://api.openai.com/v1", None),
+        )
+
+    def test_explicit_legacy_custom_reads_flat_fields(self):
+        """Passing the bare legacy 'custom' resolves the flat credentials."""
+        set_conf({
+            "bot_type": "custom:primary1",
+            "custom_api_key": "legacy-key",
+            "custom_api_base": "https://legacy.example.com/v1",
+            "custom_providers": [
+                {"id": "primary1", "name": "primary", "api_key": "key-primary",
+                 "api_base": "https://primary.example.com/v1"},
+            ],
+        })
+        self.assertEqual(
+            self.resolve("custom"),
+            ("legacy-key", "https://legacy.example.com/v1", None),
+        )
+
 
 class TestGenerateProviderId(unittest.TestCase):
     """generate_provider_id() produces valid short ids."""

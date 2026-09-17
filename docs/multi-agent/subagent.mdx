@@ -1,0 +1,56 @@
+---
+title: Sub-Agent
+description: "Sub-Agent: hand independent tasks to a sub-Agent, run them in parallel, and get back only the conclusion"
+---
+
+A sub-Agent is a temporary execution unit that the lead Agent creates during a conversation. The lead Agent hands it one independent task, it completes that task in its own context, and it returns the result. The pages it opens, the files it reads, and the commands it runs never enter the main conversation.
+
+<Note>
+  Sub-Agents are temporary. They have no identity, memory, or channel of their own, and never appear in the Agent list.
+</Note>
+
+## Two Benefits
+
+- **Isolated context**: intermediate work does not consume the main conversation's context, which saves tokens and keeps the model's attention on what matters
+- **Parallel execution**: several sub-Agents can be created and run at once, so the total time is that of the slowest one
+
+## Inheritance and Isolation
+
+A sub-Agent inherits part of the lead Agent's environment, but it is not a copy of it:
+
+| Inherited | Not inherited |
+| --- | --- |
+| Model | Message history of the main conversation |
+| Workspace (files are read and written in the same place) | Persona and rule files (`AGENT.md`, `RULE.md`, `USER.md`) |
+| Skills (types with the full tool set only) | Writing to memory (it can read shared memory / the knowledge base, but never persists writes) |
+
+A sub-Agent therefore knows only what the lead Agent passes to it. It cannot see the conversation history and cannot ask the user anything, so every path, identifier, constraint, and settled conclusion it needs must be stated when the task is created.
+
+## When It Is Triggered
+
+The lead Agent decides on its own. There is nothing to configure and no dedicated command.
+
+**A sub-Agent is created when:**
+
+- Several unrelated things can be done at the same time, such as "research product A and product B separately"
+- A task produces a lot of intermediate output but only the conclusion is needed, such as "check whether this error has a known fix in the community"
+
+**A sub-Agent is not created when:**
+
+- The lead Agent needs the intermediate results to continue (reading a few files or running a few searches is ordinary execution)
+- The task depends on earlier parts of the conversation, or needs the user to confirm something along the way
+- The task should run over the long term across conversations, which is what [scheduled tasks](/tools/scheduler) are for
+
+To force something to be run by a sub-Agent, just say so in the conversation, for example "use sub-Agents to research these two directions separately".
+
+## What You See
+
+Each sub-Agent has its own card in the Web console and desktop client. Expand it to see the tool it is currently calling and the step it has reached; once it finishes, the card holds its full report. Multiple sub-Agents start and finish independently, so it is clear which one is still running.
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/cow-subagent-demo.png" style={{ maxWidth: "800px" }} />
+</Frame>
+
+## Types and Configuration
+
+Sub-Agents come in two built-in types, `general-purpose` and `explore`, and custom types can be defined in the workspace. For the types, available tools, concurrency and timeout settings, and the disabled tools, see the [subagent tool](/tools/subagent).

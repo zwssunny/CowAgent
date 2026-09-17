@@ -10,6 +10,7 @@ OpenAI → Gemini → Seedream → Qwen → MiniMax → LinkAI; missing API keys
 are skipped, and the provider that natively owns the requested model is
 promoted to the front of the queue):
 
+    - gpt-image-2.5-flare / gpt-image-2.5-sunburst → OpenAI
     - gpt-image-2 / gpt-image-1                    → OpenAI
     - nano-banana / gemini-*-image-*               → Gemini
     - doubao-seedream-* / seedream-*               → Seedream (Volcengine Ark)
@@ -124,6 +125,26 @@ def _load_image(source: str) -> bytes:
         return resp.read()
 
 
+def _decode_image_item(item: dict, *, url_first: bool = False) -> bytes | None:
+    """Return the image bytes carried by an OpenAI-compatible result item.
+
+    Some backends send both keys even when only one of them holds a value —
+    e.g. an empty ``b64_json`` next to a usable ``url`` in URL output mode.
+    Branching on key presence would decode the empty string into a 0-byte
+    file, so branch on the value instead and fall through to the other key.
+    Returns None when neither field carries a value.
+    """
+    keys = ("url", "b64_json") if url_first else ("b64_json", "url")
+    for key in keys:
+        value = item.get(key)
+        if not value:
+            continue
+        if key == "b64_json":
+            return base64.b64decode(value)
+        return _load_image(value)
+    return None
+
+
 def _compress_image(data: bytes, max_bytes: int = 4 * 1024 * 1024, max_edge: int = 4096) -> bytes:
     """Compress image to fit size/dimension limits. Requires Pillow only when needed."""
     if len(data) <= max_bytes:
@@ -187,6 +208,25 @@ def _save_image(data: bytes, output_dir: str) -> str:
     return path
 
 
+def _apply_attribution_headers(headers: dict) -> None:
+    """Forward run/source attribution passed down by the parent agent via env.
+
+    Kept local to this script so it stays self-contained; only invoked for the
+    first-party provider so identifiers never leak to third-party vendors.
+    """
+    mapping = {
+        "COW_AGENT_RUN_ID": "X-Agent-Run-Id",
+        "COW_CLIENT_SOURCE": "X-Client-Source",
+        "COW_CLIENT_OS": "X-Client-OS",
+        "COW_CLIENT_VERSION": "X-Client-Version",
+        "COW_DEPLOYMENT_ID": "X-Deployment-Id",
+    }
+    for env_name, header in mapping.items():
+        value = (os.environ.get(env_name) or "").strip()
+        if value:
+            headers[header] = value
+
+
 # ---------------------------------------------------------------------------
 # Provider interface
 # ---------------------------------------------------------------------------
@@ -214,13 +254,14 @@ class ImageProvider(ABC):
 
 
 # ---------------------------------------------------------------------------
-# OpenAI-compatible provider (gpt-image-2, gpt-image-1)
+# OpenAI-compatible provider
+# (gpt-image-2.5-flare, gpt-image-2.5-sunburst, gpt-image-2, gpt-image-1)
 # ---------------------------------------------------------------------------
 
 class OpenAIProvider(ImageProvider):
     """Provider for OpenAI Image API (generations + edits)."""
 
-    DEFAULT_MODEL = "gpt-image-2"
+    DEFAULT_MODEL = "gpt-image-2.5-flare"
 
     def __init__(self, api_key: str, api_base: str, model: str):
         self.api_key = api_key
@@ -243,16 +284,31 @@ class OpenAIProvider(ImageProvider):
                 msg = resp.text or resp.reason
             raise RuntimeError(f"API {resp.status_code}: {msg} (url: {resp.url})")
 
+    @staticmethod
+    def _raise_for_business_error(result: dict):
+        """Raise for OpenAI-compatible backends that report business errors
+        with HTTP 200 plus an `error` field (e.g. LinkAI, Volcengine Ark)."""
+        if isinstance(result, dict) and result.get("error"):
+            err = result["error"]
+            if isinstance(err, dict):
+                msg = err.get("message") or err.get("code") or str(err)
+            else:
+                msg = str(err)
+            raise RuntimeError(f"API error: {msg}")
+
     def _post_json(self, url: str, payload: dict) -> dict:
         headers = {**self._headers(), "Content-Type": "application/json"}
         if _HAS_REQUESTS:
             resp = requests.post(url, headers=headers, json=payload, timeout=300)
             self._raise_for_api_error(resp)
-            return resp.json()
-        data = json.dumps(payload).encode()
-        req = Request(url, data=data, headers=headers, method="POST")
-        with urlopen(req, timeout=300) as r:
-            return json.loads(r.read())
+            result = resp.json()
+        else:
+            data = json.dumps(payload).encode()
+            req = Request(url, data=data, headers=headers, method="POST")
+            with urlopen(req, timeout=300) as r:
+                result = json.loads(r.read())
+        self._raise_for_business_error(result)
+        return result
 
     def _post_multipart(self, url: str, fields: dict, files: list[tuple]) -> dict:
         """POST multipart/form-data using requests (or fall back to urllib)."""
@@ -260,7 +316,9 @@ class OpenAIProvider(ImageProvider):
         if _HAS_REQUESTS:
             resp = requests.post(url, headers=headers, data=fields, files=files, timeout=300)
             self._raise_for_api_error(resp)
-            return resp.json()
+            result = resp.json()
+            self._raise_for_business_error(result)
+            return result
         boundary = uuid.uuid4().hex
         body = b""
         for key, val in fields.items():
@@ -275,7 +333,9 @@ class OpenAIProvider(ImageProvider):
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         req = Request(url, data=body, headers=headers, method="POST")
         with urlopen(req, timeout=300) as r:
-            return json.loads(r.read())
+            result = json.loads(r.read())
+        self._raise_for_business_error(result)
+        return result
 
     def generate(
         self,
@@ -290,8 +350,12 @@ class OpenAIProvider(ImageProvider):
         # OpenAI Images API expects pixel size like 1024x1024.
         resolved = resolve_size(size, aspect_ratio) if (size or aspect_ratio) else None
         if image_url:
-            return self._edit(prompt, image_url=image_url, quality=quality, size=resolved, output_dir=output_dir)
-        return self._create(prompt, quality=quality, size=resolved, output_dir=output_dir)
+            paths = self._edit(prompt, image_url=image_url, quality=quality, size=resolved, output_dir=output_dir)
+        else:
+            paths = self._create(prompt, quality=quality, size=resolved, output_dir=output_dir)
+        if not paths:
+            raise RuntimeError("provider returned no image (empty data)")
+        return paths
 
     def _create(self, prompt: str, *, quality: str | None, size: str | None, output_dir: str) -> list[str]:
         url = f"{self.api_base}/images/generations"
@@ -341,11 +405,8 @@ class OpenAIProvider(ImageProvider):
     def _save_results(result: dict, output_dir: str) -> list[str]:
         paths = []
         for item in result.get("data", []):
-            if "b64_json" in item:
-                raw = base64.b64decode(item["b64_json"])
-                paths.append(_save_image(raw, output_dir))
-            elif "url" in item:
-                raw = _load_image(item["url"])
+            raw = _decode_image_item(item)
+            if raw:
                 paths.append(_save_image(raw, output_dir))
         return paths
 
@@ -357,7 +418,7 @@ class OpenAIProvider(ImageProvider):
 class LinkAIProvider(ImageProvider):
     """Provider for LinkAI unified image generation API."""
 
-    DEFAULT_MODEL = "gpt-image-2"
+    DEFAULT_MODEL = "gpt-image-2.5-flare"
 
     def __init__(self, api_key: str, api_base: str, model: str):
         self.api_key = api_key
@@ -404,6 +465,10 @@ class LinkAIProvider(ImageProvider):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        # Attribution headers so this out-of-process call joins the same run as
+        # its parent agent. Only sent to LinkAI (this provider), never to other
+        # vendors. Values are forwarded from the agent via env vars.
+        _apply_attribution_headers(headers)
 
         if _HAS_REQUESTS:
             resp = requests.post(url, headers=headers, json=payload, timeout=300)
@@ -426,11 +491,8 @@ class LinkAIProvider(ImageProvider):
 
         paths = []
         for item in result.get("data", []):
-            if "url" in item:
-                raw = _load_image(item["url"])
-                paths.append(_save_image(raw, output_dir))
-            elif "b64_json" in item:
-                raw = base64.b64decode(item["b64_json"])
+            raw = _decode_image_item(item, url_first=True)
+            if raw:
                 paths.append(_save_image(raw, output_dir))
         return paths
 
@@ -1001,6 +1063,7 @@ class MinimaxProvider(ImageProvider):
 # When the requested model matches a prefix, that provider is promoted to the
 # front of the queue. All other configured providers still run as fallbacks.
 _MODEL_PREFERRED_PROVIDER: list[tuple[tuple[str, ...], str]] = [
+    (("gpt-image-2.5",), "OpenAI"),
     (("gpt-image",), "OpenAI"),
     (("nano-banana", "gemini-"), "Gemini"),
     (("seedream", "doubao-seedream"), "Seedream"),
@@ -1023,6 +1086,8 @@ _PROVIDER_ID_TO_LABEL = {
     "linkai": "LinkAI",
 }
 
+_CUSTOM_PROVIDER_ENV = "SKILL_IMAGE_GENERATION_CUSTOM_PROVIDER"
+
 
 def _preferred_provider(model: str) -> str | None:
     m = (model or "").lower()
@@ -1030,6 +1095,38 @@ def _preferred_provider(model: str) -> str | None:
         if m.startswith(prefixes):
             return label
     return None
+
+
+def _build_custom_provider(
+    provider_id: str,
+    model: str,
+) -> tuple[str, ImageProvider] | None:
+    """Build the selected OpenAI-compatible custom image provider."""
+    try:
+        config = json.loads(os.environ.get(_CUSTOM_PROVIDER_ENV, ""))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(config, dict):
+        return None
+
+    custom_id = provider_id[len("custom:"):]
+    if config.get("id") != custom_id:
+        return None
+    api_key = (config.get("api_key") or "").strip()
+    api_base = (config.get("api_base") or "").strip()
+    selected_model = model or (config.get("model") or "").strip()
+    if not api_key or not api_base or not selected_model:
+        return None
+
+    label = (config.get("name") or provider_id).strip()
+    return (
+        label,
+        OpenAIProvider(
+            api_key=api_key,
+            api_base=api_base,
+            model=selected_model,
+        ),
+    )
 
 
 def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, ImageProvider]]:
@@ -1046,6 +1143,10 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
          model and fall back to automatic routing — every provider then uses
          its own DEFAULT_MODEL.
     """
+    if provider_id.startswith("custom:"):
+        provider = _build_custom_provider(provider_id, model)
+        return [provider] if provider else []
+
     keys = {
         "OpenAI": os.environ.get("OPENAI_API_KEY", ""),
         "Gemini": os.environ.get("GEMINI_API_KEY", ""),
@@ -1139,10 +1240,26 @@ def main():
     aspect_ratio = args.get("aspect_ratio")
     image_url = args.get("image_url")
 
-    output_dir = os.environ.get("IMAGE_OUTPUT_DIR", os.path.join(os.getcwd(), "images"))
+    # Resolve output dir independently of the live cwd (the agent may `cd`
+    # elsewhere, e.g. into this skill's dir, which gets wiped on restart).
+    # Priority: explicit IMAGE_OUTPUT_DIR -> workspace/project dir -> cwd.
+    output_base = os.environ.get("IMAGE_OUTPUT_DIR")
+    if not output_base:
+        workspace = os.environ.get("AGENT_WORKSPACE") or os.getcwd()
+        output_base = os.path.join(workspace, "images")
+    output_dir = output_base
 
     providers = _build_providers(model, provider_id=provider_id)
     if not providers:
+        if provider_id.startswith("custom:"):
+            print(json.dumps({
+                "error": (
+                    "The selected custom image provider is missing or "
+                    "has no API key, API base, or model configured. "
+                    "Update it in the Models settings before retrying."
+                )
+            }, ensure_ascii=False))
+            sys.exit(1)
         target = f"model '{model}'" if model else "image generation"
         print(json.dumps({
             "error": (

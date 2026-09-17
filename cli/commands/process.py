@@ -318,11 +318,15 @@ def update(ctx):
     # 1. Stop service first so git pull won't conflict with running code
     ctx.invoke(stop)
 
-    # 2. Git pull
+    # 2. Git pull — same helper the Web console updater uses.
+    from cli.update_service import run_git_pull
+
     if os.path.isdir(os.path.join(root, ".git")):
         click.echo("Pulling latest code...")
-        ret = subprocess.call(["git", "pull"], cwd=root)
-        if ret != 0:
+        pull = run_git_pull(root)
+        if pull.returncode != 0:
+            if pull.stdout:
+                click.echo(pull.stdout, err=True)
             click.echo("Error: git pull failed.", err=True)
             sys.exit(1)
     else:

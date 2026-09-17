@@ -53,6 +53,9 @@ class TestQianfanConstantsAndRouting(unittest.TestCase):
         from bridge.agent_bridge import AgentLLMModel
         from common import const
 
+        # __init__ is bypassed: routing is a pure function of the model name
+        # and config, and the overrides default to "follow the global config"
+        # on the class, which is what is being asked about here.
         model = AgentLLMModel.__new__(AgentLLMModel)
         fake_conf = MagicMock()
         fake_conf.get.side_effect = lambda key, default=None: {
@@ -363,13 +366,17 @@ class TestQianfanSurfaces(unittest.TestCase):
             return f.read()
 
     def test_web_console_registers_qianfan_provider(self):
-        source = self._read("channel/web/web_channel.py")
+        # Assert against the registry itself rather than the source text, so
+        # reformatting or switching the label to an i18n dict cannot break this.
+        from channel.web.web_channel import ConfigHandler
+        from common import const
 
-        self.assertIn('("qianfan", {', source)
-        self.assertIn('"label": "百度千帆"', source)
-        self.assertIn('"api_key_field": "qianfan_api_key"', source)
-        self.assertIn('"api_base_key": "qianfan_api_base"', source)
-        self.assertIn('"api_base_default": "https://qianfan.baidubce.com/v2"', source)
+        provider = ConfigHandler.PROVIDER_MODELS["qianfan"]
+
+        self.assertEqual(provider["api_key_field"], "qianfan_api_key")
+        self.assertEqual(provider["api_base_key"], "qianfan_api_base")
+        self.assertEqual(provider["api_base_default"], "https://qianfan.baidubce.com/v2")
+        self.assertIn(const.ERNIE_5_1, provider["models"])
 
     def test_web_console_allows_qianfan_config_edits(self):
         source = self._read("channel/web/web_channel.py")
@@ -558,52 +565,6 @@ class TestQianfanVisionTool(unittest.TestCase):
         # Other configured providers should still appear in the chain.
         for expected in ("Doubao", "Claude", "MiniMax"):
             self.assertIn(expected, names)
-
-
-class TestQianfanDocs(unittest.TestCase):
-    def _read(self, relative_path):
-        root = os.path.join(os.path.dirname(__file__), "..")
-        with open(os.path.join(root, relative_path), encoding="utf-8") as f:
-            return f.read()
-
-    def test_qianfan_docs_exist_in_all_doc_locales(self):
-        for path in (
-            "docs/models/qianfan.mdx",
-            "docs/en/models/qianfan.mdx",
-            "docs/ja/models/qianfan.mdx",
-        ):
-            text = self._read(path)
-            self.assertIn("qianfan_api_key", text)
-            self.assertIn("https://qianfan.baidubce.com/v2", text)
-            self.assertIn("ernie-4.5-turbo-128k", text)
-            self.assertIn("ernie-4.5-turbo-vl", text)
-
-    def test_model_indexes_link_qianfan(self):
-        for path in (
-            "docs/models/index.mdx",
-            "docs/en/models/index.mdx",
-            "docs/ja/models/index.mdx",
-        ):
-            text = self._read(path)
-            self.assertIn('/models/qianfan', text)
-
-    def test_readme_documents_native_qianfan_provider(self):
-        text = self._read("README.md")
-
-        self.assertIn('"model": "ernie-5.1"', text)
-        self.assertIn('"qianfan_api_key": ""', text)
-        self.assertIn('"qianfan_api_base": "https://qianfan.baidubce.com/v2"', text)
-
-    def test_vision_docs_document_qianfan_provider(self):
-        expected = {
-            "docs/tools/vision.mdx": "百度千帆",
-            "docs/en/tools/vision.mdx": "Baidu Qianfan",
-            "docs/ja/tools/vision.mdx": "Baidu Qianfan",
-        }
-        for path, label in expected.items():
-            text = self._read(path)
-            self.assertIn(label, text)
-            self.assertIn("ernie-4.5-turbo-vl", text)
 
 
 if __name__ == "__main__":

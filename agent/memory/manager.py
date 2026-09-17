@@ -267,6 +267,16 @@ class MemoryManager:
         memory_dir = self.config.get_memory_dir()
         workspace_dir = self.config.get_workspace()
 
+        # Was the index empty before this sync? Only then can we be sure every
+        # chunk came from the CURRENT chunking algorithm (a fresh index, or one
+        # cleared by rebuild-index), which is what lets us stamp
+        # chunker_version. A non-empty index may still hold chunks from an
+        # older algorithm, so it must not be stamped.
+        try:
+            files_before = int(self.storage.get_stats().get("files", 0) or 0)
+        except Exception:
+            files_before = -1  # unknown -> do not stamp
+
         files_to_scan: List[tuple] = []  # (file_path, source, scope, user_id)
 
         memory_file = Path(workspace_dir) / "MEMORY.md"
@@ -303,7 +313,10 @@ class MemoryManager:
 
         from config import conf
         if conf().get("knowledge", True):
-            knowledge_dir = Path(workspace_dir) / "knowledge"
+            # Resolve through state_dir so an Agent without its own knowledge/
+            # scans the shared base rather than an empty (or missing) local one.
+            from common import state_dir
+            knowledge_dir = Path(state_dir.knowledge_dir(base=workspace_dir))
             if knowledge_dir.exists():
                 for file_path in knowledge_dir.rglob("*.md"):
                     files_to_scan.append((file_path, "knowledge", "shared", None))
@@ -323,7 +336,12 @@ class MemoryManager:
             rel_path = str(file_path.relative_to(workspace_dir_path))
             if self.storage.get_file_hash(rel_path) == file_hash:
                 continue
-            chunks = self.chunker.chunk_text(content)
+            # Markdown files (memory + knowledge) get structure-aware chunking;
+            # anything else (rare) falls back to the plain char splitter.
+            if file_path.suffix.lower() == '.md':
+                chunks = self.chunker.chunk_markdown(content)
+            else:
+                chunks = self.chunker.chunk_text(content)
             if not chunks:
                 continue
             pending.append({
@@ -404,6 +422,19 @@ class MemoryManager:
                 mtime=int(stat.st_mtime),
                 size=stat.st_size,
             )
+
+        # Stamp the chunker version only when we rebuilt from an empty index,
+        # i.e. every chunk in it was produced by the current algorithm. An
+        # index that already had files may still contain chunks from an older
+        # chunker (file hashes do not change when only the chunker does), so it
+        # stays unstamped and /memory status will suggest a rebuild.
+        if files_before == 0:
+            try:
+                self.storage.set_meta(
+                    "chunker_version", str(TextChunker.CHUNKER_VERSION)
+                )
+            except Exception:
+                pass
 
         self._dirty = False
 

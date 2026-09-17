@@ -9,8 +9,8 @@ name: Release Desktop
 #
 # Full flow:
 #   1. (this workflow) build + upload to R2 + D1 as unpublished.
-#   2. (local) download the mac dmgs, run desktop/build/notarize-dmg.sh to
-#      notarize + staple + re-upload the stapled dmgs to R2.
+#   2. (local, manual) download the mac dmgs, notarize + staple them, then
+#      re-upload the stapled dmgs to R2.
 #   3. (Publish Desktop workflow) flip D1 is_latest=1 and attach GitHub
 #      Release assets — makes the version live on the site.
 #
@@ -96,9 +96,46 @@ jobs:
             --distpath desktop/build/dist \
             --workpath desktop/build/build-work
 
+      # PyInstaller follows whatever arch the host Python is, so a translated
+      # toolchain would hand us a backend for the wrong arch. Shipping that in
+      # an arm64 app puts the whole agent — and every browser it spawns — under
+      # Rosetta, which is slow enough to look like a hang. Catch it here.
+      - name: Verify backend architecture
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: |
+          want=arm64
+          [ "${{ matrix.arch }}" = "arm64" ] || want=x86_64
+          got="$(lipo -archs desktop/build/dist/cowagent-backend/cowagent-backend)"
+          echo "backend arch: $got (want $want)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::backend is $got but this job targets $want"
+            exit 1
+          fi
+
       - name: Install desktop deps
         working-directory: desktop
         run: npm ci
+
+      # Bundle ripgrep on Windows so the grep tool has a fast backend out of the
+      # box instead of falling back to PowerShell (slow, and prone to encoding /
+      # path quirks). macOS is intentionally excluded: it always has a working
+      # system `grep` that the tool uses correctly, so bundling rg there would
+      # only add ~5MB for a marginal speed gain. Placed at resources/bin, wired
+      # into PATH by python-manager.
+      - name: Bundle ripgrep binary (Windows only)
+        if: matrix.platform == 'win'
+        shell: bash
+        env:
+          RG_VERSION: "15.2.0"
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/resources/bin
+          url="https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc.zip"
+          curl -fL "$url" -o rg.zip
+          # -j flatten, -o overwrite; grab just the rg.exe from the archive.
+          unzip -j -o rg.zip '*/rg.exe' -d desktop/resources/bin
+          ls -l desktop/resources/bin
 
       - name: Write version into package.json
         working-directory: desktop
@@ -284,6 +321,15 @@ jobs:
           # so the yml files themselves don't need to go to R2.
           # .zip is the mac auto-update artifact (electron-updater's MacUpdater
           # can ONLY consume zip, not dmg — the dmg is for manual downloads).
+          # Flattening hides collisions: two jobs emitting the same installer
+          # name would silently overwrite each other and publish whichever
+          # landed last. Refuse instead of guessing.
+          dupes="$(find artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) \
+            -exec basename {} \; | sort | uniq -d)"
+          if [ -n "$dupes" ]; then
+            echo "::error::more than one build job produced: $dupes"
+            exit 1
+          fi
           find artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.blockmap' \) -exec cp {} dist/ \;
           echo "Staged files:"; ls -la dist
           # When the whole matrix failed there's nothing to publish; flag it so
@@ -304,12 +350,27 @@ jobs:
         run: |
           # Reuse the existing cow-skills bucket under a desktop/ prefix; this
           # is served by the cdn.cowagent.ai custom domain.
+          #
+          # R2's API sporadically returns 504 / 7009 (Upstream service
+          # unavailable) mid-upload, especially on the larger dmg/zip objects.
+          # A single failure would abort the whole release, so retry each put
+          # with backoff; re-putting the same key is idempotent (it overwrites).
           for f in dist/*; do
             base="$(basename "$f")"
             key="desktop/v${VER}/${base}"
             echo "==> Uploading $base -> r2://cow-skills/$key"
-            npx --yes wrangler@latest r2 object put "cow-skills/$key" \
-              --file "$f" --remote
+            for attempt in 1 2 3 4 5; do
+              if npx --yes wrangler@latest r2 object put "cow-skills/$key" \
+                   --file "$f" --remote; then
+                break
+              fi
+              if [ "$attempt" = 5 ]; then
+                echo "::error::R2 upload failed after 5 attempts: $key"
+                exit 1
+              fi
+              echo "attempt $attempt failed, retrying in $((attempt * 10))s..."
+              sleep $((attempt * 10))
+            done
           done
 
       - name: Register release rows in D1
@@ -322,7 +383,7 @@ jobs:
           # This build job ALWAYS registers rows as unpublished (is_latest=0), so
           # /download/<p>/latest keeps serving the previous release and the new
           # version stays invisible on the site. macOS dmgs still need to be
-          # notarized+stapled locally (build/notarize-dmg.sh) before they're
+          # notarized+stapled locally before they're
           # safe to ship. Promotion to latest happens later, only after
           # notarization, via the separate "Publish Desktop" workflow.
           echo "==> Registering $VER as unpublished (is_latest=0)."

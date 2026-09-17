@@ -7,6 +7,7 @@ import {
   Zap,
   Radio,
   Clock,
+  Users,
   Settings,
   PanelLeftClose,
   PanelLeftOpen,
@@ -21,21 +22,26 @@ import {
   FileText,
   Store,
   MessageSquareWarning,
+  Palette,
+  Check,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
+import type { Theme } from '../theme/themes'
 // The desktop app's own brand icon (transparent PNG), bundled by Vite.
 import brandLogo from '../assets/logo.png'
 import { t, getLang, setLang, Lang } from '../i18n'
 import { useUIStore } from '../store/uiStore'
+import { guardDocEditors } from '../store/docEditorStore'
 import { useTheme } from '../hooks/useTheme'
 import { usePlatform } from '../hooks/usePlatform'
 import { useUpdateStore, hasPendingUpdate, hasAvailableUpdate } from '../store/updateStore'
 import UpdateBanner from '../components/UpdateBanner'
+import { product } from '@product'
 
 // Fallback shown when app.getVersion() is unavailable (dev/web preview). Keep
 // in sync with desktop/package.json "version"; the packaged app overrides this
 // with the real value via IPC, so it only matters outside a packaged build.
-const FALLBACK_VERSION = '2.1.3'
+const FALLBACK_VERSION = '2.1.9'
 
 // External links opened in the user's default browser. The window-open handler
 // in the main process routes window.open() through shell.openExternal.
@@ -68,6 +74,10 @@ const NAV_ITEMS: NavItem[] = [
   { path: '/settings', labelKey: 'menu_settings', icon: Settings },
 ]
 
+// The Team entry only exists once the install runs more than one Agent, so a
+// single-Agent client shows exactly the original menu. Inserted after Chat.
+const AGENTS_ITEM: NavItem = { path: '/agents', labelKey: 'menu_agents', icon: Users }
+
 interface NavRailProps {
   onLangChange: () => void
 }
@@ -76,7 +86,7 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
   const location = useLocation()
   const navigate = useNavigate()
   const { navCollapsed, toggleNav } = useUIStore()
-  const { theme, toggleTheme } = useTheme()
+  const { theme, toggleTheme, themeId, themes, appName, setThemeId } = useTheme()
   // On macOS the top-left is occupied by the native traffic lights, so the
   // brand mark is only shown on Windows/Linux where that corner is otherwise
   // empty (mirrors the web console's sidebar logo).
@@ -84,6 +94,18 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
 
   const collapsed = navCollapsed
   const width = collapsed ? 'w-[56px]' : 'w-[208px]'
+
+  // Leaving a page unmounts its document editor, so settle any unsaved work
+  // first - here, while declining can still stop the navigation.
+  const go = async (path: string) => {
+    if (!(await guardDocEditors())) return
+    navigate(path)
+  }
+
+  // Always surface the Team entry: it is the only way to add a second Agent,
+  // so gating it on multi-Agent mode created a chicken-and-egg trap where a
+  // single-Agent install could never opt into a team. Inserted after Chat.
+  const navItems = [NAV_ITEMS[0], AGENTS_ITEM, ...NAV_ITEMS.slice(1)]
 
   const updateState = useUpdateStore()
   // Footer dot: hidden once dismissed for this version (user asked for this).
@@ -174,27 +196,31 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
           collapsed ? 'justify-center px-0' : 'px-3'
         }`}
       >
-        {!isMac && (
-          <div className="flex items-center gap-2 min-w-0 select-none">
-            <BrandLogo />
-            {!collapsed && (
-              <span className="text-[14px] font-semibold text-content truncate">CowAgent</span>
-            )}
-          </div>
-        )}
+        {!isMac &&
+          (product.slots?.NavRailBrand ? (
+            // A build may render its own wordmark in the brand area.
+            <product.slots.NavRailBrand collapsed={collapsed} />
+          ) : (
+            <div className="flex items-center gap-2 min-w-0 select-none">
+              <BrandLogo />
+              {!collapsed && (
+                <span className="text-[14px] font-semibold text-content truncate">{appName}</span>
+              )}
+            </div>
+          ))}
       </div>
 
       {/* Content area carries the right divider, starting below the titlebar */}
       <div className="flex-1 flex flex-col min-h-0 border-r border-default">
       {/* Nav items */}
       <nav className="flex-1 overflow-y-auto px-2 py-2 space-y-0.5">
-        {NAV_ITEMS.map((item) => {
+        {navItems.map((item) => {
           const Icon = item.icon
           const isActive = location.pathname === item.path
           return (
             <button
               key={item.path}
-              onClick={() => navigate(item.path)}
+              onClick={() => void go(item.path)}
               title={collapsed ? t(item.labelKey) : undefined}
               className={`group w-full flex items-center gap-3 rounded-btn cursor-pointer transition-colors h-9 ${
                 collapsed ? 'justify-center px-0' : 'px-3'
@@ -217,7 +243,9 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
       </div>
 
       {/* Footer actions: a single "more" entry (with version + update dot) that
-          opens an upward popover, plus the always-visible collapse toggle. */}
+          opens an upward popover, plus the always-visible collapse toggle. An
+          optional '@product' slot sits on the left (e.g. an account avatar),
+          taking the spot the "more" entry would otherwise occupy. */}
       <div className="flex-shrink-0 px-2 py-2 border-t border-subtle relative" ref={menuRef}>
         {menuOpen && (
           <FooterMenu
@@ -227,9 +255,12 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
             upToDate={checkedManually && updateStatusState === 'not-available' && !availableUpdate}
             onLogs={() => {
               setMenuOpen(false)
-              navigate('/logs')
+              void go('/logs')
             }}
             onTheme={toggleTheme}
+            themeId={themeId}
+            themes={themes}
+            onThemeId={setThemeId}
             onLanguage={toggleLanguage}
             onCheckUpdate={checkUpdate}
             onOpenLink={(url) => {
@@ -240,27 +271,36 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
         )}
 
         <div className={collapsed ? 'space-y-0.5' : 'flex items-center gap-1'}>
-          {/* Single clickable entry: version label (left) + the three dots
-              (right) form one button; the whole block opens the popover. The
-              version is the packaged app version, also what auto-update
-              compares against. Collapsed: dots only, version hidden. */}
-          <button
-            onClick={() => setMenuOpen((o) => !o)}
-            title={t('menu_more')}
-            className={`relative inline-flex items-center rounded-btn cursor-pointer transition-colors ${
-              menuOpen ? 'bg-surface-2 text-content' : 'text-content-tertiary hover:text-content hover:bg-surface-2'
-            } ${collapsed ? 'w-full h-9 justify-center' : 'h-8 px-2 gap-1.5'}`}
-          >
-            {!collapsed && version && (
-              <span className="text-[12px] truncate">{`v${version}`}</span>
-            )}
-            <MoreHorizontal size={17} className="flex-shrink-0" />
-            {pendingUpdate && (
-              <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-danger" />
-            )}
-          </button>
+          {/* Left side: either the built-in "more" entry (version + dots) or,
+              when an extension provides one and hides the built-in menu, its
+              footer slot (e.g. an account avatar). */}
+          {product.slots?.NavRailFooter && product.nav?.hideFooterMenu ? (
+            <div className={collapsed ? '' : 'flex-1 min-w-0'}>
+              <product.slots.NavRailFooter />
+            </div>
+          ) : (
+            !product.nav?.hideFooterMenu && (
+              <button
+                onClick={() => setMenuOpen((o) => !o)}
+                title={t('menu_more')}
+                className={`relative inline-flex items-center rounded-btn cursor-pointer transition-colors ${
+                  menuOpen ? 'bg-surface-2 text-content' : 'text-content-tertiary hover:text-content hover:bg-surface-2'
+                } ${collapsed ? 'w-full h-9 justify-center' : 'h-8 px-2 gap-1.5'}`}
+              >
+                {!collapsed && version && (
+                  <span className="text-[12px] truncate">{`v${version}`}</span>
+                )}
+                <MoreHorizontal size={17} className="flex-shrink-0" />
+                {pendingUpdate && (
+                  <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-danger" />
+                )}
+              </button>
+            )
+          )}
 
-          {!collapsed && <div className="flex-1" />}
+          {!collapsed && !(product.slots?.NavRailFooter && product.nav?.hideFooterMenu) && (
+            <div className="flex-1" />
+          )}
 
           <FooterBtn collapsed={collapsed} onClick={toggleNav} title={collapsed ? t('nav_expand') : t('nav_collapse')}>
             {collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
@@ -312,12 +352,16 @@ const FooterMenu: React.FC<{
   checking: boolean
   pendingUpdate: boolean
   upToDate: boolean
+  themeId: string
+  themes: Theme[]
+  onThemeId: (id: string) => void
   onLogs: () => void
   onTheme: () => void
   onLanguage: () => void
   onCheckUpdate: () => void
   onOpenLink: (url: string) => void
-}> = ({ theme, checking, pendingUpdate, upToDate, onLogs, onTheme, onLanguage, onCheckUpdate, onOpenLink }) => {
+}> = ({ theme, checking, pendingUpdate, upToDate, themeId, themes, onThemeId, onLogs, onTheme, onLanguage, onCheckUpdate, onOpenLink }) => {
+  const [themeMenuOpen, setThemeMenuOpen] = useState(false)
   const updateLabel = checking
     ? t('update_checking')
     : upToDate
@@ -325,17 +369,21 @@ const FooterMenu: React.FC<{
       : t('update_check')
   return (
   <div className="absolute bottom-full left-2 right-2 mb-2 z-50 rounded-lg border border-default bg-elevated shadow-lg py-1">
-    {/* External destinations first (skill hub, docs, website) */}
-    <MenuItem icon={<Store size={16} />} label={t('menu_skill_hub')} onClick={() => onOpenLink(SKILL_HUB_URL)} />
-    <MenuItem icon={<FileText size={16} />} label={t('menu_docs')} onClick={() => onOpenLink(docsUrl())} />
-    <MenuItem icon={<Globe size={16} />} label={t('menu_website')} onClick={() => onOpenLink(websiteUrl())} />
-    <MenuItem
-      icon={<MessageSquareWarning size={16} />}
-      label={t('menu_feedback')}
-      onClick={() => onOpenLink(FEEDBACK_URL)}
-    />
-
-    <div className="my-1 border-t border-subtle" />
+    {/* External destinations (skill hub, docs, website, feedback). An
+        extension may hide this group to keep the menu to app actions only. */}
+    {!product.nav?.hideExternalLinks && (
+      <>
+        <MenuItem icon={<Store size={16} />} label={t('menu_skill_hub')} onClick={() => onOpenLink(SKILL_HUB_URL)} />
+        <MenuItem icon={<FileText size={16} />} label={t('menu_docs')} onClick={() => onOpenLink(docsUrl())} />
+        <MenuItem icon={<Globe size={16} />} label={t('menu_website')} onClick={() => onOpenLink(websiteUrl())} />
+        <MenuItem
+          icon={<MessageSquareWarning size={16} />}
+          label={t('menu_feedback')}
+          onClick={() => onOpenLink(FEEDBACK_URL)}
+        />
+        <div className="my-1 border-t border-subtle" />
+      </>
+    )}
 
     {/* App actions below: update, theme, language, logs */}
     <MenuItem
@@ -351,6 +399,24 @@ const FooterMenu: React.FC<{
       onClick={onTheme}
     />
     <MenuItem
+      icon={<Palette size={16} />}
+      label={t('menu_theme_picker')}
+      trailing={themeMenuOpen ? '▾' : '▸'}
+      onClick={() => setThemeMenuOpen((o) => !o)}
+    />
+    {themeMenuOpen &&
+      themes.map((th) => (
+        <button
+          key={th.id}
+          onClick={() => onThemeId(th.id)}
+          className="w-full flex items-center gap-2.5 pl-8 pr-3 h-9 text-[13px] text-content-secondary hover:bg-surface-2 hover:text-content cursor-pointer transition-colors"
+        >
+          <ThemeSwatch preview={th.preview ?? { accent: '#4abe6e', bg: '#111', surface: '#1c1c1f' }} />
+          <span className="flex-1 text-left truncate">{th.name}</span>
+          {themeId === th.id && <Check size={14} className="flex-shrink-0 text-accent" />}
+        </button>
+      ))}
+    <MenuItem
       icon={<Languages size={16} />}
       label={t('menu_language')}
       trailing={getLang() === 'zh' ? 'EN' : '中'}
@@ -360,6 +426,17 @@ const FooterMenu: React.FC<{
   </div>
   )
 }
+
+// Tiny 3-color preview (bg / surface / accent) for the theme picker.
+const ThemeSwatch: React.FC<{ preview: { accent: string; bg: string; surface: string } }> = ({
+  preview,
+}) => (
+  <span className="flex-shrink-0 inline-flex h-4 w-4 rounded-full overflow-hidden border border-default">
+    <span className="w-1/3 h-full" style={{ background: preview.bg }} />
+    <span className="w-1/3 h-full" style={{ background: preview.surface }} />
+    <span className="w-1/3 h-full" style={{ background: preview.accent }} />
+  </span>
+)
 
 const MenuItem: React.FC<{
   icon: React.ReactNode

@@ -6,8 +6,7 @@ import requests
 from bridge.context import ContextType
 from channel.chat_message import ChatMessage
 from common.log import logger
-from common.utils import expand_path
-from config import conf
+from common import state_dir
 from Crypto.Cipher import AES
 
 
@@ -78,10 +77,7 @@ def _decrypt_media(url: str, aeskey: str) -> bytes:
 
 def _get_tmp_dir() -> str:
     """Return the workspace tmp directory (absolute path), creating it if needed."""
-    ws_root = expand_path(conf().get("agent_workspace", "~/cow"))
-    tmp_dir = os.path.join(ws_root, "tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    return tmp_dir
+    return str(state_dir.tmp_dir())
 
 
 class WecomBotMessage(ChatMessage):

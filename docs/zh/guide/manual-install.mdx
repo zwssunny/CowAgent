@@ -128,6 +128,15 @@ sudo docker compose up -d
 sudo docker logs -f chatgpt-on-wechat
 ```
 
+<Note>
+  **数据持久化**：`docker-compose.yml` 默认将两个目录挂载到宿主机，容器重启、`docker compose pull` 升级换镜像后数据都不会丢失：
+
+  - `./cow` → 容器内 `/home/agent/cow`：工作空间，存放对话安装的技能、记忆、知识库、`mcp.json` 及对话产物。
+  - `./cow-data` → 容器内 `/home/agent/.cow`：数据目录，由 `COW_DATA_DIR` 指定，存放 Web 控制台保存的 `config.json`、运行日志、通道凭据等。
+
+  两个目录默认位于 `docker-compose.yml` 同级路径下，请勿删除。
+</Note>
+
 <Tip>
   **Docker 公网访问 Web 控制台**：在 `docker-compose.yml` 中将 `WEB_HOST` 设为 `0.0.0.0`（容器内默认绑定 `127.0.0.1` 无法从宿主机外访问），同时强烈建议设置 `WEB_PASSWORD` 启用鉴权。此外需确保 `9899` 端口正确映射到宿主机，并在防火墙/安全组放行该端口。
 </Tip>
@@ -139,7 +148,7 @@ sudo docker logs -f chatgpt-on-wechat
     ```json
     {
       "channel_type": "web",
-      "model": "deepseek-v4-flash",
+      "model": "deepseek-flash",
       "deepseek_api_key": "",
       "agent": true,
       "agent_workspace": "~/cow",
@@ -154,7 +163,7 @@ sudo docker logs -f chatgpt-on-wechat
     ```yaml
     environment:
       CHANNEL_TYPE: 'web'
-      MODEL: 'deepseek-v4-flash'
+      MODEL: 'deepseek-flash'
       DEEPSEEK_API_KEY: 'your-api-key'
       DEEPSEEK_API_BASE: 'https://api.deepseek.com/v1'
       AGENT: 'True'
@@ -169,7 +178,7 @@ sudo docker logs -f chatgpt-on-wechat
 | 参数 | 环境变量 | 说明 | 默认值 |
 | --- | --- | --- | --- |
 | `channel_type` | `CHANNEL_TYPE` | 接入渠道类型 | `web` |
-| `model` | `MODEL` | 模型名称 | `deepseek-v4-flash` |
+| `model` | `MODEL` | 模型名称 | `deepseek-flash` |
 | `agent` | `AGENT` | 是否启用 Agent 模式 | `true` |
 | `agent_workspace` | - | Agent 工作空间路径 | `~/cow` |
 | `agent_max_context_tokens` | `AGENT_MAX_CONTEXT_TOKENS` | 最大上下文 tokens | `40000` |

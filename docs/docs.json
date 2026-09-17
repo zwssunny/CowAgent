@@ -142,12 +142,15 @@
                   "tools/write",
                   "tools/edit",
                   "tools/ls",
+                  "tools/search-files",
                   "tools/bash",
                   "tools/send",
                   "tools/memory",
                   "tools/env-config",
                   "tools/web-fetch",
-                  "tools/scheduler"
+                  "tools/scheduler",
+                  "tools/delegate",
+                  "tools/subagent"
                 ]
               },
               {
@@ -246,7 +249,20 @@
                   "cli/process",
                   "cli/skill",
                   "cli/memory-knowledge",
+                  "cli/backup",
                   "cli/general"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Multi-Agent",
+            "groups": [
+              {
+                "group": "Multi-Agent System",
+                "pages": [
+                  "multi-agent/team",
+                  "multi-agent/subagent"
                 ]
               }
             ]
@@ -258,6 +274,12 @@
                 "group": "Release Notes",
                 "pages": [
                   "releases/overview",
+                  "releases/v2.1.9",
+                  "releases/v2.1.8",
+                  "releases/v2.1.7",
+                  "releases/v2.1.6",
+                  "releases/v2.1.5",
+                  "releases/v2.1.4",
                   "releases/v2.1.3",
                   "releases/v2.1.2",
                   "releases/v2.1.1",
@@ -369,12 +391,15 @@
                   "zh/tools/write",
                   "zh/tools/edit",
                   "zh/tools/ls",
+                  "zh/tools/search-files",
                   "zh/tools/bash",
                   "zh/tools/send",
                   "zh/tools/memory",
                   "zh/tools/env-config",
                   "zh/tools/web-fetch",
-                  "zh/tools/scheduler"
+                  "zh/tools/scheduler",
+                  "zh/tools/delegate",
+                  "zh/tools/subagent"
                 ]
               },
               {
@@ -473,7 +498,20 @@
                   "zh/cli/process",
                   "zh/cli/skill",
                   "zh/cli/memory-knowledge",
+                  "zh/cli/backup",
                   "zh/cli/general"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "多 Agent",
+            "groups": [
+              {
+                "group": "多 Agent 系统",
+                "pages": [
+                  "zh/multi-agent/team",
+                  "zh/multi-agent/subagent"
                 ]
               }
             ]
@@ -485,6 +523,12 @@
                 "group": "发布记录",
                 "pages": [
                   "zh/releases/overview",
+                  "zh/releases/v2.1.9",
+                  "zh/releases/v2.1.8",
+                  "zh/releases/v2.1.7",
+                  "zh/releases/v2.1.6",
+                  "zh/releases/v2.1.5",
+                  "zh/releases/v2.1.4",
                   "zh/releases/v2.1.3",
                   "zh/releases/v2.1.2",
                   "zh/releases/v2.1.1",
@@ -596,12 +640,15 @@
                   "ja/tools/write",
                   "ja/tools/edit",
                   "ja/tools/ls",
+                  "ja/tools/search-files",
                   "ja/tools/bash",
                   "ja/tools/send",
                   "ja/tools/memory",
                   "ja/tools/env-config",
                   "ja/tools/web-fetch",
-                  "ja/tools/scheduler"
+                  "ja/tools/scheduler",
+                  "ja/tools/delegate",
+                  "ja/tools/subagent"
                 ]
               },
               {
@@ -706,12 +753,30 @@
             ]
           },
           {
+            "tab": "マルチ Agent",
+            "groups": [
+              {
+                "group": "マルチ Agent システム",
+                "pages": [
+                  "ja/multi-agent/team",
+                  "ja/multi-agent/subagent"
+                ]
+              }
+            ]
+          },
+          {
             "tab": "リリース",
             "groups": [
               {
                 "group": "リリースノート",
                 "pages": [
                   "ja/releases/overview",
+                  "ja/releases/v2.1.9",
+                  "ja/releases/v2.1.8",
+                  "ja/releases/v2.1.7",
+                  "ja/releases/v2.1.6",
+                  "ja/releases/v2.1.5",
+                  "ja/releases/v2.1.4",
                   "ja/releases/v2.1.3",
                   "ja/releases/v2.1.2",
                   "ja/releases/v2.1.1",

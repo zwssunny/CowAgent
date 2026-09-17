@@ -4,12 +4,16 @@ description: CowAgent - Open-source super AI assistant and Agent Harness
 ---
 
 <div align="center">
-  <img src="https://cdn.link-ai.tech/doc/78c5dd674e2c828642ecc0406669fed7.png" alt="CowAgent" width="450px"/>
+  <img src="https://cdn.link-ai.tech/doc/78c5dd674e2c828642ecc0406669fed7.png" alt="CowAgent" width="400px"/>
 </div>
 
 **CowAgent** is an open-source super AI assistant and Agent Harness. It proactively plans tasks, runs tools and skills, and autonomously grows with memory and knowledge.
 
-CowAgent is lightweight, easy to deploy, and built to extend. Plug in any major LLM provider, run it across Web and major IM platforms, 24/7 on a personal computer or server.
+CowAgent is lightweight, easy to deploy, and built to extend. Plug in any major LLM provider, quickly assemble a multi-agent team, run it across Web and major IM platforms, 24/7 on a personal computer or server.
+
+<Frame>
+  <video controls preload="metadata" playsInline className="w-full rounded-xl" src="https://cdn.cowagent.ai/desktop/video/cow-demo-en-v1.mp4" />
+</Frame>
 
 <CardGroup cols={2}>
   <Card title="GitHub" icon="github" href="https://github.com/zhayujie/CowAgent">
@@ -38,9 +42,6 @@ CowAgent is lightweight, easy to deploy, and built to extend. Plug in any major 
   <Card title="Skills System" icon="puzzle-piece" href="/skills/index">
     A complete skill creation and execution engine. Install from Skill Hub or generate custom skills via natural-language conversation.
   </Card>
-  <Card title="Multimodal Messaging" icon="image" href="/channels/web">
-    First-class support for text, images, voice, and files — recognition, generation, and delivery.
-  </Card>
   <Card title="Tool System" icon="wrench" href="/tools/index">
     Built-in file I/O, terminal, browser, scheduler, memory retrieval, web search, and more — with native MCP integration.
   </Card>
@@ -52,6 +53,9 @@ CowAgent is lightweight, easy to deploy, and built to extend. Plug in any major 
   </Card>
   <Card title="Multi-channel Integration" icon="server" href="/channels/index">
     A single Agent simultaneously serves Web, WeChat, Feishu, DingTalk, WeCom, QQ, and Official Accounts.
+  </Card>
+  <Card title="Multi-Agent Teams" icon="users" href="/multi-agent/team">
+    Create multiple Agents with distinct roles to form a team, with group-chat collaboration, task delegation, and sub-Agents — usable in the Web console, desktop client, and channel integrations.
   </Card>
 </CardGroup>
 
@@ -68,6 +72,12 @@ Run one of the commands below to install, configure, and start CowAgent in a sin
   <Tab title="Windows (PowerShell)">
     ```powershell
     irm https://cdn.link-ai.tech/code/cow/run.ps1 | iex
+    ```
+  </Tab>
+  <Tab title="Docker">
+    ```bash
+    curl -O https://cdn.link-ai.tech/code/cow/docker-compose.yml
+    docker compose up -d
     ```
   </Tab>
 </Tabs>
@@ -91,6 +101,10 @@ Once started, open `http://localhost:9899` to access the **Web console** — the
 
 ## Community
 
-Scan the WeChat QR code to join the open-source community group:
+<Card title="Join our Discord" icon="discord" href="https://discord.gg/9U8eA8v9TR">
+  Ask questions, share skills, and follow development
+</Card>
+
+Or scan the WeChat QR code to join the open-source community group:
 
 <img width="140" src="https://img-1317903499.cos.ap-guangzhou.myqcloud.com/docs/open-community.png" />

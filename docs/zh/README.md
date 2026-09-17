@@ -5,6 +5,8 @@
   <a href="https://github.com/zhayujie/CowAgent/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT" /></a>
   <a href="https://github.com/zhayujie/CowAgent"><img src="https://img.shields.io/github/stars/zhayujie/CowAgent?style=flat-square&cacheSeconds=3600" alt="Stars" /></a>
   <a href="https://docs.cowagent.ai/zh"><img src="https://img.shields.io/badge/%E6%96%87%E6%A1%A3-cowagent.ai-blue?style=flat&logo=readthedocs&logoColor=white" alt="文档" /></a>
+  <a href="https://cdn.link-ai.tech/code/cow/cowagent-wechat-group.png"><img src="https://img.shields.io/badge/%E5%BE%AE%E4%BF%A1-%E4%BA%A4%E6%B5%81%E7%BE%A4-07C160?style=flat&logo=wechat&logoColor=white" alt="微信交流群" /></a>
+  <a href="https://discord.gg/9U8eA8v9TR"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
 </p>
 
 <p align="center">
@@ -15,9 +17,9 @@
   [<a href="../../README.md">English</a>] | [中文] | [<a href="README-Hant.md">繁體中文</a>] | [<a href="../ja/README.md">日本語</a>]
 </p>
 
-**CowAgent** 是一个开源的超级 AI 助理，能够主动思考和规划任务、操作计算机和外部资源、创造和执行 Skills、构建知识库与长期记忆、通过自主进化与你一同成长，是 Agent Harness 工程的最佳实践之一。
+**CowAgent** 是一个开源的超级 AI 助理，能够主动思考和规划任务、操作计算机和外部资源、创造和执行 Skills、构建知识库与长期记忆、创建多智能体团队，并通过自主进化与你一同成长，是 Agent Harness 工程的最佳实践之一。
 
-CowAgent 轻量、易部署、可扩展，自由接入主流大模型，覆盖微信、飞书、钉钉、企微、QQ、Telegram、Slack、网页等多渠道，7×24 运行于个人电脑或服务器中。
+CowAgent 轻量、易部署、可扩展，自由接入主流大模型，覆盖微信、飞书、钉钉、企微、QQ、Telegram、Slack、网页等消息通道，7×24 运行于个人电脑或服务器中。
 
 <p align="center">
   <a href="https://cowagent.ai/?lang=zh">🌐 官网</a> &nbsp;·&nbsp;
@@ -30,11 +32,23 @@ CowAgent 轻量、易部署、可扩展，自由接入主流大模型，覆盖�
 
 <br/>
 
+## 🎬 演示
+
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/a2d8fb12-f294-42d6-a569-c4a6ceedab1d" controls muted playsinline width="720">
+    你的浏览器无法播放该视频。
+    <a href="https://cowagent.ai/?lang=zh">前往官网观看演示 →</a>
+  </video>
+</p>
+
+<br/>
+
 ## 🌟 核心能力
 
 | 能力 | 说明 |
 | :--- | :--- |
 | [任务规划](https://docs.cowagent.ai/zh/intro/architecture) | 理解复杂任务并自主分解执行，循环调用工具直到完成目标 |
+| [多智能体](https://docs.cowagent.ai/zh/multi-agent/team) | 创建多个 Agent 组成团队，各自拥有独立的记忆、能力与知识，通过分工协作完成任务 |
 | [长期记忆](https://docs.cowagent.ai/zh/memory) | 三层记忆架构（上下文 → 天级 → 核心），梦境蒸馏自动整理，支持关键词与向量混合检索 |
 | [知识库](https://docs.cowagent.ai/zh/knowledge) | 自动整理结构化知识为 Markdown Wiki，构建持续增长的知识图谱，可视化浏览 |
 | [自主进化](https://docs.cowagent.ai/zh/memory/self-evolution) | 自动复盘对话，优化技能、处理未完成事项、沉淀记忆与知识，在使用中持续成长 |
@@ -100,21 +114,31 @@ cow install-browser                # 安装浏览器工具
 
 <br/>
 
+## 👥 多智能体团队
+
+支持创建多个 Agent 组成团队，每个成员拥有独立的记忆、能力、知识与工作空间，既能专注各自领域，也能在同一会话中通过协作完成复杂任务。多 Agent 团队支持在 Web 端、桌面客户端、IM 通道接入端使用。
+
+<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/zh/agent-team-overview.png" alt="CowAgent 多智能体团队" width="800"/>
+
+> 详见 [Agent 团队](https://docs.cowagent.ai/zh/multi-agent/team)。
+
+<br/>
+
 ## 🤖 模型支持
 
 CowAgent 支持国内外主流厂商的大语言模型。**文本对话、图像理解、图像生成、语音识别/合成、向量** 等能力均可独立配置厂商。
 
 | 厂商 | 代表模型 | 文本 | 图像理解 | 图像生成 | 语音识别 | 语音合成 | 向量 |
 | --- | --- | :-: | :-: | :-: | :-: | :-: | :-: |
-| [DeepSeek](https://docs.cowagent.ai/zh/models/deepseek) | deepseek-v4-flash / pro | ✅ | | | | | |
+| [DeepSeek](https://docs.cowagent.ai/zh/models/deepseek) | deepseek-flash (V4.1) / pro | ✅ | ✅ | | | | |
+| [Claude](https://docs.cowagent.ai/zh/models/claude) | claude-opus-5 / fable-5.1 | ✅ | ✅ | | | | |
+| [OpenAI](https://docs.cowagent.ai/zh/models/openai) | gpt-6-astra / gpt-5.6 系列 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [Gemini](https://docs.cowagent.ai/zh/models/gemini) | gemini-3.8-flash | ✅ | ✅ | ✅ | | | |
 | [MiniMax](https://docs.cowagent.ai/zh/models/minimax) | MiniMax-M3 | ✅ | ✅ | ✅ | | ✅ | |
-| [Claude](https://docs.cowagent.ai/zh/models/claude) | claude-sonnet-5 / fable-5 | ✅ | ✅ | | | | |
-| [Gemini](https://docs.cowagent.ai/zh/models/gemini) | gemini-3.5-flash | ✅ | ✅ | ✅ | | | |
-| [OpenAI](https://docs.cowagent.ai/zh/models/openai) | gpt-5.6 系列 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| [智谱 GLM](https://docs.cowagent.ai/zh/models/glm) | glm-5.2、glm-5v-turbo | ✅ | ✅ | | ✅ | | ✅ |
-| [通义千问](https://docs.cowagent.ai/zh/models/qwen) | qwen3.7-plus | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [智谱 GLM](https://docs.cowagent.ai/zh/models/glm) | glm-5.3-flash、glm-5v-turbo | ✅ | ✅ | | ✅ | | ✅ |
+| [通义千问](https://docs.cowagent.ai/zh/models/qwen) | qwen3.8-flash | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [Kimi](https://docs.cowagent.ai/zh/models/kimi) | kimi-k3 | ✅ | ✅ | | | | |
 | [豆包 Doubao](https://docs.cowagent.ai/zh/models/doubao) | doubao-seed-2.1 系列 | ✅ | ✅ | ✅ | | | ✅ |
-| [Kimi](https://docs.cowagent.ai/zh/models/kimi) | kimi-k2.7-code | ✅ | ✅ | | | | |
 | [百度ERNIE](https://docs.cowagent.ai/zh/models/qianfan) | ernie-5.1 | ✅ | ✅ | | | | |
 | [小米 MiMo](https://docs.cowagent.ai/zh/models/mimo) | mimo-v2.5-pro / v2.5 | ✅ | ✅ | | | ✅ | |
 | [LinkAI](https://docs.cowagent.ai/zh/models/linkai) | 一个 Key 接入 100+ 模型 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -203,6 +227,18 @@ CowAgent 支持国内外主流厂商的大语言模型。**文本对话、图像
 
 ## 🏷 更新日志
 
+> **2026.09.14：** [v2.1.9](https://github.com/zhayujie/CowAgent/releases/tag/2.1.9) — 多 Agent 协作体验优化、模型列表配置与多兜底模型、通道接入修复、新增图像模型（gpt-image-2.5）、语音修复
+
+> **2026.09.10：** [v2.1.8](https://github.com/zhayujie/CowAgent/releases/tag/2.1.8) — 推出多 Agent 团队、定时任务支持手动创建、上下文用量可视化、模型和搜索工具接入、工作空间文件编辑
+
+> **2026.08.20：** [v2.1.7](https://github.com/zhayujie/CowAgent/releases/tag/2.1.7) — 多工作空间与会话隔离、会话级权限模式、任务通知、桌面端优化、新模型接入
+
+> **2026.08.12：** [v2.1.6](https://github.com/zhayujie/CowAgent/releases/tag/2.1.6) — 子 Agent 并行任务分配、推理强度配置、记忆向量库可插拔、体验和安全优化
+
+> **2026.07.29：** [v2.1.5](https://github.com/zhayujie/CowAgent/releases/tag/2.1.5) — 工作空间与文件预览、基础工具优化（文件搜索、写入校验、命令后台运行）、上下文压缩（`/compact`）、提示词一键优化、安全加固
+
+> **2026.07.20：** [v2.1.4](https://github.com/zhayujie/CowAgent/releases/tag/2.1.4) — 桌面客户端体验优化、MCP 支持 OAuth 授权、飞书通道能力增强、定时任务优化与数据备份、新模型接入
+
 > **2026.07.08：** [v2.1.3](https://github.com/zhayujie/CowAgent/releases/tag/2.1.3) — [桌面客户端](https://cowagent.ai/zh/download/)正式发布（macOS / Windows）、知识库文档管理增强、MCP 工具智能检索、繁体中文支持、新模型接入
 
 > **2026.06.18：** [v2.1.2](https://github.com/zhayujie/CowAgent/releases/tag/2.1.2) — Web 控制台升级（定时任务管理、知识库分类、多模型自定义厂商）、自主进化优化、新模型接入（kimi-k2.7-code、glm-5.2）、安全加固和体验优化
@@ -211,31 +247,21 @@ CowAgent 支持国内外主流厂商的大语言模型。**文本对话、图像
 
 > **2026.06.01：** [v2.1.0](https://github.com/zhayujie/CowAgent/releases/tag/2.1.0) — 国际化支持、新增通道（Telegram、Discord、Slack、微信客服）、命令行交互升级、一键安装脚本优化、MCP Streamable HTTP 支持、新模型接入（claude-opus-4-8、MiMo）
 
-> **2026.05.22：** [v2.0.9](https://github.com/zhayujie/CowAgent/releases/tag/2.0.9) — 模型管理、MCP 协议支持、浏览器登录态持久化、新模型接入（gpt-5.5、gemini-3.5-flash、qwen3.7-max）、部署安全加固
-
-> **2026.05.06：** [v2.0.8](https://github.com/zhayujie/CowAgent/releases/tag/2.0.8) — 飞书渠道全面升级（语音、流式输出、扫码接入）、新模型支持（DeepSeek V4、百度千帆）、定时任务工具增强
-
-> **2026.04.22：** [v2.0.7](https://github.com/zhayujie/CowAgent/releases/tag/2.0.7) — 图像生成内置技能（GPT Image 2、Nano Banana）、新模型支持（Kimi K2.6、Claude Opus 4.7、GLM 5.1）、知识库和记忆增强
-
-> **2026.04.14：** [v2.0.6](https://github.com/zhayujie/CowAgent/releases/tag/2.0.6) — 知识库系统、梦境记忆模块、上下文智能压缩、Web 控制台多会话
-
-> **2026.04.01：** [v2.0.5](https://github.com/zhayujie/CowAgent/releases/tag/2.0.5) — Cow CLI 命令系统、Skill Hub 开源、浏览器工具、企微扫码创建
-
-> **2026.03.22：** [v2.0.4](https://github.com/zhayujie/CowAgent/releases/tag/2.0.4) — 新增个人微信通道，支持文本/图片/文件/语音消息
-
-> **2026.02.03：** [v2.0.0](https://github.com/zhayujie/CowAgent/releases/tag/2.0.0) — 正式升级为超级 Agent 助理，支持多轮任务决策、长期记忆、Skills 框架
-
 完整更新历史：[Release Notes](https://docs.cowagent.ai/zh/releases)
 
 <br/>
 
 ## 🤝 社区与支持
 
-扫码加入微信开源交流群：
+微信扫码添加小助手，加入 CowAgent 开源项目交流群：
 
 <img width="130" src="https://img-1317903499.cos.ap-guangzhou.myqcloud.com/docs/open-community.png" />
 
-也可通过以下方式获取支持：
+也欢迎在 GitHub [提交 Issue](https://github.com/zhayujie/CowAgent/issues)，或加入 [**Discord 服务器**](https://discord.gg/9U8eA8v9TR) 交流：
+
+<a href="https://discord.gg/9U8eA8v9TR"><img src="https://img.shields.io/badge/Discord-加入社区-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="加入 Discord" /></a>
+
+还可通过以下方式获取支持：
 
 - 🐛 [提交 Issue](https://github.com/zhayujie/CowAgent/issues)
 - 🤖 在线 AI 助手：[项目小助手](https://link-ai.tech/app/Kv2fXJcH)（基于项目知识库）

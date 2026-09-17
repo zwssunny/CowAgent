@@ -53,9 +53,24 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
 
   setStatus: (s) =>
     set((st) => {
-      // A newly detected version auto-opens the panel.
-      if (s.state === 'available')
-        return { status: s, version: s.version, percent: 0, preparing: false, progressPeaked: false, panelOpen: true }
+      if (s.state === 'available') {
+        // Auto-open the panel once per version, but don't nag: an automatic
+        // check (startup / 4h poll) that finds a version the user already
+        // dismissed leaves the panel closed and only keeps the dot lit. A
+        // different (newer) version, or an explicit "check for update" click
+        // (userInitiated), re-opens it. recheck() clears dismissedVersion, so a
+        // manual check always satisfies the "not dismissed" condition too.
+        const alreadyDismissed = st.dismissedVersion === s.version
+        const shouldOpen = s.userInitiated === true || !alreadyDismissed
+        return {
+          status: s,
+          version: s.version,
+          percent: 0,
+          preparing: false,
+          progressPeaked: false,
+          panelOpen: shouldOpen,
+        }
+      }
       if (s.state === 'downloading') {
         // First real progress event clears the "preparing" busy state. Track
         // when we've hit ~100% so the Squirrel.Mac second pass renders as an

@@ -25,6 +25,8 @@ import type {
 } from '../types'
 import Markdown from '../components/Markdown'
 import KnowledgeGraph from '../components/KnowledgeGraph'
+import AgentScopeSelect from '../components/AgentScopeSelect'
+import { useAgentStore, selectMultiAgent } from '../store/agentStore'
 
 interface KnowledgePageProps {
   baseUrl: string
@@ -143,8 +145,8 @@ function findFileByName(list: KnowledgeList, filename: string): { path: string; 
 }
 
 // Resolve a relative `.md` link (from a document body) into a knowledge path.
-// Mirrors the web console's bindChatKnowledgeLinks logic: supports
-// `knowledge/…/x.md`, `category/x.md`, and bare/relative `../x.md` (by name).
+// Supports `knowledge/…/x.md`, `category/x.md`, and bare/relative `../x.md`
+// (matched by filename).
 function resolveKnowledgeLink(list: KnowledgeList, href: string): { path: string; title: string } | null {
   const clean = href.split('#')[0].split('?')[0]
   if (!clean.endsWith('.md')) return null
@@ -191,9 +193,23 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
 
+  // Which Agent's knowledge base is shown. The first visit shows the default
+  // Agent; the last choice is remembered across visits (and dropped if that
+  // Agent no longer exists). Empty in single-Agent mode (legacy path).
+  const multiAgent = useAgentStore(selectMultiAgent)
+  const defaultAgentId = useAgentStore((s) => s.defaultAgentId)
+  const agents = useAgentStore((s) => s.agents)
+  const [scopeAgentId, setScopeAgentId] = useState<string>(
+    () => localStorage.getItem('cow_knowledge_agent') || ''
+  )
+  const remembered = agents.some((a) => a.id === scopeAgentId) ? scopeAgentId : ''
+  const viewingAgentId = multiAgent ? remembered || defaultAgentId : ''
+
   const [activePath, setActivePath] = useState<string | null>(null)
   const [docTitle, setDocTitle] = useState('')
   const [content, setContent] = useState('')
+  // Absolute dir of the open doc, for resolving doc-relative image srcs.
+  const [docDir, setDocDir] = useState('')
   const [docLoading, setDocLoading] = useState(false)
 
   const [graph, setGraph] = useState<KnowledgeGraphData | null>(null)
@@ -215,20 +231,25 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
     }
   }, [])
 
-  const openDoc = useCallback(async (path: string, title: string) => {
-    setActivePath(path)
-    setDocTitle(title)
-    setDocLoading(true)
-    setContent('')
-    try {
-      const res = await apiClient.readKnowledge(path)
-      setContent(stripDuplicateH1(res.content || '', title))
-    } catch {
-      setContent(`> ${t('knowledge_doc_load_error')}`)
-    } finally {
-      setDocLoading(false)
-    }
-  }, [])
+  const openDoc = useCallback(
+    async (path: string, title: string) => {
+      setActivePath(path)
+      setDocTitle(title)
+      setDocLoading(true)
+      setContent('')
+      setDocDir('')
+      try {
+        const res = await apiClient.readKnowledge(path, viewingAgentId || undefined)
+        setContent(stripDuplicateH1(res.content || '', title))
+        setDocDir(res.dir || '')
+      } catch {
+        setContent(`> ${t('knowledge_doc_load_error')}`)
+      } finally {
+        setDocLoading(false)
+      }
+    },
+    [viewingAgentId]
+  )
 
   // Open an internal knowledge link (relative `.md`) from within a doc body.
   // Falls back silently when the target can't be resolved in the current tree.
@@ -246,7 +267,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const refresh = useCallback(
     async (targetPath?: string) => {
       try {
-        const fresh = await apiClient.getKnowledgeList()
+        const fresh = await apiClient.getKnowledgeList(viewingAgentId || undefined)
         setData(fresh)
         if (targetPath) {
           void openDoc(targetPath, findTitle(fresh, targetPath))
@@ -260,7 +281,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         return null
       }
     },
-    [openDoc, activePath]
+    [openDoc, activePath, viewingAgentId]
   )
 
   useEffect(() => {
@@ -268,8 +289,13 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
     let cancelled = false
     ;(async () => {
       setLoading(true)
+      // Switching the viewed Agent shows a different base, so drop the open doc
+      // and its graph and reopen the first file of the new base.
+      setActivePath(null)
+      setContent('')
+      setGraph(null)
       try {
-        const fresh = await apiClient.getKnowledgeList()
+        const fresh = await apiClient.getKnowledgeList(viewingAgentId || undefined)
         if (cancelled) return
         setData(fresh)
         const first = firstFile(fresh)
@@ -283,22 +309,27 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
     return () => {
       cancelled = true
     }
-    // Only run on baseUrl change (initial mount). refresh() handles later reloads.
+    // Reload on base URL or viewed-Agent change; refresh() handles in-page edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [baseUrl])
+  }, [baseUrl, viewingAgentId])
+
+  const setScope = (id: string) => {
+    setScopeAgentId(id)
+    localStorage.setItem('cow_knowledge_agent', id)
+  }
 
   const loadGraph = useCallback(async () => {
     if (graph) return
     setGraphLoading(true)
     try {
-      setGraph(await apiClient.getKnowledgeGraph())
+      setGraph(await apiClient.getKnowledgeGraph(viewingAgentId || undefined))
     } catch (e) {
       console.error('Failed to load graph:', e)
       setGraph({ nodes: [], links: [] })
     } finally {
       setGraphLoading(false)
     }
-  }, [graph])
+  }, [graph, viewingAgentId])
 
   const switchTab = (next: Tab) => {
     setTab(next)
@@ -322,7 +353,11 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
     async (path: string): Promise<string | null> => {
       showStatus(t('knowledge_working'), false, true)
       try {
-        const res = await apiClient.knowledgeAction({ action: 'create_category', payload: { path } })
+        const res = await apiClient.knowledgeAction({
+          action: 'create_category',
+          payload: { path },
+          ...(viewingAgentId ? { agent_id: viewingAgentId } : {}),
+        })
         if (res.status !== 'success') {
           showStatus((res.message as string) || t('knowledge_request_failed'), true)
           return null
@@ -335,7 +370,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         return null
       }
     },
-    [refresh, showStatus]
+    [refresh, showStatus, viewingAgentId]
   )
 
   const createDocument = useCallback(
@@ -345,6 +380,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         const res = await apiClient.knowledgeAction({
           action: 'create_document',
           payload: { path, content, overwrite: false },
+          ...(viewingAgentId ? { agent_id: viewingAgentId } : {}),
         })
         if (res.status !== 'success') {
           showStatus((res.message as string) || t('knowledge_request_failed'), true)
@@ -359,7 +395,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         return null
       }
     },
-    [refresh, showStatus]
+    [refresh, showStatus, viewingAgentId]
   )
 
   const importDocuments = useCallback(
@@ -376,7 +412,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
       }
       showStatus(t('knowledge_importing'), false, true)
       try {
-        const res = await apiClient.importKnowledge(supported, targetCategory)
+        const res = await apiClient.importKnowledge(supported, targetCategory, viewingAgentId || undefined)
         if (res.status !== 'success') {
           showStatus(res.message || t('knowledge_import_failed'), true)
           await refresh()
@@ -398,7 +434,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         return false
       }
     },
-    [refresh, showStatus]
+    [refresh, showStatus, viewingAgentId]
   )
 
   // Open the import dialog after validating the chosen files.
@@ -444,21 +480,31 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
 
   if (isEmpty) {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center px-6 text-center">
-        <div className="w-14 h-14 rounded-2xl bg-accent-soft text-accent flex items-center justify-center mb-5">
-          <Files size={26} />
+      <div className="flex-1 flex flex-col min-h-0">
+        {/* Keep the header (and the Agent scope picker) so switching away from an
+            empty Agent's base is still possible. */}
+        <div className="flex items-center justify-between px-6 pt-5 pb-3 flex-shrink-0">
+          <div>
+            <h2 className="text-xl font-bold text-content">{t('knowledge_title')}</h2>
+          </div>
+          <AgentScopeSelect value={viewingAgentId} onChange={setScope} />
         </div>
+        <div className="flex-1 flex flex-col items-center justify-center px-6 text-center border-t border-default">
+          <div className="w-14 h-14 rounded-2xl bg-accent-soft text-accent flex items-center justify-center mb-5">
+            <Files size={26} />
+          </div>
         <h2 className="text-lg font-semibold text-content mb-2">
           {data?.enabled === false ? t('knowledge_disabled') : t('knowledge_empty')}
         </h2>
         <p className="text-sm text-content-tertiary max-w-md mb-6">{t('knowledge_empty_guide')}</p>
-        <button
-          onClick={() => navigate('/')}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover text-sm font-medium cursor-pointer transition-colors"
-        >
-          <MessageSquarePlus size={15} />
-          {t('knowledge_go_chat')}
-        </button>
+          <button
+            onClick={() => navigate('/')}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover text-sm font-medium cursor-pointer transition-colors"
+          >
+            <MessageSquarePlus size={15} />
+            {t('knowledge_go_chat')}
+          </button>
+        </div>
       </div>
     )
   }
@@ -482,7 +528,8 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
               {status.text}
             </span>
           )}
-          <div className="flex items-center gap-1 bg-inset rounded-btn p-0.5">
+          <AgentScopeSelect value={viewingAgentId} onChange={setScope} />
+          <div className="flex items-center gap-1 bg-inset-2 rounded-btn p-0.5">
             <TabBtn icon={Files} label={t('knowledge_tab_docs')} active={tab === 'docs'} onClick={() => switchTab('docs')} />
             <TabBtn
               icon={Network}
@@ -585,7 +632,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
                     <Loader2 size={16} className="animate-spin mr-2" />
                   </div>
                 ) : (
-                  <Markdown content={content} onInternalLink={openInternalLink} />
+                  <Markdown content={content} onInternalLink={openInternalLink} imageBaseDir={docDir} />
                 )}
               </div>
             )}
@@ -926,7 +973,7 @@ const TabBtn: React.FC<{
   <button
     onClick={onClick}
     className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] text-sm font-medium cursor-pointer transition-colors ${
-      active ? 'bg-surface text-content shadow-sm' : 'text-content-tertiary hover:text-content-secondary'
+      active ? 'bg-elevated dark:bg-white/10 text-content shadow-sm' : 'text-content-tertiary hover:text-content-secondary'
     }`}
   >
     <Icon size={14} />
@@ -1035,7 +1082,7 @@ const FileLeaf: React.FC<{
 }> = ({ path, title, active, onOpen }) => (
   <button
     onClick={() => onOpen(path, title)}
-    className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-btn text-sm cursor-pointer transition-colors text-left ${
+    className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-btn text-[13px] cursor-pointer transition-colors text-left ${
       active ? 'bg-accent-soft text-accent' : 'text-content-secondary hover:bg-surface-2'
     }`}
   >

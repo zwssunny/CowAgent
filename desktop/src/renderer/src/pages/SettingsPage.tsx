@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { t } from '../i18n'
+import { product } from '@product'
 import BasicSettings from './settings/BasicSettings'
 import ModelsTab from './settings/ModelsTab'
 
@@ -13,13 +14,15 @@ type Tab = 'basic' | 'models'
 
 const SettingsPage: React.FC<SettingsPageProps> = ({ baseUrl, onLangChange }) => {
   const location = useLocation()
+  const modelsTabHidden = product.models?.hideModelsTab === true
   // Allow deep-linking to the models tab via /settings?tab=models.
-  const initial: Tab = new URLSearchParams(location.search).get('tab') === 'models' ? 'models' : 'basic'
+  const initial: Tab =
+    !modelsTabHidden && new URLSearchParams(location.search).get('tab') === 'models' ? 'models' : 'basic'
   const [tab, setTab] = useState<Tab>(initial)
 
   const tabs: { key: Tab; label: string }[] = [
     { key: 'basic', label: t('settings_tab_basic') },
-    { key: 'models', label: t('settings_tab_models') },
+    ...(modelsTabHidden ? [] : [{ key: 'models' as Tab, label: t('settings_tab_models') }]),
   ]
 
   return (
@@ -47,8 +50,12 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ baseUrl, onLangChange }) =>
           ))}
         </div>
 
-        {tab === 'basic' ? (
-          <BasicSettings baseUrl={baseUrl} onLangChange={onLangChange} onOpenModels={() => setTab('models')} />
+        {tab === 'basic' || modelsTabHidden ? (
+          <BasicSettings
+            baseUrl={baseUrl}
+            onLangChange={onLangChange}
+            onOpenModels={modelsTabHidden ? undefined : () => setTab('models')}
+          />
         ) : (
           <ModelsTab baseUrl={baseUrl} />
         )}

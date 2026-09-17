@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# Defaults — conservative (see executor module docstring). Disabled by default
-# until release; enable via ``self_evolution_enabled``.
-DEFAULT_ENABLED = False
+# Defaults — conservative (see executor module docstring). Only reached when
+# config.json cannot be read at all; the effective default lives in config.py.
+DEFAULT_ENABLED = True
 DEFAULT_IDLE_MINUTES = 10
 DEFAULT_MIN_TURNS = 6
 # Max review steps for the isolated evolution agent. Kept small (not exposed as

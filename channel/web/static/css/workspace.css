@@ -1,0 +1,667 @@
+/* Workspace panel, project picker, doc editor, file cards.
+   Split out of console.css; see channel/web/README.md for the
+   load order, which is load-bearing. */
+
+/* ============================================================
+   Workspace selector (project picker above the input)
+   ============================================================ */
+.workspace-selector-menu {
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 6px);
+    width: 320px;
+    max-height: 380px;
+    overflow-y: auto;
+    padding: 6px;
+    border-radius: 12px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.12), 0 2px 8px -2px rgba(0, 0, 0, 0.05);
+    z-index: 60;
+    animation: slashMenuIn 0.15s ease-out;
+}
+.workspace-selector-menu.hidden { display: none; }
+.ws-sel-section-title {
+    padding: 6px 10px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.ws-sel-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 8px 10px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: #334155;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+    text-align: left;
+}
+.ws-sel-item:hover { background: #EDFDF3; color: #228547; }
+.ws-sel-item i { width: 15px; text-align: center; color: #64748b; flex-shrink: 0; }
+.ws-sel-item:hover i { color: inherit; }
+.ws-sel-item .ws-sel-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.ws-sel-item .ws-sel-path {
+    font-size: 11px;
+    color: #94a3b8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.ws-sel-item.active { background: #EDFDF3; }
+.ws-sel-item.active .ws-sel-check { color: #228547; margin-left: auto; }
+.ws-sel-divider { height: 1px; margin: 5px 6px; background: #eef2f6; }
+.ws-sel-input-row { display: flex; gap: 6px; padding: 6px; }
+.ws-sel-input-row input {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 9px;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    font-size: 13px;
+    background: #f8fafc;
+    color: #334155;
+    outline: none;
+}
+.ws-sel-input-row input:focus { border-color: #4ABE6E; }
+.ws-sel-input-row button {
+    padding: 6px 12px;
+    border: none;
+    border-radius: 8px;
+    background: #4ABE6E;
+    color: #fff;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.ws-sel-input-row button:hover { background: #3aa85c; }
+.ws-sel-crumb {
+    padding: 4px 10px 6px;
+    font-size: 11px;
+    color: #64748b;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.dark .workspace-selector-menu {
+    background: #1A1A1A;
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.35), 0 2px 8px -2px rgba(0, 0, 0, 0.15);
+}
+.dark .ws-sel-item { color: #e2e8f0; }
+.dark .ws-sel-item i { color: #94a3b8; }
+.dark .ws-sel-item:hover,
+.dark .ws-sel-item.active { background: rgba(74, 190, 110, 0.1); color: #4ABE6E; }
+.dark .ws-sel-divider { background: rgba(255,255,255,0.08); }
+.dark .ws-sel-input-row input { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1); color: #e2e8f0; }
+.dark .ws-sel-crumb { color: #94a3b8; }
+
+/* ---- Folder picker modal (open project) ---- */
+.fp-btn {
+    width: 30px; height: 30px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 8px; border: 1px solid #e2e8f0; background: #f8fafc;
+    color: #64748b; font-size: 13px; cursor: pointer; transition: background .12s ease;
+}
+.fp-btn:hover:not([disabled]) { background: #EDFDF3; color: #228547; border-color: #cdeed8; }
+.fp-btn[disabled] { opacity: 0.4; cursor: default; }
+.dark .fp-btn { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1); color: #94a3b8; }
+.dark .fp-btn:hover:not([disabled]) { background: rgba(74,190,110,0.12); color: #4ABE6E; }
+
+.fp-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: 8px; cursor: pointer;
+    color: #334155; font-size: 14px; transition: background .1s ease;
+}
+.fp-row:hover { background: #f1f5f9; }
+.fp-row.selected { background: #EDFDF3; color: #228547; }
+.fp-row > i:first-child { color: #eab308; width: 16px; text-align: center; flex-shrink: 0; }
+.fp-row.selected > i:first-child { color: #228547; }
+.fp-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-into { color: #cbd5e1; font-size: 11px; padding: 4px; border-radius: 6px; flex-shrink: 0; }
+.fp-into:hover { background: rgba(0,0,0,0.06); color: #64748b; }
+.dark .fp-row { color: #e2e8f0; }
+.dark .fp-row:hover { background: rgba(255,255,255,0.06); }
+.dark .fp-row.selected { background: rgba(74,190,110,0.12); color: #4ABE6E; }
+.dark .fp-into:hover { background: rgba(255,255,255,0.1); }
+.fp-empty {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; height: 200px; color: #94a3b8; font-size: 13px;
+}
+.fp-empty i { font-size: 22px; opacity: 0.5; }
+
+/* =====================================================================
+   Workspace Panel (preview + file manager)
+   ===================================================================== */
+.workspace-panel {
+    position: relative;
+    flex-shrink: 0;
+    width: 420px;
+    min-width: 280px;
+    max-width: 70vw;
+    height: 100%;
+    display: flex;
+    background: #ffffff;
+    border-left: 1px solid #e5e7eb;
+}
+.dark .workspace-panel {
+    background: #1A1A1A;
+    border-left-color: rgba(255, 255, 255, 0.08);
+}
+.workspace-panel.hidden { display: none; }
+
+.workspace-inner {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.workspace-resizer {
+    position: absolute;
+    left: -3px;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    cursor: col-resize;
+    z-index: 20;
+}
+.workspace-resizer:hover,
+.workspace-resizer.dragging { background: rgba(74, 190, 110, 0.35); }
+
+.workspace-header {
+    height: 48px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 8px 0 10px;
+    border-bottom: 1px solid #e5e7eb;
+}
+.dark .workspace-header { border-bottom-color: rgba(255, 255, 255, 0.08); }
+
+.workspace-tabs { display: flex; gap: 2px; }
+.workspace-tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    color: #64748b;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+.workspace-tab i { font-size: 12px; }
+.workspace-tab:hover { background: #f1f5f9; color: #334155; }
+.workspace-tab.active { background: #EDFDF3; color: #228547; }
+.dark .workspace-tab { color: #94a3b8; }
+.dark .workspace-tab:hover { background: rgba(255, 255, 255, 0.06); color: #e2e8f0; }
+.dark .workspace-tab.active { background: rgba(74, 190, 110, 0.12); color: #4ABE6E; }
+
+.workspace-header-actions { display: flex; align-items: center; gap: 2px; }
+.workspace-icon-btn {
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    font-size: 13px;
+    color: #94a3b8;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+.workspace-icon-btn:hover { background: #f1f5f9; color: #334155; }
+.workspace-icon-btn.hidden { display: none; }
+.dark .workspace-icon-btn:hover { background: rgba(255, 255, 255, 0.08); color: #e2e8f0; }
+
+.workspace-body {
+    display: none;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+}
+.workspace-body.active { display: flex; }
+
+.workspace-file-title {
+    flex-shrink: 0;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: #64748b;
+    border-bottom: 1px solid #f1f5f9;
+    word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+.workspace-file-title.hidden { display: none; }
+.dark .workspace-file-title { color: #94a3b8; border-bottom-color: rgba(255, 255, 255, 0.06); }
+
+.workspace-preview-content {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    position: relative;
+}
+.workspace-preview-content iframe {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    display: block;
+    background: #fff;
+}
+.workspace-preview-content .ws-pad { padding: 16px; }
+.workspace-preview-content img.ws-media,
+.workspace-preview-content video.ws-media {
+    max-width: 100%;
+    display: block;
+    margin: 0 auto;
+    border-radius: 8px;
+}
+.workspace-preview-content audio.ws-media { width: 100%; margin-top: 12px; }
+.workspace-preview-content pre {
+    margin: 0;
+    padding: 16px;
+    font-size: 12.5px;
+    line-height: 1.6;
+    white-space: pre;
+    overflow: auto;
+}
+
+/* Preview editor: fills the panel so the text area is the whole scroll area. */
+.workspace-preview-content .ws-editor {
+    width: 100%;
+    height: 100%;
+    display: block;
+    border: 0;
+    outline: none;
+    resize: none;
+    padding: 16px;
+    background: transparent;
+    color: #1e293b;
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    tab-size: 4;
+    white-space: pre;
+    overflow: auto;
+}
+.dark .workspace-preview-content .ws-editor { color: #e2e8f0; }
+.workspace-icon-btn.ws-btn-busy { opacity: 0.5; pointer-events: none; }
+
+/* =====================================================================
+   Document editor (memory files, skill definitions)
+   ===================================================================== */
+
+/* Sized to the viewport rather than to the content: a text area that grows with
+   the document would push its own save button off the top of the page. */
+textarea.doc-editor {
+    display: block;
+    width: 100%;
+    height: calc(100dvh - 280px);
+    min-height: 240px;
+    border: 0;
+    outline: none;
+    resize: vertical;
+    background: transparent;
+    color: #1e293b;
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+    tab-size: 4;
+    /* Wrap instead of scrolling sideways: these are prose documents, and a
+       horizontal scrollbar hides the end of every long paragraph. `anywhere`
+       covers the unbreakable cases (long URLs) that would still overflow. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+.dark textarea.doc-editor { color: #e2e8f0; }
+
+.doc-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    padding: 6px 12px;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    font-size: 13px;
+    color: #64748b;
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s;
+}
+.doc-action-btn:hover { background: #f1f5f9; color: #334155; }
+.dark .doc-action-btn { border-color: rgba(255, 255, 255, 0.1); color: #94a3b8; }
+.dark .doc-action-btn:hover { background: rgba(255, 255, 255, 0.1); color: #e2e8f0; }
+
+/* primary-500 / primary-600 from the Tailwind theme in chat.html. */
+.doc-action-btn-primary {
+    border-color: transparent;
+    background: #35A85B;
+    color: #fff;
+}
+.doc-action-btn-primary:hover { background: #228547; color: #fff; }
+.dark .doc-action-btn-primary { border-color: transparent; background: #35A85B; color: #fff; }
+.dark .doc-action-btn-primary:hover { background: #228547; color: #fff; }
+
+.doc-action-btn.doc-btn-busy { opacity: 0.5; pointer-events: none; }
+
+/* Unsaved-changes marker beside the file name in a viewer title. */
+.doc-dirty-dot { color: #35A85B; }
+
+.workspace-empty {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    color: #94a3b8;
+    font-size: 13px;
+    padding: 24px;
+    text-align: center;
+}
+.workspace-empty i { font-size: 26px; opacity: 0.4; }
+
+/* Files tab */
+.workspace-files-toolbar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+}
+.workspace-search {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    height: 32px;
+    border-radius: 8px;
+    background: #f1f5f9;
+}
+.workspace-search i { font-size: 11px; color: #94a3b8; }
+.workspace-search input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    outline: none;
+    font-size: 13px;
+    color: #334155;
+}
+.dark .workspace-search { background: rgba(255, 255, 255, 0.06); }
+.dark .workspace-search input { color: #e2e8f0; }
+
+.workspace-breadcrumb {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 0 12px 8px;
+    font-size: 12px;
+    color: #94a3b8;
+}
+.workspace-breadcrumb .crumb { cursor: pointer; border-radius: 4px; padding: 1px 4px; display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+.workspace-breadcrumb .crumb:hover { background: #f1f5f9; color: #334155; }
+.dark .workspace-breadcrumb .crumb:hover { background: rgba(255, 255, 255, 0.08); color: #e2e8f0; }
+.workspace-breadcrumb .sep { opacity: 0.5; }
+.workspace-breadcrumb .crumb-root {
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;         /* keep the meaningful tail (project name) visible */
+    text-align: left;
+    font-size: 11px;
+    opacity: 0.9;
+}
+
+.workspace-file-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 6px 12px;
+}
+.ws-file-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 8px;
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.12s ease;
+}
+.ws-file-row:hover { background: #f1f5f9; }
+.dark .ws-file-row:hover { background: rgba(255, 255, 255, 0.06); }
+.ws-file-row.active { background: #EDFDF3; }
+.dark .ws-file-row.active { background: rgba(74, 190, 110, 0.12); }
+.ws-file-row > i {
+    width: 16px;
+    text-align: center;
+    font-size: 13px;
+    flex-shrink: 0;
+}
+.ws-file-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    color: #334155;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.dark .ws-file-name { color: #e2e8f0; }
+.ws-file-meta {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: #94a3b8;
+}
+.ws-file-path {
+    font-size: 11px;
+    color: #94a3b8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* File icon colors by kind */
+.ws-icon-directory { color: #f59e0b; }
+.ws-icon-html { color: #f97316; }
+.ws-icon-markdown { color: #6366f1; }
+.ws-icon-image { color: #10b981; }
+.ws-icon-video { color: #ec4899; }
+.ws-icon-audio { color: #8b5cf6; }
+.ws-icon-pdf { color: #ef4444; }
+.ws-icon-csv { color: #14b8a6; }
+.ws-icon-code { color: #3b82f6; }
+.ws-icon-office { color: #2563eb; }
+.ws-icon-text,
+.ws-icon-file { color: #94a3b8; }
+
+/* =====================================================================
+   Artifact / File Cards in messages
+   ===================================================================== */
+.file-card-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 10px 0;
+}
+.file-card {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 100%;
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: 1px solid #e2e8f0;
+    background: #fff;
+    cursor: pointer;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+.file-card:hover {
+    border-color: #4ABE6E;
+    box-shadow: 0 2px 10px -2px rgba(74, 190, 110, 0.25);
+}
+.dark .file-card { background: #232323; border-color: rgba(255, 255, 255, 0.1); }
+.dark .file-card:hover { border-color: #4ABE6E; }
+.file-card > i.file-card-icon { font-size: 16px; flex-shrink: 0; }
+.file-card-info { min-width: 0; flex: 1; }
+.file-card-name {
+    font-size: 13px;
+    font-weight: 500;
+    color: #334155;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.dark .file-card-name { color: #e2e8f0; }
+.file-card-sub {
+    font-size: 11px;
+    color: #94a3b8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.file-card-actions { display: flex; gap: 2px; flex-shrink: 0; }
+.file-card-btn {
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    font-size: 11px;
+    color: #94a3b8;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+}
+.file-card-btn:hover { background: #f1f5f9; color: #334155; }
+.dark .file-card-btn:hover { background: rgba(255, 255, 255, 0.08); color: #e2e8f0; }
+
+/* Inline path chip (fallback for paths mentioned only in text) */
+.file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 1px 7px;
+    margin: 0 1px;
+    border-radius: 6px;
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    font-size: 0.88em;
+    color: #334155;
+    cursor: pointer;
+    vertical-align: baseline;
+    text-decoration: none;
+}
+.file-chip:hover { border-color: #4ABE6E; color: #228547; }
+.file-chip i { font-size: 0.85em; opacity: 0.7; }
+.dark .file-chip { background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.1); color: #e2e8f0; }
+.dark .file-chip:hover { border-color: #4ABE6E; color: #4ABE6E; }
+
+/* =====================================================================
+   Mention (@) menu
+   ===================================================================== */
+.mention-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    max-height: 300px;
+    overflow-y: auto;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.1), 0 2px 8px -2px rgba(0, 0, 0, 0.04);
+    z-index: 50;
+    padding: 4px;
+    animation: slashMenuIn 0.15s ease-out;
+}
+.mention-menu.hidden { display: none; }
+.dark .mention-menu {
+    background: #1A1A1A;
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.35), 0 2px 8px -2px rgba(0, 0, 0, 0.15);
+}
+.mention-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+}
+.mention-item:hover,
+.mention-item.active { background: #EDFDF3; }
+.dark .mention-item:hover,
+.dark .mention-item.active { background: rgba(74, 190, 110, 0.1); }
+.mention-item > i { width: 15px; text-align: center; font-size: 12px; flex-shrink: 0; }
+.mention-item .m-name {
+    font-size: 13px;
+    color: #334155;
+    flex-shrink: 0;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dark .mention-item .m-name { color: #e2e8f0; }
+.mention-item .m-path {
+    font-size: 11px;
+    color: #94a3b8;
+    flex: 1;
+    min-width: 0;
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+}
+.mention-empty { padding: 10px; font-size: 12px; color: #94a3b8; text-align: center; }
+
+/* Drop target highlight when dragging a workspace file into the chat */
+.chat-main.ws-drop-active::after {
+    content: '';
+    position: absolute;
+    inset: 8px;
+    border: 2px dashed #4ABE6E;
+    border-radius: 14px;
+    background: rgba(74, 190, 110, 0.06);
+    pointer-events: none;
+    z-index: 30;
+}
+
+/* Mobile: workspace panel takes over the chat view */
+@media (max-width: 768px) {
+    .workspace-panel {
+        position: absolute;
+        inset: 0;
+        width: 100% !important;
+        max-width: none;
+        z-index: 46;
+    }
+    .workspace-resizer { display: none; }
+}
+

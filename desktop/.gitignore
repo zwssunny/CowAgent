@@ -1,6 +1,10 @@
 node_modules/
 dist/
 release/
+v[0-9]*/
 *.log
 .DS_Store
 Thumbs.db
+flavors/
+resources/app-config.json
+resources/themes/

@@ -44,6 +44,10 @@ Memory & Knowledge:
   memory    Memory distillation (dream)
   knowledge View knowledge base stats and structure
 
+Data portability:
+  backup    Back up config and agent workspace
+  restore   Restore a CowAgent backup
+
 Others:
   help      Show this help message
   version   Show version
@@ -58,6 +62,7 @@ In the Web console or any connected channel, type `/` to see command suggestions
 | `/help` | Show command help |
 | `/status` | View service status and configuration |
 | `/cancel` | Abort the currently running agent task |
+| `/steer <instruction>` | Guide the currently running agent task without queueing a new turn |
 | `/config` | View or modify runtime configuration |
 | `/skill` | Manage skills (install, uninstall, enable, disable, etc.) |
 | `/memory dream [N]` | Manually trigger memory distillation (default 3 days, max 30) |
@@ -90,6 +95,7 @@ In the Web console or any connected channel, type `/` to see command suggestions
 | start / stop / restart | ✓ | ✗ |
 | update | ✓ | ✗ |
 | install-browser | ✓ | ✗ |
+| backup / restore | ✓ | ✗ |
 
 <Note>
   `context` only shows a hint in the terminal to use it in chat. `config` is only available in chat.

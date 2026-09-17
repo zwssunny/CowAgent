@@ -1,0 +1,295 @@
+name: Release Desktop Overlay (Win7 legacy)
+
+# Win7/8/8.1 legacy build of the BRANDED overlay client (LinkAI), i.e. the
+# intersection of two existing workflows:
+#   - release-overlay.yml : applies the private overlay onto desktop/ and ships
+#                           to R2 under the overlay's own prefix (no D1).
+#   - release-win7.yml    : downgrades BOTH halves to the last Win7-capable
+#                           versions (Electron 22 + Python 3.8) so the exe runs
+#                           on Windows 7.
+#
+# WHY A SEPARATE FILE
+# The standard overlay build (Electron 33 / Python 3.11) throws "不是有效的
+# Win32 应用程序" on Win7. Supporting it means pinning Electron 22.3.27 and
+# Python 3.8 — the same downgrade release-win7.yml does for the core, but with
+# the overlay applied and the overlay's LinkAI distribution. Kept apart from the
+# standard overlay matrix so it never disturbs it; delete when Win7 support is
+# no longer worth maintaining.
+#
+# UPDATE FEED — DEDICATED CHANNEL (the crux)
+# The overlay client reads a STATIC feed (generic provider) at
+# cdn.link-ai.tech/linkai-desktop/. Standard win and Win7 win are both the
+# "latest" channel, so they'd collide on the same latest.yml — and a Win7 client
+# offered the standard package can't run it. So this leg builds on its own
+# channel `latest-win7` (`publish.channel`), which makes electron-builder emit
+# `latest-win7.yml` AND stamp it into the packaged app-update.yml. Win7 clients
+# then only ever poll latest-win7.yml, fully isolated from the standard feed.
+# The installer also carries a `win7` name segment so it never collides with the
+# standard exe in the same v<ver>/ folder.
+#
+# WHY THIS WORKFLOW LIVES IN THE PUBLIC CORE REPO (same as release-overlay.yml)
+# Actions minutes bill to the repo that owns the RUN, not the checked-out repos,
+# and public repos get free standard runners. Windows here costs nothing; the
+# overlay stays private, pulled in with a read-only deploy key.
+#
+# CAUTION: logs of this workflow are PUBLIC. Product-identifying values are kept
+# in secrets so Actions masks them, and OVERLAY_PRODUCT_NAME is registered with
+# ::add-mask:: so the packager's own output (installer filenames built from
+# productName) is redacted too. Don't add steps that dump the overlay tree, the
+# environment, or R2 responses.
+#
+# IMPORTANT for end users: Win7 must have SP1 + update KB2533623 (or the rollup
+# KB4457144) installed, otherwise the Python 3.8 backend still fails to start.
+#
+# Required secrets in THIS repo (same set as release-overlay.yml):
+#   OVERLAY_DEPLOY_KEY     read-only deploy key for the overlay repo
+#   OVERLAY_R2_PREFIX      R2 key prefix for this variant, e.g. "linkai-desktop/"
+#   OVERLAY_PRODUCT_NAME   the overlay's productName, used only to redact it
+#                          from the public logs (optional but recommended)
+#   CLIENT_SMS_SECRET      matches client.sms.secret on the server
+#   CLOUDFLARE_API_TOKEN   R2 upload
+#   CLOUDFLARE_ACCOUNT_ID  R2 upload
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp (e.g. 2.1.4). MUST match the standard overlay release so the download page merges both Windows builds into one version row."
+        type: string
+        required: true
+      overlay_ref:
+        description: "Overlay repo ref to build with (branch/tag/sha)."
+        type: string
+        default: "main"
+      upload:
+        description: "Upload to R2 (needs the Cloudflare secrets)."
+        type: boolean
+        default: false
+      keep_installer_artifacts:
+        description: "Also keep the installer as a GitHub artifact (only for a dry build you need by hand)."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  OVERLAY_REPO: zhayujie/cow-private-overlay
+  R2_BUCKET: cow-skills
+  # Dedicated update channel: isolates the Win7 feed (latest-win7.yml) from the
+  # standard win feed (latest.yml). Both are the "latest" release channel but
+  # target different Windows generations, so they must not share a feed file.
+  WIN7_CHANNEL: latest-win7
+
+jobs:
+  build:
+    name: Build Windows x64 (Win7 legacy overlay)
+    runs-on: windows-latest
+    steps:
+      # The core takes the workspace root, matching the layout build-overlay.mjs
+      # resolves its relative paths against. Checkout defaults to the ref this
+      # run was dispatched on, so the branch picker selects the core revision.
+      - name: Checkout core
+        uses: actions/checkout@v4
+
+      # A read-only deploy key rather than a PAT: grants read on this one repo
+      # only and doesn't expire out from under the release.
+      - name: Checkout overlay
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OVERLAY_REPO }}
+          ref: ${{ inputs.overlay_ref }}
+          ssh-key: ${{ secrets.OVERLAY_DEPLOY_KEY }}
+          path: overlay
+
+      # electron-builder names the installer after the overlay's productName and
+      # prints those names as it works. Register the name here to redact it from
+      # the rest of this (public) log. Case-sensitive substring match, so the
+      # lowercase form is registered too (bundle ids, asset paths).
+      - name: Redact product name from logs
+        shell: bash
+        env:
+          PRODUCT_NAME: ${{ secrets.OVERLAY_PRODUCT_NAME }}
+        run: |
+          if [ -n "$PRODUCT_NAME" ]; then
+            echo "::add-mask::$PRODUCT_NAME"
+            echo "::add-mask::$(echo "$PRODUCT_NAME" | tr '[:upper:]' '[:lower:]')"
+          else
+            echo "::warning::OVERLAY_PRODUCT_NAME not set — installer names will appear in this public log."
+          fi
+
+      # Python 3.8 is the last CPython that supports Windows 7. A backend built
+      # with it (via PyInstaller) still runs on Win7 even though the CI host is
+      # Server 2022 — PyInstaller's bootloader targets the interpreter's minimum
+      # OS, not the build machine's.
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build Python backend (PyInstaller, Python 3.8)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Most deps are unpinned, so pip auto-picks the newest Python-3.8 wheel.
+          # But a few are pinned to versions with NO 3.8 wheel and must be relaxed
+          # for this legacy build. We rewrite them into a throwaway requirements
+          # file so the repo's source stays untouched (standard build keeps its
+          # pins). playwright 1.48.0 is the last release with a cp38 wheel.
+          sed 's/^playwright==.*/playwright==1.48.0/' \
+            desktop/build/requirements-desktop.txt > /tmp/requirements-win7.txt
+          pip install -r /tmp/requirements-win7.txt
+          pip install pyinstaller
+          # Run from repo root so the spec's relative datas resolve correctly.
+          pyinstaller desktop/build/cowagent-backend.spec \
+            --noconfirm \
+            --distpath desktop/build/dist \
+            --workpath desktop/build/build-work
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+
+      # Bundle ripgrep so the grep tool has a fast backend instead of the slow
+      # PowerShell fallback. Mirrors release-overlay.yml; build-overlay.mjs stages
+      # its own resources alongside this and only removes what it staged.
+      - name: Bundle ripgrep binary
+        shell: bash
+        env:
+          RG_VERSION: "15.2.0"
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/resources/bin
+          url="https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc.zip"
+          curl -fL "$url" -o rg.zip
+          # -j flatten, -o overwrite; grab just the rg.exe from the archive.
+          unzip -j -o rg.zip '*/rg.exe' -d desktop/resources/bin
+          ls -l desktop/resources/bin
+
+      - name: Stamp version
+        working-directory: desktop
+        shell: bash
+        run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
+
+      # Downgrade Electron to the last Win7-capable major (22). --no-save keeps
+      # this out of package.json so the repo's committed deps stay on Electron 33
+      # for the standard pipeline. electron-builder reads the installed Electron
+      # version from node_modules, so this is all that's needed to package v22.
+      - name: Pin Electron to 22 (last Win7-capable)
+        working-directory: desktop
+        run: npm install --no-save electron@22.3.27
+
+      # Download the Windows signing CLI. The URL comes from a repo variable, so
+      # nothing about signing is hardcoded in a public workflow. Only runs when a
+      # URL is set; otherwise the build stays unsigned but still succeeds.
+      # SIGNTOOL_PATH is exported for build-overlay.mjs -> electron-builder.win.js.
+      - name: Download Windows signing CLI
+        if: vars.SIGNTOOL_CLI_URL != ''
+        shell: bash
+        env:
+          SIGNTOOL_CLI_URL: ${{ vars.SIGNTOOL_CLI_URL }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signtool"
+          curl -fsSL "$SIGNTOOL_CLI_URL" -o "$RUNNER_TEMP/signtool/cli.zip"
+          unzip -o "$RUNNER_TEMP/signtool/cli.zip" -d "$RUNNER_TEMP/signtool" >/dev/null
+          exe="$(find "$RUNNER_TEMP/signtool" -type f -iname 'signtool*.exe' | head -n1)"
+          if [ -z "$exe" ]; then
+            echo "signtool.exe not found in downloaded archive" >&2
+            find "$RUNNER_TEMP/signtool" -type f >&2
+            exit 1
+          fi
+          echo "SIGNTOOL_PATH=$(cygpath -w "$exe")" >> "$GITHUB_ENV"
+          echo "resolved signtool: $exe"
+
+      # build-overlay.mjs applies the overlay, merges build.config.json over the
+      # core's dynamic win config (electron-builder.win.js -> sign hook + rg.exe),
+      # runs the core build, then electron-builder with the passthrough flags.
+      #
+      # --publish always (not never): with a generic provider, electron-builder
+      # only WRITES the update metadata (latest-win7.yml) locally and never
+      # uploads. --publish never would skip writing it entirely, which the steps
+      # below need.
+      #
+      # -c.publish.channel=latest-win7 : dedicate this build's channel so the feed
+      #   is latest-win7.yml (isolated from the standard latest.yml) and the same
+      #   value is stamped into the packaged app-update.yml.
+      # -c.win.artifactName ... -win7- : inject a "win7" segment into the file name
+      #   so the legacy exe doesn't collide with the standard exe in v<ver>/, and
+      #   the download DB can map it to the win-legacy platform by name.
+      - name: Build overlay (Electron 22)
+        working-directory: overlay
+        shell: bash
+        env:
+          COW_CORE_DIR: ${{ github.workspace }}/desktop
+          # Trusted-client SMS secret (matches client.sms.secret on the server).
+          CLIENT_SMS_SECRET: ${{ secrets.CLIENT_SMS_SECRET }}
+          # Windows code signing via the signing CLI; SIGNTOOL_PATH was exported
+          # by the download step above. COW_SIGN_DRY_RUN (repo variable) validates
+          # the pipeline with a self-signed cert, consuming no signing quota.
+          SIGNTOOL_ACCESS_KEY: ${{ secrets.SIGNTOOL_ACCESS_KEY }}
+          SIGNTOOL_ACCESS_SECRET: ${{ secrets.SIGNTOOL_ACCESS_SECRET }}
+          SIGNTOOL_CERT_CODE: ${{ secrets.SIGNTOOL_CERT_CODE }}
+          COW_SIGN_DRY_RUN: ${{ vars.COW_SIGN_DRY_RUN }}
+        run: |
+          node build-overlay.mjs --win --x64 --publish always \
+            -c.publish.channel="$WIN7_CHANNEL" \
+            -c.win.artifactName='${productName}-Setup-${version}-win7-${arch}.${ext}'
+
+      # Prefix update paths with v<ver>/ so the root feed resolves the installer
+      # from the versioned folder. Handles latest-win7.yml (the FEED regex in
+      # rewrite-yml.mjs matches "<channel>.yml").
+      - name: Rewrite update metadata
+        working-directory: overlay
+        shell: bash
+        env:
+          COW_CORE_DIR: ${{ github.workspace }}/desktop
+        run: node rewrite-yml.mjs "${{ inputs.version }}"
+
+      # wrangler@latest needs Node >=22 while the packager runs on Node 20. The
+      # build is finished by now, so switching the PATH here is harmless.
+      - name: Set up Node 22 for wrangler
+        if: inputs.upload
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Ship the installer to R2 under <prefix>v<ver>/ and publish the feed
+      # (latest-win7.yml) at the <prefix> root. Unlike release-overlay.yml this
+      # is a SINGLE leg on its OWN channel, so there's no cross-leg feed merge
+      # (no R2_META_VERSIONED / publish-feed job) — the feed goes live directly.
+      - name: Upload to R2
+        if: inputs.upload
+        working-directory: overlay
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          COW_CORE_DIR: ${{ github.workspace }}/desktop
+          R2_PREFIX: ${{ secrets.OVERLAY_R2_PREFIX }}
+          R2_VERSION: ${{ inputs.version }}
+          UPLOAD_TOOL: wrangler
+        run: |
+          # Empty would silently fall back to the default prefix and scatter this
+          # variant's files over the core release's keys.
+          if [ -z "$R2_PREFIX" ]; then
+            echo "::error::OVERLAY_R2_PREFIX secret is not set"
+            exit 1
+          fi
+          node upload-r2.mjs
+
+      # Opt-in escape hatch for a dry run (upload=false) where you still want the
+      # installer by hand. Kept short-lived: artifacts bill against storage quota.
+      - name: Upload installer artifact (opt-in)
+        if: always() && inputs.keep_installer_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: overlay-win7-x64
+          path: |
+            desktop/release/*.exe
+            desktop/release/*.blockmap
+          if-no-files-found: ignore
+          retention-days: 1

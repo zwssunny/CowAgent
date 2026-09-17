@@ -1,0 +1,68 @@
+name: Build Feishu SDK Bundle
+
+# The desktop build ships without lark_oapi; clients download a trimmed bundle
+# the first time a user enables Feishu. This workflow builds that bundle
+# reproducibly and smoke-tests it.
+#
+# Run it only when VENDOR_VERSION in channel/feishu/lark_install.py changes:
+# the artifact is published once per SDK version and reused from then on.
+# The bundle is pure Python, so one artifact serves every platform.
+#
+# Publishing is a manual step -- download the artifact from this run and put it
+# on the CDN, then pin the printed sha256 in lark_install.py.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "desktop/build/build-feishu-vendor.py"
+      - "channel/feishu/lark_install.py"
+      - ".github/workflows/publish-feishu-vendor.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        # Matches the Python the desktop backend is frozen with.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build and smoke-test the bundle
+        run: |
+          python -m pip install --upgrade pip
+          # The bundle expects these from the desktop build rather than
+          # carrying its own copies; the smoke test needs them too.
+          python -m pip install requests pycryptodome
+          python desktop/build/build-feishu-vendor.py --out dist/feishu-vendor.zip
+
+      - name: Check the pinned checksum matches
+        run: |
+          expected=$(python -c "import re,pathlib; \
+            print(re.search(r'VENDOR_SHA256 = \"([0-9a-f]*)\"', \
+            pathlib.Path('channel/feishu/lark_install.py').read_text()).group(1))")
+          actual=$(sha256sum dist/feishu-vendor.zip | cut -d' ' -f1)
+          echo "pinned in lark_install.py: ${expected:-<unset>}"
+          echo "built artifact           : $actual"
+          if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+            echo "::error::VENDOR_SHA256 is stale. Set it to: $actual"
+            exit 1
+          fi
+
+      - name: Rename artifact to its published name
+        run: |
+          version=$(python -c "import re,pathlib; \
+            print(re.search(r'VENDOR_VERSION = \"([^\"]+)\"', \
+            pathlib.Path('channel/feishu/lark_install.py').read_text()).group(1))")
+          mv dist/feishu-vendor.zip "dist/feishu-vendor-$version.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feishu-vendor
+          path: dist/feishu-vendor-*.zip

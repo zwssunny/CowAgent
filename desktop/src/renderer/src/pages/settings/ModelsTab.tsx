@@ -13,13 +13,49 @@ import {
   Pencil,
   Eye as EyeIcon,
   EyeOff,
+  ExternalLink,
 } from 'lucide-react'
 import { t, localizedLabel } from '../../i18n'
 import apiClient from '../../api/client'
-import type { CapabilityState, ModelsData, ModelProvider, SearchCapabilityState } from '../../types'
+import type {
+  CapabilityState,
+  ModelCatalogEntry,
+  ModelsData,
+  ModelProvider,
+  SearchCapabilityState,
+  SearchProviderMeta,
+} from '../../types'
 import { Card, Field, Dropdown, TextInput, Modal, Btn, MASK_RE } from './primitives'
 import CapabilityCard from './CapabilityCard'
+import { ChatFallbackButton } from './ChatFallbackCard'
+import {
+  ModelCatalogEditor,
+  toDraftRows,
+  diffAgainstSeed,
+  normalizeRows,
+  type CatalogDraftRow,
+} from './ModelCatalogEditor'
 import { normEntries, providerLabel, resolveVoices, CUSTOM_OPTION } from './modelsHelpers'
+import { product } from '@product'
+
+// Whether the "add custom provider" entry is available. Defaults to true.
+const allowCustomProviders = product.models?.allowCustomProviders !== false
+
+// LinkAI is an aggregation platform, so when the LinkAI provider is selected we
+// point users to its console to create/manage the aggregated key. Only shown
+// for that provider — other vendors manage keys on their own sites.
+const ManageLinkAIKeyLink: React.FC = () => (
+  <button
+    type="button"
+    onClick={() =>
+      window.open('https://link-ai.tech/console/models?apikey=1', '_blank', 'noopener,noreferrer')
+    }
+    className="inline-flex items-center gap-1 text-xs text-accent hover:underline cursor-pointer"
+  >
+    {t('models_manage_api_key')}
+    <ExternalLink size={11} className="shrink-0" />
+  </button>
+)
 
 interface ModelsTabProps {
   baseUrl: string
@@ -94,7 +130,8 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ baseUrl }) => {
     <div className="grid gap-5">
       <VendorSection data={data} onChanged={load} statusMap={statusMap} flash={flash} />
 
-      {/* Chat */}
+      {/* Chat — the fallback is a small button on this card's header rather
+          than a separate card, since it's a rarely-touched safety net. */}
       <CapabilityCard
         icon={MessageSquare}
         title={t('models_cap_chat')}
@@ -106,6 +143,22 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ baseUrl }) => {
         busy={busy === 'chat'}
         status={statusMap.chat}
         onSave={(p, m) => run('chat', { action: 'set_capability', capability: 'chat', provider_id: p, model: m })}
+        action={
+          <ChatFallbackButton
+            state={caps.chat_fallback}
+            data={data}
+            busy={busy === 'chat_fallback'}
+            status={statusMap.chat_fallback}
+            onSave={({ enabled, chain }) =>
+              run('chat_fallback', {
+                action: 'set_capability',
+                capability: 'chat_fallback',
+                enabled,
+                chain,
+              })
+            }
+          />
+        }
       />
 
       {/* Vision */}
@@ -152,6 +205,7 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ baseUrl }) => {
         data={data}
         allowAuto
         autoLabel={t('models_asr_auto')}
+        allowCustomModel
         busy={busy === 'asr'}
         status={statusMap.asr}
         onSave={(p, m) => run('asr', { action: 'set_capability', capability: 'asr', provider_id: p, model: m })}
@@ -188,7 +242,15 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ baseUrl }) => {
         onSaveStrategy={(strategy, provider) =>
           run('search', { action: 'set_capability', capability: 'search', strategy, provider })
         }
-        onSaveBochaKey={(key) => run('search_key', { action: 'set_search_credential', api_key: key })}
+        onSaveSearchKey={(provider, value, anonymous) =>
+          run(
+            'search_key',
+            provider === 'searxng'
+              ? // SearXNG persists an instance URL, not an API key.
+                { action: 'set_search_credential', provider, url: value }
+              : { action: 'set_search_credential', provider, api_key: value, anonymous }
+          )
+        }
         keyStatus={statusMap.search_key}
         keyBusy={busy === 'search_key'}
       />
@@ -271,7 +333,7 @@ const VendorSection: React.FC<VendorSectionProps> = ({ data, onChanged }) => {
 const VendorChip: React.FC<{ provider: ModelProvider; onClick: () => void }> = ({ provider, onClick }) => (
   <button
     onClick={onClick}
-    className="group flex items-center gap-2.5 px-3 py-2.5 rounded-btn border border-default bg-inset hover:border-accent cursor-pointer transition-colors text-left"
+    className="group flex items-center gap-2.5 px-3 py-2.5 rounded-btn border border-default bg-inset-2 hover:border-accent cursor-pointer transition-colors text-left"
   >
     <span className="flex-shrink-0 w-7 h-7 rounded-lg bg-surface-2 text-content-secondary flex items-center justify-center text-xs font-bold">
       {(localizedLabel(provider.label) || provider.id || '?').slice(0, 1).toUpperCase()}
@@ -282,6 +344,49 @@ const VendorChip: React.FC<{ provider: ModelProvider; onClick: () => void }> = (
 )
 
 const CUSTOM_PICK = '__custom_new__'
+
+// Persist a provider's catalog overlay only when the draft's diff against the
+// presets differs from what is already stored, so saving credentials alone
+// never rewrites (or accidentally clears) a catalog the user didn't touch. The
+// backend drops the overlay entirely when both overrides and hidden are empty.
+async function persistCatalogIfChanged(
+  provider: ModelProvider,
+  rows: CatalogDraftRow[],
+): Promise<void> {
+  const seed = provider.seed || []
+  const { models, hidden } = diffAgainstSeed(rows, seed)
+  const savedOverrides = normalizeRows(toDraftRows(provider.catalog || []))
+  const savedHidden = (provider.hidden || []).slice().sort()
+  const unchanged =
+    JSON.stringify(models) === JSON.stringify(savedOverrides) &&
+    JSON.stringify(hidden.slice().sort()) === JSON.stringify(savedHidden)
+  if (unchanged) return
+  await apiClient.modelsAction({
+    action: 'save_catalog',
+    provider_id: provider.id,
+    models,
+    hidden,
+  })
+}
+
+// A custom provider has no presets: its catalog is simply the whole model list,
+// so there is no seed to diff against and nothing is ever tombstoned. Persist
+// the normalized rows, skipping the write when they match the stored list.
+async function persistCustomCatalog(
+  providerId: string,
+  rows: CatalogDraftRow[],
+  saved: ModelCatalogEntry[],
+): Promise<void> {
+  const models = normalizeRows(rows)
+  const savedNorm = normalizeRows(toDraftRows(saved))
+  if (JSON.stringify(models) === JSON.stringify(savedNorm)) return
+  await apiClient.modelsAction({
+    action: 'save_catalog',
+    provider_id: providerId,
+    models,
+    hidden: [],
+  })
+}
 
 const VendorModal: React.FC<{
   provider: ModelProvider | null
@@ -309,6 +414,14 @@ const VendorModal: React.FC<{
   const [keyVisible, setKeyVisible] = useState(false)
   const [apiBase, setApiBase] = useState('')
   const [saving, setSaving] = useState(false)
+  // Catalog draft for the effective provider. Prefilled from its EFFECTIVE list
+  // (presets − removals + overrides) so the user edits the full list; reloaded
+  // whenever the effective provider changes.
+  const [catalogRows, setCatalogRows] = useState<CatalogDraftRow[]>([])
+
+  const loadCatalogRows = (p: ModelProvider | undefined) => {
+    setCatalogRows(toDraftRows(p?.effective || p?.catalog || []))
+  }
 
   // Load fields whenever the effective provider changes.
   useEffect(() => {
@@ -319,6 +432,7 @@ const VendorModal: React.FC<{
     setApiBase(init?.api_base || '')
     setKeyDirty(false)
     setKeyVisible(false)
+    loadCatalogRows(init)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider, addMode, open])
 
@@ -330,7 +444,9 @@ const VendorModal: React.FC<{
       label: localizedLabel(p.label),
       hint: p.configured ? t('models_configured') : undefined,
     })),
-    { value: CUSTOM_PICK, label: t('models_custom_vendor'), hint: t('models_add_custom_hint') },
+    ...(allowCustomProviders
+      ? [{ value: CUSTOM_PICK, label: t('models_custom_vendor'), hint: t('models_add_custom_hint') }]
+      : []),
   ]
 
   const onPick = (val: string) => {
@@ -343,6 +459,7 @@ const VendorModal: React.FC<{
     setApiKey(p?.api_key_masked || '')
     setApiBase(p?.api_base || '')
     setKeyDirty(false)
+    loadCatalogRows(p)
   }
 
   const hasBase = !!effective?.api_base_field
@@ -358,6 +475,7 @@ const VendorModal: React.FC<{
       if (keyDirty && apiKey && !MASK_RE.test(apiKey)) payload.api_key = apiKey
       if (hasBase) payload.api_base = apiBase
       await apiClient.modelsAction(payload)
+      await persistCatalogIfChanged(effective, catalogRows)
       await onSaved()
       onClose()
     } finally {
@@ -380,6 +498,7 @@ const VendorModal: React.FC<{
   return (
     <Modal
       open={open}
+      size="lg"
       title={addMode ? t('models_add_vendor') : localizedLabel(effective?.label)}
       onClose={onClose}
       footer={
@@ -403,7 +522,10 @@ const VendorModal: React.FC<{
           <Dropdown value={pickId} options={pickOptions} onChange={onPick} />
         </Field>
       )}
-      <Field label="API Key">
+      <Field
+        label="API Key"
+        labelAction={effective?.id === 'linkai' ? <ManageLinkAIKeyLink /> : undefined}
+      >
         <div className="relative">
           <TextInput
             type={keyVisible ? 'text' : 'password'}
@@ -440,6 +562,15 @@ const VendorModal: React.FC<{
           />
         </Field>
       )}
+      {effective && (
+        <ModelCatalogEditor
+          key={effective.id}
+          provider={effective}
+          rows={catalogRows}
+          onRowsChange={setCatalogRows}
+          isCustom={false}
+        />
+      )}
     </Modal>
   )
 }
@@ -455,6 +586,9 @@ const CustomProviderModal: React.FC<{
   const [apiKey, setApiKey] = useState('')
   const [keyDirty, setKeyDirty] = useState(false)
   const [saving, setSaving] = useState(false)
+  // A custom provider has no presets, so its catalog is simply its whole model
+  // list (effective === catalog). Prefill from it when editing; empty for new.
+  const [catalogRows, setCatalogRows] = useState<CatalogDraftRow[]>([])
 
   useEffect(() => {
     if (!target) return
@@ -462,10 +596,12 @@ const CustomProviderModal: React.FC<{
       setName(editing.custom_name || localizedLabel(editing.label))
       setApiBase(editing.api_base || '')
       setApiKey(editing.api_key_masked || '')
+      setCatalogRows(toDraftRows(editing.effective || editing.catalog || []))
     } else {
       setName('')
       setApiBase('')
       setApiKey('')
+      setCatalogRows([])
     }
     setKeyDirty(false)
   }, [target, editing])
@@ -488,8 +624,16 @@ const CustomProviderModal: React.FC<{
         api_base: apiBase.trim(),
       }
       if (editing) payload.id = editing.custom_id
-      if (keyDirty && apiKey && !MASK_RE.test(apiKey)) payload.api_key = apiKey
-      await apiClient.modelsAction(payload)
+      // The custom provider key is optional. Only touch it when the user
+      // edited the field (keyDirty) and it isn't the masked placeholder; send
+      // the value even when empty so an explicit clear is honored server-side.
+      if (keyDirty && !MASK_RE.test(apiKey)) payload.api_key = apiKey.trim()
+      const res = await apiClient.modelsAction(payload)
+      // The provider id is `custom:<id>`; a create returns the new id, an edit
+      // reuses the existing one. A custom provider has no presets, so the whole
+      // list is its overrides and nothing is ever hidden.
+      const cid = (res.id as string) || editing?.custom_id || ''
+      if (cid) await persistCustomCatalog(`custom:${cid}`, catalogRows, editing?.catalog || [])
       await onSaved()
       onClose()
     } finally {
@@ -512,6 +656,7 @@ const CustomProviderModal: React.FC<{
   return (
     <Modal
       open={!!target}
+      size="lg"
       title={editing ? t('models_edit_custom') : t('models_add_custom')}
       onClose={onClose}
       footer={
@@ -556,6 +701,13 @@ const CustomProviderModal: React.FC<{
           }}
         />
       </Field>
+      <ModelCatalogEditor
+        key={editing?.custom_id || 'new'}
+        provider={editing}
+        rows={catalogRows}
+        onRowsChange={setCatalogRows}
+        isCustom
+      />
     </Modal>
   )
 }
@@ -586,6 +738,18 @@ const TtsCard: React.FC<{
 }> = ({ state, data, busy, status, onSaveVoice, onSaveMode, modeStatus, modeBusy }) => {
   const [provider, setProvider] = useState(state.current_provider || '')
   const [model, setModel] = useState(state.current_model || '')
+  // Custom (OpenAI-compatible) vendors have no preset catalog: type the model.
+  // Covers expanded custom:<id> cards and the legacy flat "custom" entry.
+  const isCustomProvider = (id: string) => id.startsWith('custom:') || id === 'custom'
+  // With a catalog the model becomes a dropdown pick like built-in vendors;
+  // free-form input remains only for catalog-less custom vendors.
+  const providerHasCatalog = (id: string) =>
+    !!data?.providers?.find((x) => x.id === id)?.catalog?.length
+  const [customModel, setCustomModel] = useState(
+    isCustomProvider(state.current_provider || '') && !providerHasCatalog(state.current_provider || '')
+      ? state.current_model || ''
+      : ''
+  )
   const [voice, setVoice] = useState(state.current_voice || '')
   const [mode, setMode] = useState<'off' | 'voice_if_voice' | 'always'>(state.reply_mode || 'off')
 
@@ -603,6 +767,14 @@ const TtsCard: React.FC<{
 
   const handleProvider = (id: string) => {
     setProvider(id)
+    if (isCustomProvider(id) && !providerHasCatalog(id)) {
+      // Prefill with the saved model when re-selecting the same provider.
+      setCustomModel(id === state.current_provider ? state.current_model || '' : '')
+      setModel('')
+      setVoice('')
+      return
+    }
+    setCustomModel('')
     const first = normEntries(state.provider_models?.[id])[0]
     const fm = first?.value || ''
     setModel(fm)
@@ -612,6 +784,8 @@ const TtsCard: React.FC<{
     setModel(m)
     setVoice(resolveVoices(provider, m, state.provider_voices)[0]?.value || '')
   }
+  const useFreeText = isCustomProvider(provider) && !providerHasCatalog(provider)
+  const finalModel = useFreeText ? customModel.trim() : model
 
   return (
     <Card icon={<Volume2 size={16} />} title={t('models_cap_tts')} subtitle={t('models_cap_tts_sub')}>
@@ -642,12 +816,22 @@ const TtsCard: React.FC<{
               />
             </Field>
             <Field label={t('models_model')}>
-              <Dropdown
-                value={model}
-                options={modelOptions}
-                placeholder={t('models_select_model')}
-                onChange={handleModel}
-              />
+              {useFreeText ? (
+                // Catalog-less custom vendor: type the model directly.
+                <TextInput
+                  className="font-mono"
+                  value={customModel}
+                  onChange={(e) => setCustomModel(e.target.value)}
+                  placeholder={t('config_custom_model_hint')}
+                />
+              ) : (
+                <Dropdown
+                  value={model}
+                  options={modelOptions}
+                  placeholder={t('models_select_model')}
+                  onChange={handleModel}
+                />
+              )}
             </Field>
             {voiceOptions.length > 0 && (
               <Field label={t('models_voice')}>
@@ -660,7 +844,7 @@ const TtsCard: React.FC<{
               </span>
               <button
                 disabled={busy}
-                onClick={() => onSaveVoice(provider, model, voice)}
+                onClick={() => onSaveVoice(provider, finalModel, voice)}
                 className="px-4 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover text-sm font-medium cursor-pointer transition-colors disabled:opacity-50 inline-flex items-center gap-2"
               >
                 {busy && <Loader2 size={14} className="animate-spin" />}
@@ -702,24 +886,52 @@ const EmbeddingCard: React.FC<{
   </CapabilityCard>
 )
 
+// Search providers that own a dedicated credential (as opposed to reusing a
+// model-vendor key): a dedicated API key, or — for SearXNG — a self-hosted
+// instance URL. AnySearch additionally supports an anonymous tier, so it
+// counts as "configured" even without a key. Mirrors the web console flow.
+const isDedicatedKeyProvider = (p: SearchProviderMeta): boolean =>
+  p.needs_dedicated_key ||
+  p.needs_url ||
+  ['bocha', 'anysearch', 'serply', 'tavily', 'searxng', 'keenable'].includes(p.id)
+
 const SearchCard: React.FC<{
   state: SearchCapabilityState
   busy: boolean
   status?: string
   onSaveStrategy: (strategy: string, provider: string) => void
-  onSaveBochaKey: (key: string) => void
+  onSaveSearchKey: (provider: string, key: string, anonymous: boolean) => void
   keyStatus?: string
   keyBusy: boolean
-}> = ({ state, busy, status, onSaveStrategy, onSaveBochaKey, keyStatus, keyBusy }) => {
+}> = ({ state, busy, status, onSaveStrategy, onSaveSearchKey, keyStatus, keyBusy }) => {
   const [strategy, setStrategy] = useState<string>(state.strategy || 'auto')
   const [provider, setProvider] = useState<string>(state.fixed_provider || state.current_provider || '')
-  const [bochaOpen, setBochaOpen] = useState(false)
+  // The dedicated-key provider currently open in the credential modal, or null.
+  const [keyProvider, setKeyProvider] = useState<SearchProviderMeta | null>(null)
+  // Two-step add flow: when >1 dedicated provider is unconfigured, first show a
+  // picker; a single unconfigured one opens its editor directly.
+  const [pickerOpen, setPickerOpen] = useState(false)
 
   const providerOptions = useMemo(
     () => state.providers.map((p) => ({ value: p.id, label: localizedLabel(p.label) })),
     [state.providers]
   )
-  const bocha = state.providers.find((p) => p.id === 'bocha')
+
+  // Providers that hold their own key: split into configured (editable chips)
+  // and unconfigured (offered behind the "+ add" entry).
+  const dedicated = useMemo(() => state.providers.filter(isDedicatedKeyProvider), [state.providers])
+  const configured = dedicated.filter((p) => p.configured)
+  const missing = dedicated.filter((p) => !p.configured)
+
+  const openProvider = (p: SearchProviderMeta) => {
+    setPickerOpen(false)
+    setKeyProvider(p)
+  }
+  const onAdd = () => {
+    if (missing.length === 0) return
+    if (missing.length === 1) openProvider(missing[0])
+    else setPickerOpen(true)
+  }
 
   return (
     <Card icon={<SearchIcon size={16} />} title={t('models_cap_search')} subtitle={t('models_cap_search_sub')}>
@@ -744,87 +956,184 @@ const SearchCard: React.FC<{
             />
           </Field>
         )}
-        <div className="flex items-center justify-between">
-          <button
-            onClick={() => setBochaOpen(true)}
-            className="text-xs text-accent hover:text-accent-hover cursor-pointer inline-flex items-center gap-1"
-          >
-            {t('models_search_bocha_key')}
-            {bocha?.configured && <Check size={12} />}
-          </button>
-          <div className="flex items-center gap-3">
-            <span className={`text-xs text-accent transition-opacity ${status ? 'opacity-100' : 'opacity-0'}`}>
-              {status}
-            </span>
-            <button
-              disabled={busy || (strategy === 'fixed' && !provider)}
-              onClick={() => onSaveStrategy(strategy, provider)}
-              className="px-4 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover text-sm font-medium cursor-pointer transition-colors disabled:opacity-50 inline-flex items-center gap-2"
-            >
-              {busy && <Loader2 size={14} className="animate-spin" />}
-              {t('config_save')}
-            </button>
+
+        {/* Dedicated-key providers: configured chips (click to edit) + add entry. */}
+        <Field label={t('models_search_bocha_key')}>
+          <div className="flex items-center flex-wrap gap-2">
+            {configured.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => openProvider(p)}
+                title={t('models_search_edit_hint')}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-btn text-xs bg-accent-soft text-accent hover:opacity-80 cursor-pointer transition-opacity"
+              >
+                <Check size={12} />
+                {localizedLabel(p.label)}
+                {p.anonymous && ` · ${t('models_search_anonymous_badge')}`}
+              </button>
+            ))}
+            {missing.length > 0 && (
+              <button
+                onClick={onAdd}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-btn text-xs border border-dashed border-default text-content-tertiary hover:border-accent hover:text-accent cursor-pointer transition-colors"
+              >
+                <Plus size={12} />
+                {t('models_search_add_provider')}
+              </button>
+            )}
+            {configured.length === 0 && missing.length === 0 && (
+              <span className="text-xs text-content-tertiary">{t('models_search_none_configured')}</span>
+            )}
           </div>
+        </Field>
+
+        <div className="flex items-center justify-end gap-3">
+          <span className={`text-xs text-accent transition-opacity ${status ? 'opacity-100' : 'opacity-0'}`}>
+            {status}
+          </span>
+          <button
+            disabled={busy || (strategy === 'fixed' && !provider)}
+            onClick={() => onSaveStrategy(strategy, provider)}
+            className="px-4 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover text-sm font-medium cursor-pointer transition-colors disabled:opacity-50 inline-flex items-center gap-2"
+          >
+            {busy && <Loader2 size={14} className="animate-spin" />}
+            {t('config_save')}
+          </button>
         </div>
       </div>
 
-      <BochaKeyModal
-        open={bochaOpen}
-        masked={bocha?.api_key_masked || ''}
+      {/* Add-provider picker (only when >1 unconfigured dedicated provider). */}
+      <Modal
+        open={pickerOpen}
+        title={t('models_search_add_provider')}
+        onClose={() => setPickerOpen(false)}
+        footer={
+          <Btn variant="ghost" onClick={() => setPickerOpen(false)}>
+            {t('config_cancel')}
+          </Btn>
+        }
+      >
+        <p className="text-xs text-content-tertiary mb-3">{t('models_search_add_desc')}</p>
+        <div className="space-y-2">
+          {missing.map((p) => (
+            <button
+              key={p.id}
+              onClick={() => openProvider(p)}
+              className="w-full flex items-center justify-between px-3 py-2.5 rounded-btn bg-inset-2 hover:bg-surface-2 text-sm text-content cursor-pointer transition-colors"
+            >
+              <span>{localizedLabel(p.label)}</span>
+              <ExternalLink size={12} className="text-content-tertiary" />
+            </button>
+          ))}
+        </div>
+      </Modal>
+
+      <SearchKeyModal
+        provider={keyProvider}
         busy={keyBusy}
         status={keyStatus}
-        onClose={() => setBochaOpen(false)}
-        onSave={(k) => {
-          onSaveBochaKey(k)
-          setBochaOpen(false)
+        onClose={() => setKeyProvider(null)}
+        onSave={(key, anonymous) => {
+          if (keyProvider) onSaveSearchKey(keyProvider.id, key, anonymous)
+          setKeyProvider(null)
         }}
       />
     </Card>
   )
 }
 
-const BochaKeyModal: React.FC<{
-  open: boolean
-  masked: string
+// Dedicated-credential editor for a single search provider. Most providers
+// hold an API key; SearXNG holds a self-hosted instance URL (echoed back
+// verbatim, not masked). AnySearch adds an anonymous option: saving with an
+// empty key enables the anonymous tier.
+const SearchKeyModal: React.FC<{
+  provider: SearchProviderMeta | null
   busy: boolean
   status?: string
   onClose: () => void
-  onSave: (key: string) => void
-}> = ({ open, masked, busy, onClose, onSave }) => {
-  const [key, setKey] = useState('')
+  onSave: (value: string, anonymous: boolean) => void
+}> = ({ provider, busy, onClose, onSave }) => {
+  const open = !!provider
+  // anysearch and keenable share the "save empty = enable anonymous tier" contract.
+  const isAnonymousProvider = provider?.id === 'anysearch' || provider?.id === 'keenable'
+  const isSearxng = provider?.id === 'searxng' || !!provider?.needs_url
+  // SearXNG prefills its plain instance URL; others prefill the masked key.
+  const initial = isSearxng ? provider?.url_masked || '' : provider?.api_key_masked || ''
+  const [value, setValue] = useState('')
   const [dirty, setDirty] = useState(false)
+
   useEffect(() => {
     if (open) {
-      setKey(masked)
+      setValue(initial)
       setDirty(false)
     }
-  }, [open, masked])
+  }, [open, initial])
+
+  if (!provider) return null
+
+  const title = t(`models_search_${provider.id}_title`)
+  const desc = t(`models_search_${provider.id}_desc`)
+
+  const handleSave = () => {
+    if (isSearxng) {
+      // URL is plain text (never masked). Empty is a no-op here — use the
+      // configured chip / clear flow to remove it.
+      const trimmed = value.trim()
+      if (!dirty || !trimmed) {
+        onClose()
+        return
+      }
+      onSave(trimmed, false)
+      return
+    }
+    // Kept the masked placeholder untouched -> nothing to persist.
+    if (!dirty || MASK_RE.test(value)) {
+      // anysearch/keenable: an untouched-but-empty field still means "anonymous".
+      if (isAnonymousProvider && !initial) onSave('', true)
+      else onClose()
+      return
+    }
+    const trimmed = value.trim()
+    // anysearch/keenable: empty key = enable anonymous mode.
+    onSave(trimmed, isAnonymousProvider && !trimmed)
+  }
+
+  const fieldLabel = isSearxng ? t('models_search_instance_url') : 'API Key'
+  const fieldHint = isSearxng
+    ? undefined
+    : isAnonymousProvider
+      ? t('models_search_anysearch_anon_hint')
+      : undefined
+  const placeholder = isSearxng ? 'https://searxng.example.com' : 'sk-...'
+
   return (
     <Modal
       open={open}
-      title={t('models_search_bocha_key')}
+      title={title}
       onClose={onClose}
       footer={
         <>
           <Btn variant="ghost" onClick={onClose}>
             {t('config_cancel')}
           </Btn>
-          <Btn variant="primary" disabled={busy} onClick={() => onSave(dirty && !MASK_RE.test(key) ? key : '')}>
+          <Btn variant="primary" disabled={busy} onClick={handleSave}>
             {busy ? <Loader2 size={14} className="animate-spin" /> : t('config_save')}
           </Btn>
         </>
       }
     >
-      <Field label="Bocha API Key" hint={t('models_search_bocha_hint')}>
+      <p className="text-xs text-content-tertiary mb-3">{desc}</p>
+      <Field label={fieldLabel} hint={fieldHint}>
         <TextInput
-          className="font-mono"
-          value={key}
-          placeholder="sk-..."
+          className={isSearxng ? '' : 'font-mono'}
+          value={value}
+          placeholder={placeholder}
           onFocus={() => {
-            if (!dirty && MASK_RE.test(key)) setKey('')
+            // Only API keys use a masked sentinel; URLs stay as-is.
+            if (!isSearxng && !dirty && MASK_RE.test(value)) setValue('')
           }}
           onChange={(e) => {
-            setKey(e.target.value)
+            setValue(e.target.value)
             setDirty(true)
           }}
         />

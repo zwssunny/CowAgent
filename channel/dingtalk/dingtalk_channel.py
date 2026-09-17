@@ -21,7 +21,7 @@ from dingtalk_stream.card_replier import CardReplier
 from bridge.context import Context, ContextType
 from bridge.reply import Reply, ReplyType
 from channel.chat_channel import ChatChannel
-from common.utils import expand_path
+from common import state_dir
 from channel.dingtalk.dingtalk_message import DingTalkMessage
 from common.expired_dict import ExpiredDict
 from common.log import logger
@@ -105,6 +105,9 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
         self._stream_client = None
         self._running = False
         self._event_loop = None
+        # Consecutive reconnect failures, driving exponential backoff so a bad
+        # proxy env or a rejecting gateway doesn't flood the log.
+        self._reconnect_fails = 0
         logger.debug("[DingTalk] client_id={}, client_secret={} ".format(
             self.dingtalk_client_id, self.dingtalk_client_secret))
         # 无需群校验和前缀
@@ -148,8 +151,8 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
 
     def startup(self):
         import asyncio
-        self.dingtalk_client_id = conf().get('dingtalk_client_id')
-        self.dingtalk_client_secret = conf().get('dingtalk_client_secret')
+        self.dingtalk_client_id = self.cfg('dingtalk_client_id')
+        self.dingtalk_client_secret = self.cfg('dingtalk_client_secret')
         self._running = True
         credential = dingtalk_stream.Credential(self.dingtalk_client_id, self.dingtalk_client_secret)
         client = dingtalk_stream.DingTalkStreamClient(credential)
@@ -187,7 +190,11 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
                 logger.info("[DingTalk] ✅ Connected to DingTalk stream")
                 self.report_startup_success()
                 _first_connect = False
-            else:
+            elif getattr(self, "_reconnect_fails", 0) == 0:
+                # Only announce a reconnect once the previous session actually
+                # ran (backoff counter cleared). During a tight failure storm
+                # the connection "opens" then immediately errors, so logging
+                # here every loop just doubled the noise.
                 logger.info("[DingTalk] Reconnected to DingTalk stream")
 
             # Run the WebSocket session in an asyncio loop.
@@ -199,8 +206,22 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
             asyncio.set_event_loop(loop)
             self._event_loop = loop
             try:
+                # DingTalk's stream gateway is a direct connection: never route
+                # it through an OS/env SOCKS proxy. websockets >=13 auto-detects
+                # ALL_PROXY/all_proxy and then fails hard with "python-socks is
+                # required" when that extra isn't installed, so explicitly opt
+                # out of proxying. Older websockets has no `proxy` kwarg and
+                # never proxied, so fall back gracefully.
+                connect_kwargs = {}
+                try:
+                    import inspect as _inspect
+                    if "proxy" in _inspect.signature(_ws.connect).parameters:
+                        connect_kwargs["proxy"] = None
+                except Exception:
+                    pass
+
                 async def _session():
-                    async with _ws.connect(uri) as websocket:
+                    async with _ws.connect(uri, **connect_kwargs) as websocket:
                         client.websocket = websocket
                         async for raw_message in websocket:
                             json_message = _json.loads(raw_message)
@@ -209,14 +230,31 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
                                 break
 
                 loop.run_until_complete(_session())
+                # A clean session exit resets the backoff for the next loop.
+                self._reconnect_fails = 0
             except (KeyboardInterrupt, SystemExit):
                 logger.info("[DingTalk] Session loop received stop signal, exiting")
                 break
             except Exception as e:
                 if not self._running:
                     break
-                logger.warning(f"[DingTalk] Stream session error: {e}, reconnecting in 3s...")
-                for _ in range(30):
+                # Exponential backoff so a persistent failure (e.g. a bad proxy
+                # env, or the gateway rejecting us) doesn't spam the log a dozen
+                # times a second. Caps at 60s.
+                self._reconnect_fails = getattr(self, "_reconnect_fails", 0) + 1
+                delay = min(60, 3 * (2 ** min(self._reconnect_fails - 1, 5)))
+                # Only log the first few failures at WARNING; after that drop to
+                # DEBUG to keep the console readable during an outage.
+                if self._reconnect_fails <= 3:
+                    logger.warning(
+                        f"[DingTalk] Stream session error: {e}, reconnecting in {delay}s..."
+                    )
+                else:
+                    logger.debug(
+                        f"[DingTalk] Stream session error (#{self._reconnect_fails}): {e}, "
+                        f"reconnecting in {delay}s..."
+                    )
+                for _ in range(int(delay * 10)):
                     if not self._running:
                         break
                     time.sleep(0.1)
@@ -396,10 +434,7 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
                 
                 # 保存到临时文件
                 file_name = os.path.basename(file_path) or f"media_{uuid.uuid4()}"
-                workspace_root = expand_path(conf().get("agent_workspace", "~/cow"))
-                tmp_dir = os.path.join(workspace_root, "tmp")
-                os.makedirs(tmp_dir, exist_ok=True)
-                temp_file = os.path.join(tmp_dir, file_name)
+                temp_file = os.path.join(str(state_dir.tmp_dir()), file_name)
                 
                 with open(temp_file, "wb") as f:
                     f.write(response.content)
@@ -658,6 +693,8 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
         
         context = self._compose_context(cmsg.ctype, cmsg.content, isgroup=False, msg=cmsg)
         if context:
+            from agent.team_addressing import stamp_speaker_from_channel
+            stamp_speaker_from_channel(self, context, cmsg.content)
             self.produce(context)
 
 
@@ -720,6 +757,8 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
         context = self._compose_context(cmsg.ctype, cmsg.content, isgroup=True, msg=cmsg)
         context['no_need_at'] = True
         if context:
+            from agent.team_addressing import stamp_speaker_from_channel
+            stamp_speaker_from_channel(self, context, cmsg.content)
             self.produce(context)
 
 
@@ -735,8 +774,8 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
             logger.info(f"[DingTalk] Sending scheduled task message to {receiver} (is_group={is_group})")
             
             # 使用缓存的 robot_code 或配置的值
-            robot_code = self._robot_code or conf().get("dingtalk_robot_code")
-            logger.info(f"[DingTalk] Using robot_code: {robot_code}, cached: {self._robot_code}, config: {conf().get('dingtalk_robot_code')}")
+            robot_code = self._robot_code or self.cfg("dingtalk_robot_code")
+            logger.info(f"[DingTalk] Using robot_code: {robot_code}, cached: {self._robot_code}, config: {self.cfg('dingtalk_robot_code')}")
             
             if not robot_code:
                 logger.error(f"[DingTalk] Cannot send scheduled task: robot_code not available. Please send at least one message to the bot first, or configure dingtalk_robot_code in config.json")
@@ -768,7 +807,7 @@ class DingTalkChanel(ChatChannel, dingtalk_stream.ChatbotHandler):
         
         isgroup = msg.is_group
         incoming_message = msg.incoming_message
-        robot_code = self._robot_code or conf().get("dingtalk_robot_code")
+        robot_code = self._robot_code or self.cfg("dingtalk_robot_code")
         
         # 处理图片和视频发送
         if reply.type == ReplyType.IMAGE_URL:

@@ -9,6 +9,7 @@ import requests
 from bridge.reply import Reply, ReplyType
 from common import const
 from common.log import logger
+from common.utils import apply_client_source, apply_cloud_user
 from config import conf
 from voice import audio_convert
 from voice.voice import Voice
@@ -23,15 +24,20 @@ class LinkAIVoice(Voice):
         try:
             url = conf().get("linkai_api_base", "https://api.link-ai.tech") + "/v1/audio/transcriptions"
             headers = {"Authorization": "Bearer " + conf().get("linkai_api_key")}
+            apply_client_source(headers)
+            apply_cloud_user(headers)
             # Pin whisper-1: gateway ignores any other ASR model id.
             model = const.WHISPER_1
-            if voice_file.endswith(".amr"):
+            # Whisper only accepts amr/mp3/wav/m4a; WeChat voice notes arrive as
+            # .silk/.slk, so normalise the extension before deciding.
+            lower = voice_file.lower()
+            if lower.endswith(".amr") or lower.endswith(".silk") or lower.endswith(".slk"):
                 try:
                     mp3_file = os.path.splitext(voice_file)[0] + ".mp3"
                     audio_convert.any_to_mp3(voice_file, mp3_file)
                     voice_file = mp3_file
                 except Exception as e:
-                    logger.warning(f"[LinkVoice] amr file transfer failed, directly send amr voice file: {e}")
+                    logger.warning(f"[LinkVoice] voice file transfer failed, directly send voice file: {e}")
             with open(voice_file, "rb") as file:
                 res = requests.post(
                     url,
@@ -59,6 +65,8 @@ class LinkAIVoice(Voice):
         try:
             url = conf().get("linkai_api_base", "https://api.link-ai.tech") + "/v1/audio/speech"
             headers = {"Authorization": "Bearer " + conf().get("linkai_api_key")}
+            apply_client_source(headers)
+            apply_cloud_user(headers)
             # Gateway routes by `model` (tts-1 / doubao / baidu) + `voice` from
             # that engine's catalog. `app_code` is optional workspace override.
             data = {

@@ -202,5 +202,111 @@ class TestSkillServicePathTraversal(unittest.TestCase):
         self.assertEqual(result, expected)
 
 
+class TestSkillServiceFilePathTraversal(unittest.TestCase):
+    """Test that the per-file paths in an add payload cannot escape the skills root.
+
+    The skill *name* is validated by _safe_skill_dir (issue #2873), but every
+    entry in ``payload["files"]`` also carries a ``path`` that is joined onto
+    the install directory, so it needs the same containment check.
+    """
+
+    def setUp(self):
+        self.tmp_root = tempfile.mkdtemp()
+        self.skills_root = os.path.join(self.tmp_root, "skills")
+        os.makedirs(self.skills_root)
+        from agent.skills.service import SkillService
+        mock_manager = MagicMock()
+        mock_manager.custom_dir = self.skills_root
+        self.svc = SkillService(mock_manager)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp_root, ignore_errors=True)
+
+    def _add_url_with_path(self, rel_path):
+        """Run _add_url with a single file entry, writing a marker to each dest."""
+        written = []
+
+        def fake_download(url, dest):
+            written.append(dest)
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(dest, "w") as f:
+                f.write("pwned")
+
+        with patch.object(self.svc, "_download_file", side_effect=fake_download):
+            self.svc._add_url("innocent", {
+                "name": "innocent",
+                "files": [{"url": "https://example.com/a", "path": rel_path}],
+            })
+        return written
+
+    def test_relative_file_path_allowed(self):
+        """A plain nested path stays inside the skill directory."""
+        written = self._add_url_with_path("scripts/run.py")
+        expected = os.path.realpath(
+            os.path.join(self.skills_root, "innocent.tmp", "scripts/run.py")
+        )
+        self.assertEqual([expected], [os.path.realpath(p) for p in written])
+        self.assertTrue(
+            os.path.exists(os.path.join(self.skills_root, "innocent", "scripts", "run.py"))
+        )
+
+    def test_dotdot_file_path_blocked(self):
+        """'../../escaped.py' must be rejected before anything is downloaded."""
+        with self.assertRaises(ValueError) as ctx:
+            self._add_url_with_path("../../escaped.py")
+        self.assertIn("path traversal", str(ctx.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp_root, "escaped.py")))
+
+    def test_backslash_file_path_blocked(self):
+        r"""'..\..\escaped.py' must be rejected (Windows separators)."""
+        with self.assertRaises(ValueError) as ctx:
+            self._add_url_with_path("..\\..\\escaped.py")
+        self.assertIn("path traversal", str(ctx.exception))
+
+    def test_absolute_posix_file_path_blocked(self):
+        """An absolute POSIX path must be rejected, not silently honoured."""
+        with self.assertRaises(ValueError) as ctx:
+            self._add_url_with_path("/tmp/cow-evil-marker.py")
+        self.assertIn("path traversal", str(ctx.exception))
+
+    def test_absolute_native_file_path_blocked(self):
+        """An absolute path outside the skills root must be rejected."""
+        outside = os.path.join(self.tmp_root, "outside", "evil.py")
+        with self.assertRaises(ValueError) as ctx:
+            self._add_url_with_path(outside)
+        self.assertIn("path traversal", str(ctx.exception))
+        self.assertFalse(os.path.exists(outside))
+
+    def test_midpath_dotdot_blocked(self):
+        """'sub/../../sibling.py' escapes the skill dir even while inside the root."""
+        with self.assertRaises(ValueError) as ctx:
+            self._add_url_with_path("sub/../../sibling.py")
+        self.assertIn("path traversal", str(ctx.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.skills_root, "sibling.py")))
+
+    def test_traversal_aborts_before_download(self):
+        """No file is fetched at all when an entry is unsafe."""
+        calls = []
+
+        def fake_download(url, dest):
+            calls.append(url)
+
+        with patch.object(self.svc, "_download_file", side_effect=fake_download):
+            with self.assertRaises(ValueError):
+                self.svc._add_url("innocent", {
+                    "name": "innocent",
+                    "files": [{"url": "https://example.com/evil", "path": "../../evil.py"}],
+                })
+        self.assertEqual([], calls)
+
+    def test_safe_file_path_rejects_root_itself(self):
+        """A path resolving to the install dir itself is not a valid file target."""
+        with self.assertRaises(ValueError):
+            self.svc._safe_file_path(self.skills_root, ".")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,26 +4,84 @@ Supports text files, images (jpg, png, gif, webp), and PDF files
 """
 
 import os
-import re
 from typing import Dict, Any
 from pathlib import Path
 
 from agent.tools.base_tool import BaseTool, ToolResult
+from agent.tools.utils.credentials import DENIED_MESSAGE, is_credential_path
+from agent.tools.utils.file_state import note_read
 from agent.tools.utils.truncate import truncate_head, format_size, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES
 from common.utils import expand_path
 
+EMPTY_FILE_NOTICE = "[File exists but is empty]"
 
-# Paths whose CONTENT mirrors the process environment (and thus any secrets
-# loaded from ~/.cow/.env). Reading them bypasses the env_config boundary.
-# Matches /proc/self/environ, /proc/thread-self/environ and /proc/<pid>/environ.
-_PROC_ENVIRON_RE = re.compile(r"^/proc/(\d+|self|thread-self)/environ$")
+
+def split_lines(content: str) -> list:
+    """Split into lines, dropping the empty element after a trailing newline.
+
+    Without this a file ending in "\\n" reports one line too many and renders a
+    phantom numbered blank line at the end.
+    """
+    lines = content.split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()
+    return lines
+
+
+PDF_MAX_PAGES_PER_READ = 20
+
+
+def _parse_page_range(pages, total_pages: int):
+    """Parse a PDF ``pages`` argument into an inclusive (first, last) pair.
+
+    Accepts "5", "2-8" and the open-ended "10-". Defaults to the first
+    PDF_MAX_PAGES_PER_READ pages so a large document is never parsed whole.
+    """
+    if total_pages <= 0:
+        return 1, 0
+
+    spec = str(pages or "").strip()
+    if not spec:
+        return 1, min(PDF_MAX_PAGES_PER_READ, total_pages)
+
+    if '-' in spec:
+        head, _, tail = spec.partition('-')
+        head, tail = head.strip(), tail.strip()
+    else:
+        head = tail = spec.strip()
+
+    try:
+        first = int(head) if head else 1
+        last = int(tail) if tail else total_pages
+    except ValueError:
+        raise ValueError(f'Invalid pages value "{spec}". Use e.g. "3", "1-5" or "10-".')
+
+    if first < 1 or last < first:
+        raise ValueError(f'Invalid pages range "{spec}" for a {total_pages}-page document.')
+    if first > total_pages:
+        raise ValueError(f'Page {first} is beyond the end of the document ({total_pages} pages).')
+
+    last = min(last, total_pages, first + PDF_MAX_PAGES_PER_READ - 1)
+    return first, last
+
+
+def number_lines(text: str, start_line: int) -> str:
+    """Prefix each line with its 1-indexed file line number as ``12|code``.
+
+    The compact gutter (no padding) keeps the token cost low while letting the
+    model line up read output with grep hits and ask for a precise offset.
+    Callers must tell the model these prefixes are display-only.
+    """
+    return '\n'.join(
+        f"{start_line + i}|{line}" for i, line in enumerate(text.split('\n'))
+    )
 
 
 class Read(BaseTool):
     """Tool for reading file contents"""
     
     name: str = "read"
-    description: str = f"Read or inspect file contents. For text/PDF/Word/Excel/PPT files, returns content (truncated to {DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB). For images/videos/audio, returns metadata only (file info, size, type). Use offset/limit for large text files."
+    description: str = f"Read or inspect file contents. For text/PDF/Word/Excel/PPT files, returns content (truncated to {DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB). Each line is prefixed with its line number as `12|content` - these prefixes are display aids for locating lines and are NOT part of the file, so strip them whenever you reuse the content (in edit's oldText/newText, when writing it elsewhere, or when quoting it to the user). For images/videos/audio, returns metadata only (file info, size, type). Use offset/limit for large text files."
     
     params: dict = {
         "type": "object",
@@ -39,6 +97,10 @@ class Read(BaseTool):
             "limit": {
                 "type": "integer",
                 "description": "Maximum number of lines to read (optional)"
+            },
+            "pages": {
+                "type": "string",
+                "description": f"PDF only: page range to extract, e.g. \"3\", \"1-5\" or \"10-\". Defaults to the first {PDF_MAX_PAGES_PER_READ} pages; at most {PDF_MAX_PAGES_PER_READ} pages are read per call."
             }
         },
         "required": ["path"]
@@ -79,6 +141,7 @@ class Read(BaseTool):
         path = path.strip() if isinstance(path, str) else ""
         offset = args.get("offset")
         limit = args.get("limit")
+        pages = args.get("pages")
 
         if not path:
             return ToolResult.fail("Error: path parameter is required")
@@ -89,20 +152,28 @@ class Read(BaseTool):
         # Security check: block credential files and their aliases.
         # See issue #2913 (/proc/self/environ bypass) and #2863 (scope).
         if self._is_credential_path(absolute_path):
-            return ToolResult.fail(
-                "Error: Access denied. API keys and credentials must be accessed through the env_config tool only."
-            )
+            return ToolResult.fail(DENIED_MESSAGE)
         
-        # Check if file exists
+        # Check if file exists. Both misses below name the tool that answers
+        # the question instead - otherwise the model tends to guess at nearby
+        # paths and burn turns on more failed reads.
         if not os.path.exists(absolute_path):
+            hint = "Hint: use search_files with target='files' to locate it by name."
             # Provide helpful hint if using relative path
             if not os.path.isabs(path) and not path.startswith('~'):
                 return ToolResult.fail(
                     f"Error: File not found: {path}\n"
                     f"Resolved to: {absolute_path}\n"
-                    f"Hint: Relative paths are based on workspace ({self.cwd}). For files outside workspace, use absolute paths."
+                    f"Hint: Relative paths are based on workspace ({self.cwd}). For files outside workspace, use absolute paths.\n"
+                    f"{hint}"
                 )
-            return ToolResult.fail(f"Error: File not found: {path}")
+            return ToolResult.fail(f"Error: File not found: {path}\n{hint}")
+
+        if os.path.isdir(absolute_path):
+            return ToolResult.fail(
+                f"Error: {path} is a directory, not a file. "
+                f"Use the ls tool to list what is inside it."
+            )
         
         # Check if readable
         if not os.access(absolute_path, os.R_OK):
@@ -126,7 +197,7 @@ class Read(BaseTool):
         
         # Check if PDF
         if file_ext in self.pdf_extensions:
-            return self._read_pdf(absolute_path, path, offset, limit)
+            return self._read_pdf(absolute_path, path, offset, limit, pages)
 
         # Check if Office document (.docx, .xlsx, .pptx, etc.)
         if file_ext in self.office_extensions:
@@ -148,37 +219,98 @@ class Read(BaseTool):
             return path
         return os.path.abspath(os.path.join(self.cwd, path))
 
-    def _is_credential_path(self, absolute_path: str) -> bool:
-        """Return True if *absolute_path* points at protected credential data.
+    @staticmethod
+    def _paginate(all_lines, offset, limit, display_path):
+        """Slice, truncate and number a list of lines for presentation.
 
-        Beyond the literal ~/.cow/.env file, this also blocks two real bypass
-        surfaces reported in issue #2913:
-          1. /proc/<pid|self|thread-self>/environ — a second view of the
-             process environment that leaks secrets loaded from ~/.cow/.env.
-          2. Symlinks resolving to ~/.cow/.env; the previous exact abspath
-             match kept the link target and could be bypassed.
+        Shared by the text, PDF and Office readers so that offset/limit,
+        truncation and the continuation hints behave identically everywhere -
+        previously each reader reimplemented this and they had drifted apart
+        (only the text reader handled negative offsets correctly).
 
-        Scope is kept deliberately narrow (only the credential file and its
-        environ aliases) so this does NOT re-broaden the block that #2863
-        intentionally narrowed to ~/.cow/.env.
+        :return: (result_dict, error_message) - exactly one is not None.
         """
-        # Compare on both the normalized path and the symlink-resolved path,
-        # in POSIX form so the /proc regex matches regardless of os.sep.
-        candidates = set()
-        try:
-            candidates.add(os.path.normpath(absolute_path).replace(os.sep, "/"))
-            candidates.add(os.path.realpath(absolute_path).replace(os.sep, "/"))
-        except OSError:
-            candidates.add(absolute_path.replace(os.sep, "/"))
+        total_lines = len(all_lines)
 
-        # 1. /proc environ aliases (checked on raw and symlink-resolved forms).
-        for candidate in candidates:
-            if _PROC_ENVIRON_RE.match(candidate):
-                return True
+        if total_lines == 0:
+            return {
+                "content": EMPTY_FILE_NOTICE,
+                "total_lines": 0,
+                "start_line": 0,
+                "output_lines": 0,
+                "is_empty": True,
+            }, None
 
-        # 2. The credential file itself, following symlinks on both sides.
-        env_real = os.path.realpath(expand_path("~/.cow/.env")).replace(os.sep, "/")
-        return env_real in candidates
+        start_line = 0
+        if offset is not None:
+            if offset < 0:
+                # -20 means "the last 20 lines".
+                start_line = max(0, total_lines + offset)
+            else:
+                start_line = max(0, offset - 1)
+                if start_line >= total_lines:
+                    return None, (
+                        f"Error: Offset {offset} is beyond end of file "
+                        f"({total_lines} lines total)"
+                    )
+
+        end_line = total_lines
+        user_limited = False
+        if limit is not None:
+            end_line = min(start_line + limit, total_lines)
+            user_limited = True
+
+        selected = '\n'.join(all_lines[start_line:end_line])
+        truncation = truncate_head(selected)
+        start_display = start_line + 1
+
+        if truncation.first_line_exceeds_limit:
+            size = format_size(len(all_lines[start_line].encode('utf-8')))
+            return {
+                "content": (
+                    f"[Line {start_display} is {size}, exceeds "
+                    f"{format_size(DEFAULT_MAX_BYTES)} limit. Use bash tool to read: "
+                    f"head -c {DEFAULT_MAX_BYTES} {display_path} | tail -n +{start_display}]"
+                ),
+                "total_lines": total_lines,
+                "start_line": start_display,
+                "output_lines": 0,
+                "details": {"truncation": truncation.to_dict()},
+            }, None
+
+        output_text = number_lines(truncation.content, start_display)
+        details = {}
+
+        if truncation.truncated:
+            end_display = start_display + truncation.output_lines - 1
+            limit_note = (
+                "" if truncation.truncated_by == "lines"
+                else f" ({format_size(DEFAULT_MAX_BYTES)} limit)"
+            )
+            output_text += (
+                f"\n\n[Showing lines {start_display}-{end_display} of {total_lines}"
+                f"{limit_note}. Use offset={end_display + 1} to continue.]"
+            )
+            details["truncation"] = truncation.to_dict()
+        elif user_limited and end_line < total_lines:
+            output_text += (
+                f"\n\n[{total_lines - end_line} more lines in file. "
+                f"Use offset={end_line + 1} to continue.]"
+            )
+
+        result = {
+            "content": output_text,
+            "total_lines": total_lines,
+            "start_line": start_display,
+            "output_lines": truncation.output_lines,
+        }
+        if details:
+            result["details"] = details
+        return result, None
+
+    def _is_credential_path(self, absolute_path: str) -> bool:
+        """Shared guard; see agent.tools.utils.credentials.is_credential_path."""
+        return is_credential_path(absolute_path)
 
     def _return_file_metadata(self, absolute_path: str, file_type: str, file_size: int) -> ToolResult:
         """
@@ -289,88 +421,14 @@ class Read(BaseTool):
             with open(absolute_path, 'r', encoding='utf-8-sig') as f:
                 content = f.read()
 
-            all_lines = content.split('\n')
-            total_file_lines = len(all_lines)
-            
-            # Apply offset (if specified)
-            start_line = 0
-            if offset is not None:
-                if offset < 0:
-                    # Negative offset: read from end
-                    # -20 means "last 20 lines" → start from (total - 20).
-                    # A file ending in "\n" produces a trailing empty element
-                    # from split('\n'); exclude it so offset=-1 returns the
-                    # real last line instead of the empty string after the
-                    # final newline (and -N returns N real lines).
-                    effective_lines = total_file_lines
-                    if all_lines and all_lines[-1] == '':
-                        effective_lines -= 1
-                    start_line = max(0, effective_lines + offset)
-                else:
-                    # Positive offset: read from start (1-indexed)
-                    start_line = max(0, offset - 1)  # Convert to 0-indexed
-                    if start_line >= total_file_lines:
-                        return ToolResult.fail(
-                            f"Error: Offset {offset} is beyond end of file ({total_file_lines} lines total)"
-                        )
-            
-            start_line_display = start_line + 1  # For display (1-indexed)
-            
-            # If user specified limit, use it
-            selected_content = content
-            user_limited_lines = None
-            if limit is not None:
-                end_line = min(start_line + limit, total_file_lines)
-                selected_content = '\n'.join(all_lines[start_line:end_line])
-                user_limited_lines = end_line - start_line
-            elif offset is not None:
-                selected_content = '\n'.join(all_lines[start_line:])
-            
-            # Apply truncation (considering line count and byte limits)
-            truncation = truncate_head(selected_content)
-            
-            output_text = ""
-            details = {}
+            result, error = self._paginate(
+                split_lines(content), offset, limit, display_path
+            )
+            if error:
+                return ToolResult.fail(error)
 
-            if truncation.first_line_exceeds_limit:
-                # First line exceeds 30KB limit
-                first_line_size = format_size(len(all_lines[start_line].encode('utf-8')))
-                output_text = f"[Line {start_line_display} is {first_line_size}, exceeds {format_size(DEFAULT_MAX_BYTES)} limit. Use bash tool to read: head -c {DEFAULT_MAX_BYTES} {display_path} | tail -n +{start_line_display}]"
-                details["truncation"] = truncation.to_dict()
-            elif truncation.truncated:
-                # Truncation occurred
-                end_line_display = start_line_display + truncation.output_lines - 1
-                next_offset = end_line_display + 1
-                
-                output_text = truncation.content
-                
-                if truncation.truncated_by == "lines":
-                    output_text += f"\n\n[Showing lines {start_line_display}-{end_line_display} of {total_file_lines}. Use offset={next_offset} to continue.]"
-                else:
-                    output_text += f"\n\n[Showing lines {start_line_display}-{end_line_display} of {total_file_lines} ({format_size(DEFAULT_MAX_BYTES)} limit). Use offset={next_offset} to continue.]"
-                
-                details["truncation"] = truncation.to_dict()
-            elif user_limited_lines is not None and start_line + user_limited_lines < total_file_lines:
-                # User specified limit, more content available, but no truncation
-                remaining = total_file_lines - (start_line + user_limited_lines)
-                next_offset = start_line + user_limited_lines + 1
-                
-                output_text = truncation.content
-                output_text += f"\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
-            else:
-                # No truncation, no exceeding user limit
-                output_text = truncation.content
-            
-            result = {
-                "content": output_text,
-                "total_lines": total_file_lines,
-                "start_line": start_line_display,
-                "output_lines": truncation.output_lines
-            }
-            
-            if details:
-                result["details"] = details
-            
+            # Record the read so edit/write can warn if the file changes later.
+            note_read(absolute_path)
             return ToolResult.success(result)
             
         except UnicodeDecodeError:
@@ -393,52 +451,14 @@ class Read(BaseTool):
                 "content": f"[Office file {Path(absolute_path).name}: no text content could be extracted]",
             })
 
-        all_lines = text.split('\n')
-        total_lines = len(all_lines)
+        result, error = self._paginate(
+            split_lines(text), offset, limit, display_path
+        )
+        if error:
+            return ToolResult.fail(error)
 
-        start_line = 0
-        if offset is not None:
-            if offset < 0:
-                start_line = max(0, total_lines + offset)
-            else:
-                start_line = max(0, offset - 1)
-                if start_line >= total_lines:
-                    return ToolResult.fail(
-                        f"Error: Offset {offset} is beyond end of content ({total_lines} lines total)"
-                    )
-
-        selected_content = text
-        user_limited_lines = None
-        if limit is not None:
-            end_line = min(start_line + limit, total_lines)
-            selected_content = '\n'.join(all_lines[start_line:end_line])
-            user_limited_lines = end_line - start_line
-        elif offset is not None:
-            selected_content = '\n'.join(all_lines[start_line:])
-
-        truncation = truncate_head(selected_content)
-        start_line_display = start_line + 1
-        output_text = ""
-
-        if truncation.truncated:
-            end_line_display = start_line_display + truncation.output_lines - 1
-            next_offset = end_line_display + 1
-            output_text = truncation.content
-            output_text += f"\n\n[Showing lines {start_line_display}-{end_line_display} of {total_lines}. Use offset={next_offset} to continue.]"
-        elif user_limited_lines is not None and start_line + user_limited_lines < total_lines:
-            remaining = total_lines - (start_line + user_limited_lines)
-            next_offset = start_line + user_limited_lines + 1
-            output_text = truncation.content
-            output_text += f"\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
-        else:
-            output_text = truncation.content
-
-        return ToolResult.success({
-            "content": output_text,
-            "total_lines": total_lines,
-            "start_line": start_line_display,
-            "output_lines": truncation.output_lines,
-        })
+        note_read(absolute_path)
+        return ToolResult.success(result)
 
     @staticmethod
     def _extract_office_text(absolute_path: str, file_ext: str) -> str:
@@ -488,7 +508,8 @@ class Read(BaseTool):
 
         return ""
 
-    def _read_pdf(self, absolute_path: str, display_path: str, offset: int = None, limit: int = None) -> ToolResult:
+    def _read_pdf(self, absolute_path: str, display_path: str, offset: int = None,
+                  limit: int = None, pages: str = None) -> ToolResult:
         """
         Read PDF file content
         
@@ -510,84 +531,47 @@ class Read(BaseTool):
             # Read PDF
             reader = PdfReader(absolute_path)
             total_pages = len(reader.pages)
-            
-            # Extract text from all pages
+
+            try:
+                first_page, last_page = _parse_page_range(pages, total_pages)
+            except ValueError as e:
+                return ToolResult.fail(f"Error: {e}")
+
+            # Only extract the requested window; a large PDF is expensive to
+            # parse in full and the model rarely needs every page.
             text_parts = []
-            for page_num, page in enumerate(reader.pages, 1):
-                page_text = page.extract_text()
+            for page_num in range(first_page, last_page + 1):
+                page_text = reader.pages[page_num - 1].extract_text()
                 if page_text.strip():
                     text_parts.append(f"--- Page {page_num} ---\n{page_text}")
-            
+
             if not text_parts:
+                scope = (
+                    f"pages {first_page}-{last_page} of {total_pages}"
+                    if (first_page, last_page) != (1, total_pages)
+                    else f"{total_pages} pages"
+                )
                 return ToolResult.success({
-                    "content": f"[PDF file with {total_pages} pages, but no text content could be extracted]",
+                    "content": f"[PDF file with {scope}, but no text content could be extracted]",
                     "total_pages": total_pages,
                     "message": "PDF may contain only images or be encrypted"
                 })
-            
-            # Merge all text
-            full_content = "\n\n".join(text_parts)
-            all_lines = full_content.split('\n')
-            total_lines = len(all_lines)
-            
-            # Apply offset and limit (same logic as text files)
-            start_line = 0
-            if offset is not None:
-                start_line = max(0, offset - 1)
-                if start_line >= total_lines:
-                    return ToolResult.fail(
-                        f"Error: Offset {offset} is beyond end of content ({total_lines} lines total)"
-                    )
-            
-            start_line_display = start_line + 1
-            
-            selected_content = full_content
-            user_limited_lines = None
-            if limit is not None:
-                end_line = min(start_line + limit, total_lines)
-                selected_content = '\n'.join(all_lines[start_line:end_line])
-                user_limited_lines = end_line - start_line
-            elif offset is not None:
-                selected_content = '\n'.join(all_lines[start_line:])
-            
-            # Apply truncation
-            truncation = truncate_head(selected_content)
-            
-            output_text = ""
-            details = {}
-            
-            if truncation.truncated:
-                end_line_display = start_line_display + truncation.output_lines - 1
-                next_offset = end_line_display + 1
-                
-                output_text = truncation.content
-                
-                if truncation.truncated_by == "lines":
-                    output_text += f"\n\n[Showing lines {start_line_display}-{end_line_display} of {total_lines}. Use offset={next_offset} to continue.]"
-                else:
-                    output_text += f"\n\n[Showing lines {start_line_display}-{end_line_display} of {total_lines} ({format_size(DEFAULT_MAX_BYTES)} limit). Use offset={next_offset} to continue.]"
-                
-                details["truncation"] = truncation.to_dict()
-            elif user_limited_lines is not None and start_line + user_limited_lines < total_lines:
-                remaining = total_lines - (start_line + user_limited_lines)
-                next_offset = start_line + user_limited_lines + 1
-                
-                output_text = truncation.content
-                output_text += f"\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
-            else:
-                output_text = truncation.content
-            
-            result = {
-                "content": output_text,
-                "total_pages": total_pages,
-                "total_lines": total_lines,
-                "start_line": start_line_display,
-                "output_lines": truncation.output_lines
-            }
-            
-            if details:
-                result["details"] = details
-            
+
+            result, error = self._paginate(
+                split_lines("\n\n".join(text_parts)), offset, limit, display_path
+            )
+            if error:
+                return ToolResult.fail(error)
+
+            result["total_pages"] = total_pages
+            result["pages_read"] = f"{first_page}-{last_page}"
+            if last_page < total_pages:
+                result["content"] += (
+                    f"\n\n[Read pages {first_page}-{last_page} of {total_pages}. "
+                    f"Use pages=\"{last_page + 1}-\" to continue.]"
+                )
+
+            note_read(absolute_path)
             return ToolResult.success(result)
             
         except Exception as e:

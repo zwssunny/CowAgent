@@ -15,6 +15,21 @@ from config import conf, load_config
 from zai import ZhipuAiClient
 
 
+# GLM models that natively accept image input on the chat/completions endpoint.
+# glm-5.3-flash is multimodal (image understanding); the dedicated glm-5v-turbo
+# is only needed for text-only chat models (glm-5-turbo, glm-5.2, etc.).
+_VISION_CAPABLE_MODEL_PREFIXES = ("glm-5.3-flash", "glm-5v")
+
+# Fallback vision model for text-only main models that cannot see images.
+_DEFAULT_VISION_MODEL = "glm-5v-turbo"
+
+
+def _is_vision_capable_model(model_name: Optional[str]) -> bool:
+    """Whether the given GLM model can accept image input directly."""
+    name = (model_name or "").strip().lower()
+    return bool(name) and name.startswith(_VISION_CAPABLE_MODEL_PREFIXES)
+
+
 # ZhipuAI对话模型API
 class ZHIPUAIBot(Bot, ZhipuAIImage):
     def __init__(self):
@@ -154,10 +169,14 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
                     model: Optional[str] = None,
                     max_tokens: int = 1000) -> dict:
         """Analyze an image using ZhipuAI OpenAI-compatible SDK.
-        Always uses glm-5v-turbo — the text models (glm-5-turbo etc.) do not support vision.
+
+        Multimodal chat models (e.g. glm-5.3-flash) accept image input directly,
+        so we honor the requested model when it is vision-capable. Text-only chat
+        models (glm-5-turbo, glm-5.2, etc.) fall back to the dedicated
+        glm-5v-turbo vision model.
         """
         try:
-            vision_model = "glm-5v-turbo"
+            vision_model = model if _is_vision_capable_model(model) else _DEFAULT_VISION_MODEL
             response = self.client.chat.completions.create(
                 model=vision_model,
                 max_tokens=max_tokens,
@@ -241,11 +260,27 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
                 if stream:
                     request_params["tool_stream"] = kwargs.get("tool_stream", True)
             
+            # GLM-5.3 (and later always-thinking GLMs) reject
+            # thinking.type="disabled" with error 1210. They always think and
+            # only accept reasoning_effort in low/high/max. Normalize here so an
+            # upstream "disabled" toggle never reaches the API.
+            model_name = request_params["model"]
+            always_thinking = self._is_always_thinking_model(model_name)
+
             # Add thinking parameter for deep thinking mode (GLM-4.7)
             thinking = kwargs.get("thinking")
-            if thinking:
+            reasoning_effort = kwargs.get("reasoning_effort")
+            if always_thinking:
+                request_params["thinking"] = {"type": "enabled"}
+                # Effort must be one of low/high/max; fall back to the doc default.
+                effort = reasoning_effort if reasoning_effort in ("low", "high", "max") else "max"
+                request_params["reasoning_effort"] = effort
+            elif thinking:
                 request_params["thinking"] = thinking
-            elif "glm-4.7" in request_params["model"]:
+                # Zhipu only accepts reasoning_effort when thinking is enabled.
+                if thinking.get("type") == "enabled" and reasoning_effort:
+                    request_params["reasoning_effort"] = reasoning_effort
+            elif "glm-4.7" in model_name:
                 # Enable thinking by default for GLM-4.7
                 request_params["thinking"] = {"type": "disabled"}
             
@@ -273,10 +308,41 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
                     "status_code": 500
                 }
     
+    @staticmethod
+    def _is_always_thinking_model(model_name: str) -> bool:
+        """Whether the model always thinks and rejects thinking.type="disabled".
+
+        GLM-5.3 (and any later glm-5.3.* variants) always reason and only accept
+        reasoning_effort in low/high/max. See the GLM-5.3 release notes.
+        """
+        name = (model_name or "").strip().lower()
+        return name.startswith("glm-5.3")
+
+    def _create_completion(self, request_params):
+        """Call the SDK, degrading gracefully on older zai-sdk versions.
+
+        ``reasoning_effort`` requires zai-sdk>=0.2.3. Older SDKs raise
+        ``TypeError: ... unexpected keyword argument 'reasoning_effort'``. Rather
+        than fail the whole request (and every retry), drop the unsupported
+        kwarg and retry once so the model still answers.
+        """
+        try:
+            return self.client.chat.completions.create(**request_params)
+        except TypeError as e:
+            if "reasoning_effort" in str(e) and "reasoning_effort" in request_params:
+                logger.warning(
+                    "[ZHIPU_AI] installed zai-sdk does not support 'reasoning_effort'; "
+                    "retrying without it. Upgrade to zai-sdk>=0.2.3 for GLM-5.3."
+                )
+                params = dict(request_params)
+                params.pop("reasoning_effort", None)
+                return self.client.chat.completions.create(**params)
+            raise
+
     def _handle_sync_response(self, request_params):
         """Handle synchronous ZhipuAI API response"""
         try:
-            response = self.client.chat.completions.create(**request_params)
+            response = self._create_completion(request_params)
             
             # Convert ZhipuAI response to OpenAI-compatible format
             return {
@@ -313,10 +379,24 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
     def _handle_stream_response(self, request_params):
         """Handle streaming ZhipuAI API response"""
         try:
-            stream = self.client.chat.completions.create(**request_params)
+            stream = self._create_completion(request_params)
+            stream_usage = None  # Provider-reported token usage
             
             # Stream chunks to caller, converting to OpenAI format
             for chunk in stream:
+                # ZhipuAI attaches usage to the final chunk (which may have an
+                # empty choices list) — capture it before the skip below.
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    try:
+                        stream_usage = {
+                            "prompt_tokens": chunk_usage.prompt_tokens,
+                            "completion_tokens": chunk_usage.completion_tokens,
+                            "total_tokens": chunk_usage.total_tokens,
+                        }
+                    except AttributeError:
+                        pass
+
                 if not chunk.choices:
                     continue
                 
@@ -372,6 +452,11 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
                     openai_chunk["choices"][0]["delta"]["tool_calls"] = openai_tool_calls
                 
                 yield openai_chunk
+
+            # Emit a trailing usage-only chunk so the agent can record a real
+            # prompt_tokens count for the context indicator.
+            if stream_usage is not None:
+                yield {"choices": [], "usage": stream_usage}
                 
         except Exception as e:
             logger.error(f"[ZHIPU_AI] stream response error: {e}")

@@ -66,12 +66,13 @@ class BaiduWenxinBot(Bot):
                         reply = Reply(ReplyType.TEXT, reply_content)
                 return reply
             elif context.type == ContextType.IMAGE_CREATE:
-                ok, retstring = self.create_img(query, 0)
-                reply = None
-                if ok:
-                    reply = Reply(ReplyType.IMAGE_URL, retstring)
-                else:
-                    reply = Reply(ReplyType.ERROR, retstring)
+                # The Wenxin API has no image-generation backend in this project,
+                # so this class has no create_img(). The image-create prefix used
+                # to call it anyway and raise AttributeError, which the channel
+                # worker logs and swallows -- the user got no reply at all.
+                # Answer with the same "unsupported type" error the other
+                # text-only bots return.
+                reply = Reply(ReplyType.ERROR, "Bot不支持处理{}类型的消息".format(context.type))
                 return reply
 
     def reply_text(self, session: BaiduWenxinSession, retry_count=0):

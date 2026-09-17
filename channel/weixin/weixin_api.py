@@ -31,6 +31,69 @@ DEFAULT_API_TIMEOUT = 15
 QR_POLL_TIMEOUT = 35
 BOT_TYPE = "3"
 
+# Retry policy for outbound sendMessage calls on transient transport errors.
+SEND_RETRIES = 2
+SEND_RETRY_BACKOFF_BASE = 1.0
+
+
+# The Weixin CDN only accepts legacy TLS1.2 + RSA cipher suites (e.g.
+# AES256-GCM-SHA384). OpenSSL 1.1.1's default SECLEVEL=2 rejects these
+# no-forward-secrecy suites, so the handshake fails with SSLV3_ALERT_
+# HANDSHAKE_FAILURE. Lower the security level only for CDN requests.
+_cdn_session = None
+
+
+def _get_cdn_session() -> "requests.Session":
+    global _cdn_session
+    if _cdn_session is not None:
+        return _cdn_session
+
+    import ssl
+
+    from requests.adapters import HTTPAdapter
+
+    try:
+        from urllib3.util.ssl_ import create_urllib3_context
+    except ImportError:
+        create_urllib3_context = None
+
+    class _WeixinCdnAdapter(HTTPAdapter):
+        def _build_ctx(self):
+            if create_urllib3_context is not None:
+                ctx = create_urllib3_context()
+            else:
+                ctx = ssl.create_default_context()
+            try:
+                ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+            except ssl.SSLError:
+                pass
+            # A custom SSL context has an empty trust store; load a CA bundle
+            # (certifi if available, otherwise system defaults) so cert
+            # verification still works.
+            try:
+                import certifi
+                ctx.load_verify_locations(cafile=certifi.where())
+            except Exception:
+                try:
+                    ctx.load_default_certs()
+                except Exception:
+                    pass
+            return ctx
+
+        def init_poolmanager(self, *args, **kwargs):
+            kwargs["ssl_context"] = self._build_ctx()
+            return super().init_poolmanager(*args, **kwargs)
+
+        def proxy_manager_for(self, *args, **kwargs):
+            kwargs["ssl_context"] = self._build_ctx()
+            return super().proxy_manager_for(*args, **kwargs)
+
+    session = requests.Session()
+    adapter = _WeixinCdnAdapter()
+    session.mount("https://", adapter)
+    _cdn_session = session
+    return _cdn_session
+
 
 def _random_wechat_uin() -> str:
     val = random.randint(0, 0xFFFFFFFF)
@@ -69,20 +132,39 @@ class WeixinApi:
         self.token = token
         self.cdn_base_url = cdn_base_url
 
-    def _post(self, endpoint: str, body: dict, timeout: int = DEFAULT_API_TIMEOUT) -> dict:
+    def _post(self, endpoint: str, body: dict, timeout: int = DEFAULT_API_TIMEOUT,
+              retries: int = 0) -> dict:
         url = _ensure_trailing_slash(self.base_url) + endpoint
         headers = _build_headers(self.token)
         body.setdefault("base_info", {}).setdefault("channel_version", CHANNEL_VERSION)
-        try:
-            resp = requests.post(url, json=body, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.Timeout:
-            logger.debug(f"[Weixin] API timeout: {endpoint}")
-            return {"ret": 0, "msgs": []}
-        except Exception as e:
-            logger.error(f"[Weixin] API error {endpoint}: {e}")
-            raise
+        attempt = 0
+        while True:
+            try:
+                resp = requests.post(url, json=body, headers=headers, timeout=timeout)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.Timeout:
+                logger.debug(f"[Weixin] API timeout: {endpoint}")
+                return {"ret": 0, "msgs": []}
+            except (requests.exceptions.SSLError,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                # Transient transport-level errors (e.g. SSLEOFError from the
+                # peer dropping the connection) are usually recoverable, so
+                # retry a few times with exponential backoff before giving up.
+                if attempt < retries:
+                    backoff = SEND_RETRY_BACKOFF_BASE * (2 ** attempt)
+                    attempt += 1
+                    logger.warning(f"[Weixin] API transient error {endpoint} "
+                                   f"(attempt {attempt}/{retries}), retrying in "
+                                   f"{backoff}s: {e}")
+                    time.sleep(backoff)
+                    continue
+                logger.error(f"[Weixin] API error {endpoint}: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"[Weixin] API error {endpoint}: {e}")
+                raise
 
     # ── getUpdates (long-poll) ─────────────────────────────────────────
 
@@ -104,7 +186,7 @@ class WeixinApi:
                 "item_list": [{"type": 1, "text_item": {"text": text}}],
                 "context_token": context_token,
             }
-        })
+        }, retries=SEND_RETRIES)
 
     def send_image_item(self, to: str, context_token: str,
                         encrypt_query_param: str, aes_key_b64: str,
@@ -175,7 +257,7 @@ class WeixinApi:
                 "item_list": items,
                 "context_token": context_token,
             }
-        })
+        }, retries=SEND_RETRIES)
 
     # ── getUploadUrl ───────────────────────────────────────────────────
 
@@ -328,7 +410,7 @@ def upload_media_to_cdn(api: WeixinApi, file_path: str, to_user_id: str,
             else:
                 raise RuntimeError(f"[Weixin] getUploadUrl returned neither upload_full_url nor upload_param: {resp}")
 
-            cdn_resp = requests.post(cdn_url, data=encrypted, headers={
+            cdn_resp = _get_cdn_session().post(cdn_url, data=encrypted, headers={
                 "Content-Type": "application/octet-stream",
                 "Content-Length": str(len(encrypted)),
             }, timeout=120)
@@ -381,7 +463,7 @@ def download_media_from_cdn(cdn_base_url: str, encrypt_query_param: str,
     """
     from urllib.parse import quote
     url = f"{cdn_base_url}/download?encrypted_query_param={quote(encrypt_query_param)}"
-    resp = requests.get(url, timeout=60)
+    resp = _get_cdn_session().get(url, timeout=60)
     resp.raise_for_status()
 
     # Determine key format:

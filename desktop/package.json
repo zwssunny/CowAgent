@@ -1,6 +1,6 @@
 {
   "name": "cowagent-desktop",
-  "version": "2.1.3",
+  "version": "2.1.9",
   "description": "CowAgent Desktop Client - AI Agent on your desktop",
   "main": "dist/main/index.js",
   "author": "CowAgent",
@@ -15,13 +15,17 @@
     "build:renderer": "vite build",
     "dist": "npm run build && electron-builder",
     "dist:mac": "npm run build && electron-builder --mac",
-    "dist:win": "npm run build && electron-builder --win"
+    "dist:win": "npm run build && electron-builder --win",
+    "flavor:apply": "node scripts/apply-flavor.mjs",
+    "flavor:clear": "node scripts/apply-flavor.mjs --clear",
+    "dist:flavor": "node scripts/apply-flavor.mjs $FLAVOR && npm run build && electron-builder && node scripts/apply-flavor.mjs --clear"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",
     "highlight.js": "^11.11.1",
     "lucide-react": "^1.21.0",
     "markdown-it": "^14.2.0",
+    "png-to-ico": "^3.0.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.28.0",
@@ -60,7 +64,9 @@
         "from": "resources",
         "to": ".",
         "filter": [
-          "icon.png"
+          "icon.png",
+          "app-config.json",
+          "themes/**"
         ]
       }
     ],
@@ -73,21 +79,12 @@
       "entitlementsInherit": "build/entitlements.mac.plist",
       "notarize": false,
       "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Used for voice input in chat: record a short clip and transcribe it via the configured speech recognition provider."
+      },
       "target": [
-        {
-          "target": "dmg",
-          "arch": [
-            "arm64",
-            "x64"
-          ]
-        },
-        {
-          "target": "zip",
-          "arch": [
-            "arm64",
-            "x64"
-          ]
-        }
+        "dmg",
+        "zip"
       ]
     },
     "win": {
@@ -113,5 +110,9 @@
       "provider": "generic",
       "url": "https://cowagent.ai/update/"
     }
+  },
+  "overrides": {
+    "js-yaml": "4.3.1",
+    "linkify-it": "5.0.2"
   }
 }

@@ -35,8 +35,8 @@ KNOWN_COMMANDS = {
     "help", "version", "status", "logs",
     "start", "stop", "restart",
     "cancel",
-    "skill", "context", "config",
-    "knowledge", "memory",
+    "skill", "context", "config", "tasks",
+    "knowledge", "memory", "compact", "clear",
     "install-browser",
 }
 
@@ -55,7 +55,8 @@ CHAT_ONLY_COMMANDS = set()  # context is allowed in both, but behaves differentl
 # Users may override / extend these via config.json "command_aliases".
 DEFAULT_ALIASES = {
     "c":   "cancel",
-    "cc":  "context clear",
+    "cc":  "clear",
+    "cp":  "compact",
     "ctx": "context",
     "h":   "help",
     "s":   "status",
@@ -356,7 +357,9 @@ class CowCliPlugin(Plugin):
                 "/cancel: Abort the running Agent task",
                 "/logs [N]: Show the last N log lines (default 20)",
                 "/context: Show current conversation context",
-                "/context clear: Clear current conversation context",
+                "/clear: Clear current conversation context",
+                "/compact: Summarize older turns to free up context",
+                "/tasks: List scheduled tasks for this chat",
                 "/skill list: List installed skills",
                 "/skill list --remote: Browse Skill Hub",
                 "/skill search <keyword>: Search skills",
@@ -384,7 +387,9 @@ class CowCliPlugin(Plugin):
                 "/cancel: 中止当前正在运行的 Agent 任务",
                 "/logs [N]: 查看最近N条日志 (默认20)",
                 "/context: 查看当前对话上下文信息",
-                "/context clear: 清除当前对话上下文",
+                "/clear: 清除当前对话上下文",
+                "/compact: 总结较早的对话以释放上下文",
+                "/tasks: 查看当前会话的定时任务",
                 "/skill list: 查看已安装的技能",
                 "/skill list --remote: 浏览技能广场",
                 "/skill search <关键词>: 搜索技能",
@@ -406,6 +411,84 @@ class CowCliPlugin(Plugin):
 
     def _cmd_version(self, args: str, e_context, **_) -> str:
         return f"CowAgent v{__version__}"
+
+    # ------------------------------------------------------------------
+    # tasks — read-only scheduler list scoped to the current chat.
+    # Feishu intercepts /tasks before this plugin to keep its interactive card;
+    # every other channel receives this plain-text view.
+    # ------------------------------------------------------------------
+
+    def _cmd_tasks(self, args: str, e_context, session_id: str = "", **_) -> str:
+        from agent.tools.scheduler.integration import get_task_store
+
+        task_store = get_task_store()
+        if task_store is None:
+            from agent.tools.scheduler.task_store import TaskStore
+            from common.state_dir import scheduler_file_global
+
+            task_store = TaskStore(str(scheduler_file_global()))
+
+        channel_type = ""
+        receiver = ""
+        if e_context is not None:
+            context = e_context["context"]
+            channel_type = context.get("channel_type", "") or ""
+            receiver = context.get("receiver", "") or ""
+            session_id = context.get("session_id", "") or session_id
+
+        visible = []
+        for task in task_store.list_tasks():
+            action = task.get("action") or {}
+            if receiver:
+                if action.get("receiver") != receiver:
+                    continue
+                if channel_type and action.get("channel_type") != channel_type:
+                    continue
+            elif session_id not in {
+                action.get("receiver"),
+                action.get("notify_session_id"),
+            }:
+                continue
+            visible.append(task)
+
+        return self._format_tasks(visible)
+
+    @staticmethod
+    def _format_tasks(tasks) -> str:
+        if not tasks:
+            return _t(
+                "📅 当前会话暂无定时任务。",
+                "📅 No scheduled tasks in this chat.",
+            )
+
+        lines = [_t("📅 当前会话的定时任务", "📅 Scheduled tasks in this chat"), ""]
+        for index, task in enumerate(tasks[:20], 1):
+            enabled = task.get("enabled", True)
+            status = "✅" if enabled else "⏸️"
+            schedule = task.get("schedule") or {}
+            schedule_type = schedule.get("type")
+            if schedule_type == "cron":
+                schedule_text = "cron {}".format(schedule.get("expression") or "?")
+            elif schedule_type == "interval":
+                schedule_text = "every {}s".format(schedule.get("seconds") or "?")
+            elif schedule_type == "once":
+                schedule_text = "once at {}".format(schedule.get("run_at") or "?")
+            else:
+                schedule_text = str(schedule_type or "unknown")
+
+            next_run = str(task.get("next_run_at") or "-").replace("T", " ")
+            lines.extend(
+                [
+                    "{}. {} {}".format(index, status, task.get("name") or "Unnamed task"),
+                    "   ID: {}".format(task.get("id") or "-"),
+                    "   {} · Next: {}".format(schedule_text, next_run),
+                ]
+            )
+
+        hidden = len(tasks) - 20
+        if hidden > 0:
+            lines.append(_t("\n另有 {} 个任务未显示。", "\n{} more tasks are hidden.").format(hidden))
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # cancel — abort the in-flight agent run for the current session.
@@ -433,9 +516,19 @@ class CowCliPlugin(Plugin):
         if request_id and registry.cancel_request(request_id):
             cancelled = 1
 
-        # Fall back to session-wide cancel
+        # Fall back to session-wide cancel, under the agent-scoped key the run
+        # was registered with.
         if cancelled == 0 and target_session:
-            cancelled = registry.cancel_session(target_session)
+            from bridge.bridge import Bridge
+            agent_bridge = Bridge().get_agent_bridge()
+            agent_id = (
+                agent_bridge.route_context(e_context["context"])
+                if e_context is not None
+                else None
+            )
+            cancelled = registry.cancel_session(
+                agent_bridge.scoped_session_key(target_session, agent_id)
+            )
 
         if cancelled <= 0:
             return _t("当前没有可中止的任务。", "Nothing to cancel.")
@@ -538,9 +631,16 @@ class CowCliPlugin(Plugin):
 
         sub = args.strip().lower()
         if sub == "clear":
+            # Kept for backward compatibility; /clear is the preferred form.
             return self._context_clear(agent, session_id)
         else:
             return self._context_info(agent, session_id)
+
+    def _cmd_clear(self, args: str, e_context: EventContext, session_id: str = "", **_) -> str:
+        """Clear the current conversation context (alias of /context clear)."""
+        session_id = self._get_session_id(e_context, fallback=session_id)
+        agent = self._get_agent(session_id)
+        return self._context_clear(agent, session_id)
 
     def _context_info(self, agent, session_id: str) -> str:
         if not agent:
@@ -569,7 +669,7 @@ class CowCliPlugin(Plugin):
                 f"  Tool calls: {tool_msgs}",
                 f"  Total content length: ~{total_chars} chars",
                 "",
-                "  Send /context clear to clear the conversation context",
+                "  Send /clear to clear the conversation context",
             ]
         else:
             lines = [
@@ -582,9 +682,36 @@ class CowCliPlugin(Plugin):
                 f"  工具调用: {tool_msgs}",
                 f"  内容总长度: ~{total_chars} 字符",
                 "",
-                "  发送 /context clear 可清除对话上下文",
+                "  发送 /clear 可清除对话上下文",
             ]
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # compact — summarize older turns and free up context on demand.
+    # ------------------------------------------------------------------
+
+    def _cmd_compact(self, args: str, e_context: EventContext, session_id: str = "", **_) -> str:
+        session_id = self._get_session_id(e_context, fallback=session_id)
+        agent = self._get_agent(session_id)
+        if not agent:
+            return _t("⚠️ Agent 未初始化，暂无上下文可压缩", "⚠️ Agent not initialized, no context to compact")
+
+        if not hasattr(agent, "compact_context"):
+            return _t("⚠️ 当前 Agent 不支持手动压缩", "⚠️ This Agent does not support manual compaction")
+
+        result = agent.compact_context()
+        if not result.get("ok"):
+            return _t("💬 当前上下文较短，无需压缩", "💬 Context is already short, nothing to compact")
+
+        turns = result.get("compacted_turns", 0)
+        before = result.get("before", 0)
+        after = result.get("after", 0)
+        return _t(
+            f"🗜️ 已压缩上下文\n\n  压缩轮次: {turns}\n  消息数: {before} → {after}\n\n"
+            f"较早的对话已总结保留，最近的对话保持不变。",
+            f"🗜️ Context compacted\n\n  Turns summarized: {turns}\n  Messages: {before} → {after}\n\n"
+            f"Older conversation was summarized; recent turns are kept as-is.",
+        )
 
     def _context_clear(self, agent, session_id: str) -> str:
         if not agent:
@@ -694,7 +821,8 @@ class CowCliPlugin(Plugin):
         from config import get_data_root
         config_path = os.path.join(get_data_root(), "config.json")
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            # utf-8-sig tolerates a UTF-8 BOM (e.g. edited with Windows Notepad).
+            with open(config_path, "r", encoding="utf-8-sig") as f:
                 file_config = _json.load(f)
             file_config.update(updates)
             with open(config_path, "w", encoding="utf-8") as f:
@@ -827,7 +955,7 @@ class CowCliPlugin(Plugin):
         sub_args = parts[1].strip() if len(parts) > 1 else ""
 
         if sub == "list":
-            return self._skill_list(sub_args)
+            return self._skill_list(sub_args, e_context)
         elif sub == "search":
             return self._skill_search(sub_args)
         elif sub == "install":
@@ -868,17 +996,31 @@ class CowCliPlugin(Plugin):
             from bridge.bridge import Bridge
             bridge = Bridge()
             agent_bridge = bridge.get_agent_bridge()
-            for agent in [agent_bridge.default_agent] + list(agent_bridge.agents.values()):
+            for _agent_id, _session_id, agent in agent_bridge.iter_agent_instances():
                 if agent and hasattr(agent, 'skill_manager') and agent.skill_manager:
                     agent.skill_manager.refresh_skills()
                     break
         except Exception as e:
             logger.debug(f"[CowCli] skill refresh skipped: {e}")
 
-    def _skill_list_local(self) -> str:
+    def _skill_list_local(self, agent_id=None) -> str:
         from cli.utils import load_skills_config, get_skills_dir, get_builtin_skills_dir
         self._refresh_skill_manager()
         config = load_skills_config()
+
+        # Scope to this Agent's selection: a subset picked in team.json means
+        # /skill list here shows only what this Agent actually draws on, not the
+        # whole shared library. ``None`` selection = every shared skill; an empty
+        # list is a deliberate "none" and must NOT fall through to a disk scan.
+        selection = self._agent_skill_selection(agent_id)
+        scoped = selection is not None
+        if scoped:
+            config = {n: e for n, e in config.items() if n in selection}
+            if not config:
+                return _t(
+                    "该智能体未启用任何技能。\n\n💡 在「智能体」中为它勾选技能",
+                    "This Agent has no skills enabled.\n\n💡 Pick skills for it under Agents",
+                )
 
         if not config:
             skills_dir = get_skills_dir()
@@ -927,7 +1069,7 @@ class CowCliPlugin(Plugin):
         lines.append(_t("💡 /skill info <名称>: 查看详情", "💡 /skill info <name>: Show details"))
         return "\n".join(lines)
 
-    def _skill_list(self, args: str) -> str:
+    def _skill_list(self, args: str, e_context=None) -> str:
         parts = args.strip().split()
         if "--remote" in parts or "-r" in parts:
             page = 1
@@ -935,7 +1077,33 @@ class CowCliPlugin(Plugin):
                 if p == "--page" and i + 1 < len(parts) and parts[i + 1].isdigit():
                     page = max(1, int(parts[i + 1]))
             return self._skill_list_remote(page=page)
-        return self._skill_list_local()
+        return self._skill_list_local(self._current_agent_id(e_context))
+
+    def _agent_skill_selection(self, agent_id):
+        """The set of skill names this Agent draws on, or ``None`` for "all".
+
+        Mirrors SkillManager's first gate: a profile with an explicit ``skills``
+        list is a subset; ``None``/absent means the full shared library.
+        """
+        try:
+            from agent.registry import get_agent_registry
+            profile = get_agent_registry().get(agent_id or None, require_enabled=False)
+            return None if profile.skills is None else set(profile.skills)
+        except Exception:
+            return None
+
+    def _current_agent_id(self, e_context):
+        """Resolve which Agent this /skill command is running inside, so the
+        listing can be scoped to that Agent's selection rather than the whole
+        shared library."""
+        if e_context is None:
+            return None
+        try:
+            from bridge.bridge import Bridge
+            agent_bridge = Bridge().get_agent_bridge()
+            return agent_bridge.route_context(e_context["context"])
+        except Exception:
+            return None
 
     _REMOTE_PAGE_SIZE = 10
 
@@ -1101,6 +1269,14 @@ class CowCliPlugin(Plugin):
                     json.dump(config, f, indent=4, ensure_ascii=False)
             except Exception:
                 pass
+
+        # The skill is gone from the shared library, so scrub its name from any
+        # Agent's selection list in team.json instead of leaving dead entries.
+        try:
+            from agent.admin import get_agent_admin_service
+            get_agent_admin_service().prune_skill(name)
+        except Exception as e:
+            logger.debug(f"[CowCli] skill prune skipped: {e}")
 
         return _t(f"✅ 技能 '{name}' 已卸载", f"✅ Skill '{name}' uninstalled")
 
@@ -1355,7 +1531,7 @@ class CowCliPlugin(Plugin):
 
     def _memory_status(self) -> str:
         """Show current memory index status."""
-        from agent.memory.embedding import detect_index_dim
+        from agent.memory.embedding import detect_index_dim, detect_chunker_version
         from config import conf
 
         agent = self._get_agent("")
@@ -1405,6 +1581,18 @@ class CowCliPlugin(Plugin):
                 warnings.append(_t(
                     f"  ⚠️ 索引中存量向量为 {index_dim} 维，与当前配置 {cfg_dim} 维不一致；运行 /memory rebuild-index 重建后向量检索才会生效",
                     f"  ⚠️ Existing vectors are {index_dim}-dim, mismatching the current {cfg_dim}-dim config; run /memory rebuild-index to make vector search work",
+                ))
+
+            # Index predates (or doesn't match) the current chunker. Chunked
+            # files only re-split when their content hash changes, so a chunker
+            # upgrade alone never refreshes old boundaries — suggest a rebuild.
+            # This is only a hint: rebuild re-embeds everything and is costly,
+            # so the user decides.
+            from agent.memory.chunker import TextChunker
+            if detect_chunker_version(memory_manager.storage) != TextChunker.CHUNKER_VERSION:
+                warnings.append(_t(
+                    "  ⚠️ 索引由旧版切分算法生成；建议运行 /memory rebuild-index 以按标题更精准地切分记忆（重建成本较高，由你决定）",
+                    "  ⚠️ Index was built by an older chunking strategy; consider running /memory rebuild-index for heading-aware chunking (a rebuild re-embeds everything, so it's your call)",
                 ))
 
         if warnings:
@@ -1601,13 +1789,12 @@ class CowCliPlugin(Plugin):
         """Create a MemoryFlushManager without a running agent (for pre-init dream)."""
         from pathlib import Path
         from config import conf
-        from common.utils import expand_path
+        from common.state_dir import state_root
         from agent.memory.summarizer import MemoryFlushManager
         from bridge.bridge import Bridge
         from bridge.agent_bridge import AgentLLMModel
 
-        workspace = Path(expand_path(conf().get("agent_workspace", "~/cow")))
-        flush_mgr = MemoryFlushManager(workspace_dir=workspace)
+        flush_mgr = MemoryFlushManager(workspace_dir=state_root())
         flush_mgr.llm_model = AgentLLMModel(Bridge())
         return flush_mgr
 
@@ -1637,7 +1824,8 @@ class CowCliPlugin(Plugin):
         from config import get_data_root
         config_path = os.path.join(get_data_root(), "config.json")
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            # utf-8-sig tolerates a UTF-8 BOM (e.g. edited with Windows Notepad).
+            with open(config_path, "r", encoding="utf-8-sig") as f:
                 file_config = _json.load(f)
             file_config["knowledge"] = enabled
             with open(config_path, "w", encoding="utf-8") as f:
@@ -1657,11 +1845,8 @@ class CowCliPlugin(Plugin):
 
     def _knowledge_stats(self) -> str:
         from config import conf
-        from common.utils import expand_path
-        knowledge_dir = os.path.join(
-            expand_path(conf().get("agent_workspace", "~/cow")),
-            "knowledge"
-        )
+        from common import state_dir
+        knowledge_dir = str(state_dir.knowledge_dir())
         if not os.path.isdir(knowledge_dir):
             return _t("📚 知识库目录不存在\n\n💡 开启知识库: /knowledge on", "📚 Knowledge base directory not found\n\n💡 Enable it: /knowledge on")
 
@@ -1704,12 +1889,8 @@ class CowCliPlugin(Plugin):
         return "\n".join(lines)
 
     def _knowledge_tree(self) -> str:
-        from config import conf
-        from common.utils import expand_path
-        knowledge_dir = os.path.join(
-            expand_path(conf().get("agent_workspace", "~/cow")),
-            "knowledge"
-        )
+        from common import state_dir
+        knowledge_dir = str(state_dir.knowledge_dir())
         if not os.path.isdir(knowledge_dir):
             return _t("📚 知识库目录不存在\n\n💡 开启知识库: /knowledge on", "📚 Knowledge base directory not found\n\n💡 Enable it: /knowledge on")
 

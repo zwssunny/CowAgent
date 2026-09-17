@@ -31,19 +31,49 @@ def _normalize_mcp_configs(raw) -> list:
 class ToolManager:
     """
     Tool manager for managing tools.
+
+    One instance per Agent workspace. Not a plain singleton: the instance
+    caches booted MCP subprocesses so that per-session agent init does not
+    re-fork them, and each workspace has its own ``mcp.json``. A single
+    process-wide instance would let the first Agent to start decide which MCP
+    servers exist, hand its tools (and their credentials) to every other
+    Agent, and leave their own servers permanently unloaded.
     """
-    _instance = None
+    _instances: Dict[str, "ToolManager"] = {}
+    _instances_lock = threading.Lock()
 
     def __new__(cls):
-        """Singleton pattern to ensure only one instance of ToolManager exists."""
-        if cls._instance is None:
-            cls._instance = super(ToolManager, cls).__new__(cls)
-            cls._instance.tool_classes = {}  # Store tool classes instead of instances
-            cls._instance._initialized = False
-        return cls._instance
+        from common.state_dir import real_state_root
+
+        key = real_state_root()
+        instance = cls._instances.get(key)
+        if instance is not None:
+            return instance
+        with cls._instances_lock:
+            instance = cls._instances.get(key)
+            if instance is None:
+                instance = super(ToolManager, cls).__new__(cls)
+                instance.workspace_root = key
+                instance.tool_classes = {}  # Store tool classes instead of instances
+                instance._initialized = False
+                cls._instances[key] = instance
+            return instance
+
+    @classmethod
+    def instances(cls) -> list:
+        """Every ToolManager built so far, for process-wide operations."""
+        with cls._instances_lock:
+            return list(cls._instances.values())
+
+    @classmethod
+    def reset_instances(cls) -> None:
+        """Drop every cached instance. For tests."""
+        with cls._instances_lock:
+            cls._instances.clear()
 
     def __init__(self):
-        # Initialize only once
+        # Runs on every ToolManager() call, including the ones that get a
+        # cached instance back, so every field is guarded.
         if not hasattr(self, 'tool_classes'):
             self.tool_classes = {}  # Dictionary to store tool classes
         if not hasattr(self, '_mcp_registry'):
@@ -260,9 +290,12 @@ class ToolManager:
             logger.error(f"Error configuring tools from config: {e}")
 
     def _mcp_json_path(self) -> str:
-        import os
-        workspace = os.path.expanduser(conf().get("agent_workspace", "~/cow"))
-        return os.path.join(workspace, "mcp.json")
+        # Anchored to the workspace this instance was built for, not to the
+        # ambient identity: the MCP loader and refresh run on background
+        # threads that carry no identity and would otherwise read the default
+        # Agent's mcp.json.
+        from common.state_dir import mcp_config_file
+        return str(mcp_config_file(base=self.workspace_root))
 
     def _read_mcp_json_signature(self):
         """
@@ -300,7 +333,9 @@ class ToolManager:
                 with open(mcp_json_path, "r", encoding="utf-8") as f:
                     data = _json.load(f)
                 raw = data.get("mcpServers") or data.get("mcp_servers") or data
-                logger.info(f"[ToolManager] Loading MCP config from {mcp_json_path}")
+                # DEBUG: with N agents this fires N times for the same shared
+                # mcp.json; the real boot is logged once at INFO further below.
+                logger.debug(f"[ToolManager] Loading MCP config from {mcp_json_path}")
                 return _normalize_mcp_configs(raw)
             except Exception as e:
                 logger.warning(f"[ToolManager] Failed to read {mcp_json_path}: {e}, falling back to config.json")
@@ -349,7 +384,9 @@ class ToolManager:
                 daemon=True,
                 name="mcp-loader",
             ).start()
-            logger.info(
+            # DEBUG: fires once per agent; with many agents sharing one mcp.json
+            # this is just noise. The actual server boot is logged at INFO.
+            logger.debug(
                 f"[ToolManager] MCP loading started in background "
                 f"({len(mcp_servers_config)} server(s) configured)"
             )
@@ -425,6 +462,16 @@ class ToolManager:
         with self._mcp_registry._registry_lock:
             client = self._mcp_registry._clients.pop(server_name, None)
         if client is not None:
+            # This client may be pooled and shared with other Agents on the same
+            # mcp.json. Drop the matching pool entry so a later reload re-boots a
+            # fresh subprocess rather than handing out the one we're stopping.
+            try:
+                pool = self._mcp_registry._shared_pool
+                with self._mcp_registry._shared_pool_lock:
+                    for k in [k for k, v in pool.items() if v is client]:
+                        pool.pop(k, None)
+            except Exception:
+                pass
             try:
                 client.shutdown()
             except Exception as e:
@@ -453,12 +500,30 @@ class ToolManager:
             # Let the OAuth web callback bring a server online once authorized.
             set_reload_callback(self.reload_mcp_server)
 
+            mcp_json_path = self._mcp_json_path()
+
+            booted_any = False
             for cfg in mcp_servers_config:
                 server_name = cfg.get("name", "<unnamed>")
                 try:
-                    client = McpClient(cfg)
-                    if not client.initialize():
-                        if getattr(client, "needs_auth", False):
+                    # Reuse a subprocess already booted from the *same* mcp.json
+                    # with the *same* config, so several Agents sharing one
+                    # mcp.json don't each fork their own copy of every server.
+                    # Booting is serialized per key, so concurrent loader threads
+                    # racing on the same server end up sharing one subprocess.
+                    share_key = registry.shared_key(mcp_json_path, server_name, cfg)
+                    boot_failure = {}
+
+                    def _boot():
+                        c = McpClient(cfg)
+                        if c.initialize():
+                            return c
+                        boot_failure["needs_auth"] = getattr(c, "needs_auth", False)
+                        return None
+
+                    client, reused = registry.get_or_boot_shared(share_key, _boot)
+                    if client is None:
+                        if boot_failure.get("needs_auth"):
                             self._mcp_status[server_name] = "needs_auth"
                             logger.info(
                                 f"[MCP] Server '{server_name}' needs authorization — "
@@ -477,28 +542,45 @@ class ToolManager:
                         tool_name = schema.get("name", "")
                         if not tool_name:
                             continue
-                        mcp_tool = McpTool(client, schema, server_name)
+                        mcp_tool = McpTool(
+                            client, schema, server_name,
+                            name_prefix=cfg.get("tool_name_prefix", ""),
+                        )
                         # Atomic dict assignment is GIL-safe; readers iterate
                         # over a list() snapshot to avoid concurrent mutation.
-                        self._mcp_tool_instances[tool_name] = mcp_tool
-                        added.append(tool_name)
+                        self._mcp_tool_instances[mcp_tool.name] = mcp_tool
+                        added.append(mcp_tool.name)
 
                     # Register client into the shared registry only after its
                     # tools are visible, so callers never see a half-loaded server.
                     with registry._registry_lock:
                         registry._clients[server_name] = client
                     self._mcp_status[server_name] = "ready"
-                    logger.info(
-                        f"[MCP] Server '{server_name}' ready — "
-                        f"{len(added)} tool(s): {added}"
-                    )
+                    if reused:
+                        # A shared subprocess this Agent attached to; log quietly
+                        # so N Agents sharing one mcp.json don't repeat the line.
+                        logger.debug(
+                            f"[MCP] Server '{server_name}' reused — "
+                            f"{len(added)} tool(s) attached"
+                        )
+                    else:
+                        booted_any = True
+                        logger.info(
+                            f"[MCP] Server '{server_name}' ready — "
+                            f"{len(added)} tool(s): {added}"
+                        )
                 except Exception as e:
                     self._mcp_status[server_name] = "failed"
                     logger.warning(f"[MCP] Server '{server_name}' load failed: {e}")
 
             ready = sum(1 for s in self._mcp_status.values() if s == "ready")
             total = len(self._mcp_status)
-            logger.info(
+            # Only surface the summary at INFO when this loader actually booted a
+            # server. When every server was reused from the shared pool (the
+            # common case for the 2nd..Nth agent sharing one mcp.json) keep it at
+            # DEBUG to avoid N identical "loading complete" lines.
+            _complete_log = logger.info if booted_any else logger.debug
+            _complete_log(
                 f"[ToolManager] MCP loading complete: "
                 f"{ready}/{total} server(s) ready, "
                 f"{len(self._mcp_tool_instances)} tool(s) available"

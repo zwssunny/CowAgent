@@ -112,6 +112,15 @@ sudo docker compose up -d
 sudo docker logs -f chatgpt-on-wechat
 ```
 
+<Note>
+  **Data persistence**: `docker-compose.yml` mounts two host directories by default, so your data survives container restarts and `docker compose pull` image upgrades:
+
+  - `./cow` → `/home/agent/cow` in the container: the workspace, holding conversation-installed skills, memory, knowledge base, `mcp.json`, and conversation artifacts.
+  - `./cow-data` → `/home/agent/.cow` in the container: the data directory pointed to by `COW_DATA_DIR`, holding the `config.json` saved from the web console, run logs, and channel credentials.
+
+  Both directories are created next to `docker-compose.yml` by default — don't delete them.
+</Note>
+
 <Tip>
   **Running in Docker?** Set `WEB_HOST` to `0.0.0.0` in `docker-compose.yml` so the console is reachable from outside the container, and set `WEB_PASSWORD` to protect it. Make sure port `9899` is mapped to the host and open in your firewall or security group.
 </Tip>
@@ -121,7 +130,7 @@ sudo docker logs -f chatgpt-on-wechat
 ```json
 {
   "channel_type": "web",
-  "model": "deepseek-v4-flash",
+  "model": "deepseek-flash",
   "deepseek_api_key": "",
   "agent": true,
   "agent_workspace": "~/cow",
@@ -135,7 +144,7 @@ sudo docker logs -f chatgpt-on-wechat
 | Parameter | Description | Default |
 | --- | --- | --- |
 | `channel_type` | Channel type | `web` |
-| `model` | Model name | `deepseek-v4-flash` |
+| `model` | Model name | `deepseek-flash` |
 | `agent` | Enable Agent mode | `true` |
 | `agent_workspace` | Agent workspace path | `~/cow` |
 | `agent_max_context_tokens` | Max context tokens | `40000` |

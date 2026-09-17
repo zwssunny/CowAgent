@@ -16,8 +16,12 @@ from .diff import (
     restore_line_endings,
     normalize_for_fuzzy_match,
     count_matches,
+    find_match_spans,
     fuzzy_find_text,
     generate_diff_string,
+    looks_like_line_numbered_block,
+    reindent_replacement,
+    strip_line_number_prefixes,
     FuzzyMatchResult
 )
 
@@ -41,8 +45,12 @@ __all__ = [
     'restore_line_endings',
     'normalize_for_fuzzy_match',
     'count_matches',
+    'find_match_spans',
     'fuzzy_find_text',
     'generate_diff_string',
+    'looks_like_line_numbered_block',
+    'reindent_replacement',
+    'strip_line_number_prefixes',
     'FuzzyMatchResult',
     'validate_url_safe',
     'assert_public_ip'

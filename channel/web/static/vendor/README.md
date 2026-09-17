@@ -35,7 +35,7 @@ Notes:
 - `tailwind.min.js` is the official Tailwind Play CDN build (an in-browser JIT
   engine). It must be served as JS to keep the existing `tailwind.config = {}`
   customization working.
-- One external script remains in `channel/web/static/js/console.js`:
+- One external script remains, in `channel/web/static/js/views/channels-wecom.js`:
   `wwcdn.weixin.qq.com/.../wecom-aibot-sdk` — Tencent requires the WeCom Bot
   SDK to be loaded from their CDN, and it is only fetched when the user opens
   the WeCom Bot QR-login flow.

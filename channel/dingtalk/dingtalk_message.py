@@ -9,7 +9,7 @@ from channel.chat_message import ChatMessage
 # -*- coding=utf-8 -*-
 from common.log import logger
 from common.tmp_dir import TmpDir
-from common.utils import expand_path
+from common import state_dir
 from config import conf
 
 
@@ -50,10 +50,8 @@ class DingTalkMessage(ChatMessage):
                 download_url = image_download_handler.get_image_download_url(download_code)
                 
                 # 下载到工作空间 tmp 目录
-                workspace_root = expand_path(conf().get("agent_workspace", "~/cow"))
-                tmp_dir = os.path.join(workspace_root, "tmp")
-                os.makedirs(tmp_dir, exist_ok=True)
-                
+                tmp_dir = str(state_dir.tmp_dir())
+
                 image_path = download_image_file(download_url, tmp_dir)
                 if image_path:
                     self.content = image_path
@@ -68,10 +66,8 @@ class DingTalkMessage(ChatMessage):
                 self.ctype = ContextType.TEXT
                 
                 # 下载到工作空间 tmp 目录
-                workspace_root = expand_path(conf().get("agent_workspace", "~/cow"))
-                tmp_dir = os.path.join(workspace_root, "tmp")
-                os.makedirs(tmp_dir, exist_ok=True)
-                
+                tmp_dir = str(state_dir.tmp_dir())
+
                 # 提取富文本中的文本内容
                 text_content = ""
                 if self.rich_text_content:
